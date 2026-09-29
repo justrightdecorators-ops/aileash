@@ -1,540 +1,1232 @@
-# Codebase — part 25 of 43
+# Codebase — part 25 of 45
 
 Contains:
-- `modules/toolspage.py`
-- `modules/verifier.py`
-- `modules/walk.py`
+- `modules/studio.py`
 
 
-## `modules/toolspage.py`
+## `modules/studio.py`
 
-587 lines, 53800 bytes
+1320 lines, 68971 bytes
 
 ```python
 """
-modules/toolspage.py  v1.0.0
-The free tools at /tools, and the tool files themselves.
+modules/studio.py  v4.0.3
+Monop Studio. Creators upload a video at /create and get back:
 
-    /tools                                 the page
-    /tools/sebbi_token_meter.user.js       browser: cost of a prompt before you send it
-    /tools/sebbi_receipt_lens.user.js      browser: check any receipt on any page
-    /tools/sebbi_prompt_shield.user.js     browser: catch a secret before it reaches an AI
-    /tools/sebbi_spend_guard.py            python: a hard budget for any agent
-    /tools/sebbi_proof_badge.html          the two-line snippet for a live badge
-    /tools/sebbi_proof_badge.js            the badge script other sites load
+  * a teaser video saved to their phone, ready for TikTok, Instagram,
+    Facebook and YouTube - the first few seconds play clear, then the picture
+    blurs behind an end card with the video's link and a QR code burned into
+    the pixels, so it survives any upload anywhere;
+  * a short link, https://sebbi.pro/v/<id>, that opens straight onto that
+    video in the 10p Wing (modules/cinema.py);
+  * a channel link for their bio, https://sebbi.pro/cinema/@<name>.
 
-Page module (runtime do_GET patch, like map.py). Armed by
-/x/toolspage/status after each deploy. Files are base64-embedded, so the
-whole thing is one file with nothing else to deploy. Downloads are served
-with a filename so a phone saves them properly, and the badge script is
-served with permissive CORS because other sites load it.
+Viewers watch the teaser free, then pay 10p to watch the rest. A viewer with
+no credit taps Google Pay or Apple Pay once (Stripe Checkout), GBP 1 or GBP 5
+lands on their phone as credit, 10p comes off and the video plays. No account.
+Stripe's card fee (1.5% + 20p) is added on top of the credit and shown before
+paying, so the full credit is spent on videos: GBP 1 credit costs GBP 1.22.
+
+The creator gets 70% of every paid view, less 50p a month per video which is
+only ever taken from that video's own earnings - a video that earns nothing
+costs nothing. Balances and payouts run on modules/credits.py (/earn), and
+every paid view, payment and upload is sealed into the chain.
+
+Routes (all served by a runtime do_GET / do_POST patch, like credits.py):
+  GET  /create                       the creator page
+  GET  /v/<id>                       one tap -> the video in the 10p Wing
+  GET  /v/<id>/teaser                the free teaser video
+  GET  /v/<id>/poster.jpg            the still
+  GET  /v/<id>/full?viewer=&t=       the full video, for viewers who paid
+  POST /v/api/join | signin | new | chunk | finish | mine | delete
+  GET  /v/api/state?id=&viewer=      unlocked? balance? price?
+  POST /v/api/unlock | pay | paid | report
+  GET  /v/api/admin?key=&do=list|remove&id=     (CREDITS_ADMIN_KEY)
+  GET  /x/studio/status              arms the routes after a deploy
+
+Railway variables (all optional):
+  STUDIO_DIR          where videos are kept (default: the folder DB_PATH is in)
+  STUDIO_MAX_MB       biggest upload in MB (default 20000 - about three hours of phone video)
+  STUDIO_PACKS        credit packs in pence (default 100,500)
+  STUDIO_MONTHLY_FEE  pence per video per month, from its earnings (default 50)
+  STUDIO_CARD_FEE_PCT / STUDIO_CARD_FEE_PENCE   the card fee added on top (1.5 / 20)
+Stripe uses the key server.py already has (STRIPE_SECRET). Apple Pay and
+Google Pay show on the Stripe payment page when they are switched on in the
+Stripe dashboard (Settings > Payment methods).
 """
 
 import base64
+import gzip
+import hashlib
+import hmac
+import importlib
+import json
+import math
+import os
+import re
+import secrets
+import shutil
 import sys
+import threading
+import time
+import urllib.parse
+from collections import defaultdict, deque
 
-VERSION = "1.0.0"
+VERSION = "4.0.3"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
 
-_B0 = (
-    "PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmll"
-    "d3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEsdmlld3BvcnQtZml0PWNvdmVyIj4KPHRp"
-    "dGxlPkZyZWUgdG9vbHMg4oCUIHNlYmJpLnBybzwvdGl0bGU+CjxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250ZW50PSJGaXZl"
-    "IGZyZWUgdG9vbHMgZm9yIGFueW9uZSB3b3JraW5nIHdpdGggQUk6IGEgdG9rZW4gbWV0ZXIsIGEgcmVjZWlwdCBsZW5zLCBhIHBy"
-    "b21wdCBzaGllbGQsIGEgc3BlbmQgZ3VhcmQgYW5kIGEgbGl2ZSBwcm9vZiBiYWRnZS4gT25lIHRhcCB0byBkb3dubG9hZCwgbm90"
-    "aGluZyB0byBzaWduIHVwIGZvci4iPgo8bGluayBocmVmPSJodHRwczovL2ZvbnRzLmdvb2dsZWFwaXMuY29tL2NzczI/ZmFtaWx5"
-    "PUlCTStQbGV4K01vbm86d2dodEA0MDA7NTAwOzYwMCZmYW1pbHk9SUJNK1BsZXgrU2Fuczp3Z2h0QDQwMDs1MDA7NjAwJmZhbWls"
-    "eT1OZXdzcmVhZGVyOm9wc3osd2dodEA2Li43Miw1MDAmZGlzcGxheT1zd2FwIiByZWw9InN0eWxlc2hlZXQiPgo8c3R5bGU+Cjpy"
-    "b290ey0taW5rOiMwNTA3MGY7LS1pbmsyOiMwZDE0MjQ7LS1nb2xkOiNjOWE4NGM7LS1vazojN2ZlM2IwOy0tYmx1ZTojOGZkMGZm"
-    "Oy0tcGluazojZDU5YmZmOy0tcmVkOiNmZjhhODA7LS1tdXRlOiM4YTkzYWQ7LS1saW5lOnJnYmEoMjAxLDE2OCw3NiwuMjIpOy0t"
-    "bW9ubzonSUJNIFBsZXggTW9ubycsdWktbW9ub3NwYWNlLG1vbm9zcGFjZTstLXNhbnM6J0lCTSBQbGV4IFNhbnMnLHN5c3RlbS11"
-    "aSxzYW5zLXNlcmlmOy0tc2VyaWY6J05ld3NyZWFkZXInLEdlb3JnaWEsc2VyaWZ9Cip7Ym94LXNpemluZzpib3JkZXItYm94O21h"
-    "cmdpbjowO3BhZGRpbmc6MDstd2Via2l0LXRhcC1oaWdobGlnaHQtY29sb3I6dHJhbnNwYXJlbnR9CmJvZHl7YmFja2dyb3VuZDpy"
-    "YWRpYWwtZ3JhZGllbnQoZWxsaXBzZSBhdCA1MCUgMCUsIzEwMWEzYyAwJSwjMDUwNzBmIDYyJSk7Y29sb3I6I2U4ZWRmNztmb250"
-    "LWZhbWlseTp2YXIoLS1zYW5zKTtsaW5lLWhlaWdodDoxLjY7bWluLWhlaWdodDoxMDB2aH0KLndyYXB7bWF4LXdpZHRoOjkwMHB4"
-    "O21hcmdpbjowIGF1dG87cGFkZGluZzowIDIwcHggNzBweH0KLnRvcHtkaXNwbGF5OmZsZXg7anVzdGlmeS1jb250ZW50OnNwYWNl"
-    "LWJldHdlZW47YWxpZ24taXRlbXM6Y2VudGVyO3BhZGRpbmc6Y2FsYygxNHB4ICsgZW52KHNhZmUtYXJlYS1pbnNldC10b3ApKSAw"
-    "IDB9Ci5icmFuZHtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTNweH0uYnJhbmQgYntjb2xvcjp2YXIoLS1nb2xk"
-    "KTtmb250LXdlaWdodDo1MDB9Ci50b3AgYXtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTJweDtjb2xvcjp2YXIo"
-    "LS1tdXRlKTt0ZXh0LWRlY29yYXRpb246bm9uZTttYXJnaW4tbGVmdDoxNHB4fQouaGVyb3t0ZXh0LWFsaWduOmNlbnRlcjtwYWRk"
-    "aW5nOjQycHggMCA2cHh9Ci5raWNre2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMS41cHg7bGV0dGVyLXNwYWNp"
-    "bmc6LjJlbTtjb2xvcjp2YXIoLS1nb2xkKX0KaDF7Zm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0OjUwMDtmb250"
-    "LXNpemU6Y2xhbXAoMzRweCw3dncsNTZweCk7bGluZS1oZWlnaHQ6MS4wNTttYXJnaW46MTJweCBhdXRvIDEycHg7bWF4LXdpZHRo"
-    "OjE2Y2g7YmFja2dyb3VuZDpsaW5lYXItZ3JhZGllbnQoOTBkZWcsI2ZmZiwjYzlhODRjIDQwJSwjN2ZlM2IwIDcwJSwjOGZkMGZm"
-    "KTstd2Via2l0LWJhY2tncm91bmQtY2xpcDp0ZXh0O2JhY2tncm91bmQtY2xpcDp0ZXh0O2NvbG9yOnRyYW5zcGFyZW50fQouaGVy"
-    "byBwe2NvbG9yOiNiNmMwZDY7bWF4LXdpZHRoOjU2Y2g7bWFyZ2luOjAgYXV0bztmb250LXNpemU6MTYuNXB4fQoudG9vbHN7ZGlz"
-    "cGxheTpncmlkO2dhcDoxNHB4O21hcmdpbi10b3A6MzBweH0KLnRvb2x7cG9zaXRpb246cmVsYXRpdmU7YmFja2dyb3VuZDpsaW5l"
-    "YXItZ3JhZGllbnQoMTYwZGVnLHJnYmEoMjEsMzIsNzQsLjg1KSxyZ2JhKDEzLDIwLDM2LC45MikpO2JvcmRlcjoxcHggc29saWQg"
-    "dmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoxNnB4O3BhZGRpbmc6MjBweDtvdmVyZmxvdzpoaWRkZW59Ci50b29sOmJlZm9yZXtj"
-    "b250ZW50OiIiO3Bvc2l0aW9uOmFic29sdXRlO2luc2V0OjA7YmFja2dyb3VuZDpyYWRpYWwtZ3JhZGllbnQoNDAwcHggMTIwcHgg"
-    "YXQgMTAlIDAlLHZhcigtLWdsb3cpLHRyYW5zcGFyZW50IDcwJSk7b3BhY2l0eTouNTtwb2ludGVyLWV2ZW50czpub25lfQoudG9v"
-    "bCAubntmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTFweDtsZXR0ZXItc3BhY2luZzouMTRlbTtjb2xvcjp2YXIo"
-    "LS1jKX0KLnRvb2wgaDN7Zm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0OjUwMDtmb250LXNpemU6MjVweDttYXJn"
-    "aW46NnB4IDAgOHB4fQoudG9vbCBwe2NvbG9yOiNiNmMwZDY7Zm9udC1zaXplOjE0LjVweDttYXgtd2lkdGg6NThjaH0KLnRvb2wg"
-    "dWx7bGlzdC1zdHlsZTpub25lO21hcmdpbjoxMHB4IDAgMH0KLnRvb2wgbGl7Zm9udC1zaXplOjEzLjVweDtjb2xvcjojY2ZkNmU2"
-    "O3BhZGRpbmc6M3B4IDAgM3B4IDIwcHg7cG9zaXRpb246cmVsYXRpdmV9Ci50b29sIGxpOmJlZm9yZXtjb250ZW50OiIiO3Bvc2l0"
-    "aW9uOmFic29sdXRlO2xlZnQ6MDt0b3A6MTBweDt3aWR0aDo4cHg7aGVpZ2h0OjhweDtib3JkZXItcmFkaXVzOjUwJTtiYWNrZ3Jv"
-    "dW5kOnZhcigtLWMpO2JveC1zaGFkb3c6MCAwIDhweCB2YXIoLS1jKX0KLnJvd3tkaXNwbGF5OmZsZXg7Z2FwOjhweDtmbGV4LXdy"
-    "YXA6d3JhcDttYXJnaW4tdG9wOjE0cHg7YWxpZ24taXRlbXM6Y2VudGVyfQouZGx7ZGlzcGxheTppbmxpbmUtZmxleDthbGlnbi1p"
-    "dGVtczpjZW50ZXI7Z2FwOjhweDtiYWNrZ3JvdW5kOnZhcigtLWMpO2NvbG9yOiMwNTA3MGY7Ym9yZGVyOjA7Ym9yZGVyLXJhZGl1"
-    "czoxMHB4O3BhZGRpbmc6MTJweCAxOHB4O2ZvbnQ6NjAwIDEzcHggdmFyKC0tbW9ubyk7dGV4dC1kZWNvcmF0aW9uOm5vbmU7Y3Vy"
-    "c29yOnBvaW50ZXJ9Ci5ob3d7YmFja2dyb3VuZDp0cmFuc3BhcmVudDtjb2xvcjojZThlZGY3O2JvcmRlcjoxcHggc29saWQgcmdi"
-    "YSgyNTUsMjU1LDI1NSwuMjIpO2JvcmRlci1yYWRpdXM6MTBweDtwYWRkaW5nOjEycHggMTZweDtmb250OjUwMCAxMi41cHggdmFy"
-    "KC0tbW9ubyk7Y3Vyc29yOnBvaW50ZXJ9Ci5zdGVwc3tkaXNwbGF5Om5vbmU7bWFyZ2luLXRvcDoxMnB4O2JhY2tncm91bmQ6IzAz"
-    "MDUwYjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6MTBweDtwYWRkaW5nOjE0cHg7Zm9udC1zaXpl"
-    "OjEzLjVweDtjb2xvcjojY2ZkNmU2fQouc3RlcHMub257ZGlzcGxheTpibG9ja30uc3RlcHMgb2x7bWFyZ2luLWxlZnQ6MThweH0u"
-    "c3RlcHMgbGl7cGFkZGluZzozcHggMH0uc3RlcHMgbGk6YmVmb3Jle2Rpc3BsYXk6bm9uZX0KcHJle2JhY2tncm91bmQ6IzAzMDUw"
-    "Yjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6OHB4O3BhZGRpbmc6MTBweDtmb250OjEycHggdmFy"
-    "KC0tbW9ubyk7Y29sb3I6I2NmZTZkOTtvdmVyZmxvdy14OmF1dG87bWFyZ2luLXRvcDo4cHg7d2hpdGUtc3BhY2U6cHJlLXdyYXA7"
-    "d29yZC1icmVhazpicmVhay1hbGx9Ci5waWxse2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMC41cHg7Y29sb3I6"
-    "dmFyKC0tbXV0ZSk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4xNCk7Ym9yZGVyLXJhZGl1czo5OTlweDtwYWRk"
-    "aW5nOjRweCA5cHh9CnNlY3Rpb257cGFkZGluZzo0MHB4IDAgMDtib3JkZXItdG9wOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1"
-    "LC4wNyk7bWFyZ2luLXRvcDo0MHB4fQpoMntmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6"
-    "ZTpjbGFtcCgyNHB4LDQuNHZ3LDM0cHgpO21hcmdpbi1ib3R0b206MTBweH0KLmxlYWR7Y29sb3I6I2I2YzBkNjttYXgtd2lkdGg6"
-    "NjJjaH0KLmZpbmFse3RleHQtYWxpZ246Y2VudGVyO3BhZGRpbmc6NDBweCAwIDB9Ci5jdGF7ZGlzcGxheTppbmxpbmUtZmxleDtn"
-    "YXA6OHB4O21hcmdpbjoxOHB4IDZweCAwO3BhZGRpbmc6MTRweCAyMnB4O2JvcmRlci1yYWRpdXM6MTBweDtmb250OjUwMCAxNHB4"
-    "IHZhcigtLW1vbm8pO3RleHQtZGVjb3JhdGlvbjpub25lO2JhY2tncm91bmQ6dmFyKC0tZ29sZCk7Y29sb3I6IzA1MDcwZn0KLmN0"
-    "YS5naG9zdHtiYWNrZ3JvdW5kOnRyYW5zcGFyZW50O2NvbG9yOiNmZmY7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1"
-    "LC4yNSl9Cjwvc3R5bGU+PC9oZWFkPjxib2R5PjxkaXYgY2xhc3M9IndyYXAiPgo8ZGl2IGNsYXNzPSJ0b3AiPjxkaXYgY2xhc3M9"
-    "ImJyYW5kIj5zZWJiaTxiPi5wcm88L2I+IMK3IEZSRUUgVE9PTFM8L2Rpdj48bmF2PjxhIGhyZWY9Ii8iPkhvbWU8L2E+PGEgaHJl"
-    "Zj0iL3N0YXJ0Ij5TdGFydCBoZXJlPC9hPjxhIGhyZWY9Ii9wcm92ZSI+UHJvb2Y8L2E+PC9uYXY+PC9kaXY+Cgo8ZGl2IGNsYXNz"
-    "PSJoZXJvIj48ZGl2IGNsYXNzPSJraWNrIj5GSVZFIFRPT0xTIMK3IEZSRUUgwrcgTk8gQUNDT1VOVDwvZGl2Pgo8aDE+VG9vbHMg"
-    "Zm9yIHBlb3BsZSB3aG8gd29yayB3aXRoIEFJLjwvaDE+CjxwPkVhY2ggb25lIGlzIGEgc2luZ2xlIGZpbGUuIE9uZSB0YXAgdG8g"
-    "ZG93bmxvYWQsIGEgbWludXRlIHRvIHNldCB1cCwgYW5kIGl0IHJ1bnMgb24geW91ciBvd24gbWFjaGluZS4gTm8gc2lnbi11cCwg"
-    "bm8gdHJhY2tpbmcsIG5vdGhpbmcgc2VudCBhbnl3aGVyZSB1bmxlc3MgeW91IGFzayBpdCB0byBiZS48L3A+PC9kaXY+Cgo8ZGl2"
-    "IGNsYXNzPSJ0b29scyI+Cgo8ZGl2IGNsYXNzPSJ0b29sIiBpZD0ibWV0ZXIiIHN0eWxlPSItLWM6IzdmZTNiMDstLWdsb3c6cmdi"
-    "YSgxMjcsMjI3LDE3NiwuMTYpIj4KIDxkaXYgY2xhc3M9Im4iPjAxIMK3IFRPS0VOIE1FVEVSIMK3IEJST1dTRVI8L2Rpdj4KIDxo"
-    "Mz5TZWUgd2hhdCBhIHByb21wdCBjb3N0cyBiZWZvcmUgeW91IHNlbmQgaXQ8L2gzPgogPHA+QSBidWJibGUgdGhhdCBmbG9hdHMg"
-    "b24gYW55IEFJIGNoYXQgcGFnZSBhbmQgY291bnRzIHdoYXQncyBpbiB0aGUgYm94IGFzIHlvdSB0eXBlLCBpbiB0b2tlbnMgYW5k"
-    "IGluIHlvdXIgb3duIG1vbmV5LjwvcD4KIDx1bD48bGk+TGl2ZSB0b2tlbiBjb3VudCBhbmQgY29zdCBhdCB5b3VyIG93biBwcmlj"
-    "ZSBwZXIgbWlsbGlvbjwvbGk+CiA8bGk+U3BvdHMgd2hlbiB5b3Ugc2VuZCB0aGUgc2FtZSBwcm9tcHQgdHdpY2UsIGFuZCB0b3Rh"
-    "bHMgd2hhdCBjYWNoaW5nIHdvdWxkIGhhdmUgc2F2ZWQgeW91PC9saT4KIDxsaT5EcmFnIGl0IGFueXdoZXJlOyBldmVyeXRoaW5n"
-    "IHN0YXlzIG9uIHlvdXIgZGV2aWNlPC9saT48L3VsPgogPGRpdiBjbGFzcz0icm93Ij48YSBjbGFzcz0iZGwiIGhyZWY9Ii90b29s"
-    "cy9zZWJiaV90b2tlbl9tZXRlci51c2VyLmpzIiBkb3dubG9hZD7irIcgRG93bmxvYWQ8L2E+PGJ1dHRvbiBjbGFzcz0iaG93IiBk"
-    "YXRhLXQ9Im1ldGVyIj5Ib3cgdG8gaW5zdGFsbDwvYnV0dG9uPjxzcGFuIGNsYXNzPSJwaWxsIj5DaHJvbWUgwrcgRWRnZSDCtyBG"
-    "aXJlZm94IMK3IFNhZmFyaTwvc3Bhbj48L2Rpdj4KIDxkaXYgY2xhc3M9InN0ZXBzIiBpZD0icy1tZXRlciI+PG9sPjxsaT5JbnN0"
-    "YWxsIGEgdXNlcnNjcmlwdCBtYW5hZ2VyIChUYW1wZXJtb25rZXkgb3IgVmlvbGVudG1vbmtleSkgZnJvbSB5b3VyIGJyb3dzZXIn"
-    "cyBhZGQtb24gc3RvcmUuIEl0J3MgZnJlZSBhbmQgdGFrZXMgYSBtaW51dGUuPC9saT48bGk+VGFwIERvd25sb2FkIGFib3ZlOyB5"
-    "b3VyIG1hbmFnZXIgd2lsbCBvZmZlciB0byBpbnN0YWxsIHRoZSBzY3JpcHQuPC9saT48bGk+T3BlbiBhbnkgQUkgY2hhdC4gVGhl"
-    "IGJ1YmJsZSBhcHBlYXJzIGluIHRoZSBjb3JuZXIuIFRhcCBpdCwgcHV0IGluIHlvdXIgcHJpY2UgcGVyIG1pbGxpb24gdG9rZW5z"
-    "LCBhbmQgc3RhcnQgdHlwaW5nLjwvbGk+PC9vbD48L2Rpdj4KPC9kaXY+Cgo8ZGl2IGNsYXNzPSJ0b29sIiBpZD0ibGVucyIgc3R5"
-    "bGU9Ii0tYzojYzlhODRjOy0tZ2xvdzpyZ2JhKDIwMSwxNjgsNzYsLjE2KSI+CiA8ZGl2IGNsYXNzPSJuIj4wMiDCtyBSRUNFSVBU"
-    "IExFTlMgwrcgQlJPV1NFUjwvZGl2PgogPGgzPkNoZWNrIGFueSByZWNlaXB0LCBhbnl3aGVyZSB5b3UgcmVhZCBpdDwvaDM+CiA8"
-    "cD5GaW5kcyBldmVyeSBTSEEtMjU2IHJlY2VpcHQgb24gYW55IHBhZ2UgeW91IG9wZW4gYW5kIGNoZWNrcyBpdCBhZ2FpbnN0IHRo"
-    "ZSBzZWJiaS5wcm8gY2hhaW4gaW4gb25lIHRhcC4gQnVpbHQgZm9yIGF1ZGl0b3JzLCByZXZpZXdlcnMgYW5kIGFueW9uZSBoYW5k"
-    "ZWQgYSBoYXNoIGluIGFuIGVtYWlsLjwvcD4KIDx1bD48bGk+SGlnaGxpZ2h0cyBoYXNoZXMgaW4gZW1haWxzLCB3aWtpcywgdGlj"
-    "a2V0cyBhbmQgd2ViIHNwcmVhZHNoZWV0czwvbGk+CiA8bGk+VGFwIG9uZTogVkVSSUZJRUQgd2l0aCB0aGUgYmxvY2sgYW5kIHRp"
-    "bWUsIG9yIE5PVCBGT1VORDwvbGk+CiA8bGk+T25seSB0aGUgaGFzaCBpcyBldmVyIHNlbnQsIG5ldmVyIHRoZSBwYWdlPC9saT48"
-    "L3VsPgogPGRpdiBjbGFzcz0icm93Ij48YSBjbGFzcz0iZGwiIGhyZWY9Ii90b29scy9zZWJiaV9yZWNlaXB0X2xlbnMudXNlci5q"
-    "cyIgZG93bmxvYWQ+4qyHIERvd25sb2FkPC9hPjxidXR0b24gY2xhc3M9ImhvdyIgZGF0YS10PSJsZW5zIj5Ib3cgdG8gaW5zdGFs"
-    "bDwvYnV0dG9uPjxzcGFuIGNsYXNzPSJwaWxsIj5GcmVlIGZvcmV2ZXI8L3NwYW4+PC9kaXY+CiA8ZGl2IGNsYXNzPSJzdGVwcyIg"
-    "aWQ9InMtbGVucyI+PG9sPjxsaT5JbnN0YWxsIFRhbXBlcm1vbmtleSBvciBWaW9sZW50bW9ua2V5IGluIHlvdXIgYnJvd3Nlci48"
-    "L2xpPjxsaT5UYXAgRG93bmxvYWQgYW5kIGFjY2VwdCB0aGUgaW5zdGFsbC48L2xpPjxsaT5PcGVuIGFueSBwYWdlIHdpdGggcmVj"
-    "ZWlwdHMgb24gaXQuIEEgY291bnRlciB0ZWxscyB5b3UgaG93IG1hbnkgaXQgZm91bmQ7IHRhcCBvbmUgdG8gY2hlY2sgaXQuPC9s"
-    "aT48L29sPjwvZGl2Pgo8L2Rpdj4KCjxkaXYgY2xhc3M9InRvb2wiIGlkPSJzaGllbGQiIHN0eWxlPSItLWM6I2ZmOGE4MDstLWds"
-    "b3c6cmdiYSgyNTUsMTM4LDEyOCwuMTYpIj4KIDxkaXYgY2xhc3M9Im4iPjAzIMK3IFBST01QVCBTSElFTEQgwrcgQlJPV1NFUjwv"
-    "ZGl2PgogPGgzPlN0b3AgYSBzZWNyZXQgYmVmb3JlIGl0IHJlYWNoZXMgdGhlIEFJPC9oMz4KIDxwPldhdGNoZXMgdGhlIGJveCB5"
-    "b3UncmUgdHlwaW5nIGluIGFuZCB3YXJucyB5b3UgdGhlIG1vbWVudCBhIHNlY3JldCBhcHBlYXJzLiBPbmUgdGFwIG1hc2tzIGl0"
-    "IGluIHBsYWNlLCBsZWF2aW5nIHRoZSByZXN0IG9mIHlvdXIgcHJvbXB0IHVudG91Y2hlZC48L3A+CiA8dWw+PGxpPkNhdGNoZXMg"
-    "ZW1haWxzLCBBUEkga2V5cywgQVdTIGtleXMsIGJlYXJlciB0b2tlbnMsIHByaXZhdGUga2V5cywgY2FyZCBudW1iZXJzIGFuZCBO"
-    "SSBudW1iZXJzPC9saT4KIDxsaT5Xb3JrcyBpbiBhbnkgQUkgY2hhdCwgYW55IHdlYiBmb3JtPC9saT4KIDxsaT5SdW5zIGVudGly"
-    "ZWx5IGluIHlvdXIgYnJvd3Nlcjsgbm90aGluZyBpcyBzZW50IGFueXdoZXJlLCBldmVyPC9saT48L3VsPgogPGRpdiBjbGFzcz0i"
-    "cm93Ij48YSBjbGFzcz0iZGwiIGhyZWY9Ii90b29scy9zZWJiaV9wcm9tcHRfc2hpZWxkLnVzZXIuanMiIGRvd25sb2FkPuKshyBE"
-    "b3dubG9hZDwvYT48YnV0dG9uIGNsYXNzPSJob3ciIGRhdGEtdD0ic2hpZWxkIj5Ib3cgdG8gaW5zdGFsbDwvYnV0dG9uPjxzcGFu"
-    "IGNsYXNzPSJwaWxsIj5Qcml2YWN5IGJ5IGRlZmF1bHQ8L3NwYW4+PC9kaXY+CiA8ZGl2IGNsYXNzPSJzdGVwcyIgaWQ9InMtc2hp"
-    "ZWxkIj48b2w+PGxpPkluc3RhbGwgVGFtcGVybW9ua2V5IG9yIFZpb2xlbnRtb25rZXkuPC9saT48bGk+VGFwIERvd25sb2FkIGFu"
-    "ZCBhY2NlcHQgdGhlIGluc3RhbGwuPC9saT48bGk+VHlwZSBvciBwYXN0ZSBhcyBub3JtYWwuIElmIGEgc2VjcmV0IGFwcGVhcnMs"
-    "IGEgYmFyIHJpc2VzIGZyb20gdGhlIGJvdHRvbTogdGFwICJNYXNrIHRoZW0iLjwvbGk+PC9vbD48L2Rpdj4KPC9kaXY+Cgo8ZGl2"
-    "IGNsYXNzPSJ0b29sIiBpZD0iZ3VhcmQiIHN0eWxlPSItLWM6IzhmZDBmZjstLWdsb3c6cmdiYSgxNDMsMjA4LDI1NSwuMTYpIj4K"
-    "IDxkaXYgY2xhc3M9Im4iPjA0IMK3IFNQRU5EIEdVQVJEIMK3IFBZVEhPTjwvZGl2PgogPGgzPkEgaGFyZCBjZWlsaW5nIG9uIHdo"
-    "YXQgYW4gYWdlbnQgY2FuIHNwZW5kPC9oMz4KIDxwPkFkZCBvbmUgbGluZSBhYm92ZSB0aGUgZnVuY3Rpb24gdGhhdCBjYWxscyB5"
-    "b3VyIG1vZGVsLiBUaGUgZ3VhcmQgcHJpY2VzIGV2ZXJ5IGNhbGwgYmVmb3JlIGl0IGhhcHBlbnMgYW5kIHJlZnVzZXMgdGhlIG9u"
-    "ZSB0aGF0IHdvdWxkIGJyZWFrIHlvdXIgYnVkZ2V0LjwvcD4KIDx1bD48bGk+UnVuYXdheSBsb29wcyB0cmlwcGVkIGJ5IGEgY2ly"
-    "Y3VpdCBicmVha2VyLCByZXBlYXRzIHNlcnZlZCBmcm9tIGNhY2hlPC9saT4KIDxsaT5FdmVyeSBkZWNpc2lvbiB3cml0dGVuIHRv"
-    "IGEgbG9jYWwgaGFzaC1jaGFpbmVkIGxvZyB5b3UgY2FuIHJlLXZlcmlmeTwvbGk+CiA8bGk+T25lIGZpbGUsIHN0YW5kYXJkIGxp"
-    "YnJhcnkgb25seSwgbm90aGluZyBzZW50IGFueXdoZXJlPC9saT48L3VsPgogPHByZT5ndWFyZCA9IEd1YXJkKGRhaWx5X2xpbWl0"
-    "X2dicD01LjAwLCBwcmljZV9wZXJfbWlsbGlvbj0zLjAwKQoKQGd1YXJkLm1ldGVyCmRlZiBhc2tfbW9kZWwocHJvbXB0KToKICAg"
-    "IC4uLjwvcHJlPgogPGRpdiBjbGFzcz0icm93Ij48YSBjbGFzcz0iZGwiIGhyZWY9Ii90b29scy9zZWJiaV9zcGVuZF9ndWFyZC5w"
-    "eSIgZG93bmxvYWQ+4qyHIERvd25sb2FkPC9hPjxidXR0b24gY2xhc3M9ImhvdyIgZGF0YS10PSJndWFyZCI+SG93IHRvIHJ1biBp"
-    "dDwvYnV0dG9uPjxzcGFuIGNsYXNzPSJwaWxsIj5QeXRob24gMy44Kzwvc3Bhbj48L2Rpdj4KIDxkaXYgY2xhc3M9InN0ZXBzIiBp"
-    "ZD0icy1ndWFyZCI+PG9sPjxsaT5Eb3dubG9hZCBpdCBuZXh0IHRvIHlvdXIgYWdlbnQncyBjb2RlLjwvbGk+PGxpPlJ1biA8Yj5w"
-    "eXRob24zIHNlYmJpX3NwZW5kX2d1YXJkLnB5PC9iPiB0byB3YXRjaCB0aGUgZGVtb25zdHJhdGlvbjogYSBjYWxsLCBhIGNhY2hl"
-    "ZCByZXBlYXQsIGEgcmVmdXNhbCwgYW5kIHRoZSBsb2cgdmVyaWZpZWQuPC9saT48bGk+SW1wb3J0IEd1YXJkLCBzZXQgeW91ciBs"
-    "aW1pdCBhbmQgeW91ciBwcmljZSwgYW5kIGRlY29yYXRlIHRoZSBmdW5jdGlvbiB0aGF0IGNhbGxzIHlvdXIgbW9kZWwuPC9saT48"
-    "L29sPjwvZGl2Pgo8L2Rpdj4KCjxkaXYgY2xhc3M9InRvb2wiIGlkPSJiYWRnZSIgc3R5bGU9Ii0tYzojZDU5YmZmOy0tZ2xvdzpy"
-    "Z2JhKDIxMywxNTUsMjU1LC4xNikiPgogPGRpdiBjbGFzcz0ibiI+MDUgwrcgUFJPT0YgQkFER0UgwrcgWU9VUiBXRUJTSVRFPC9k"
-    "aXY+CiA8aDM+U2hvdyB5b3VyIEFJIGludGVncml0eSBsZXZlbCwgbGl2ZTwvaDM+CiA8cD5Ud28gbGluZXMgb24geW91ciBvd24g"
-    "c2l0ZSBwdXQgYSBiYWRnZSBvbiB0aGUgcGFnZSBzaG93aW5nIHlvdXIgQUkgaW50ZWdyaXR5IGxldmVsLCBjaGVja2VkIGFnYWlu"
-    "c3Qgc2ViYmkucHJvIGV2ZXJ5IHRpbWUgc29tZW9uZSBsb2FkcyBpdC4gTm90IGEgc3RpY2tlcjogYSBsaXZlIGNoZWNrLCBhbmQg"
-    "dGFwcGluZyBpdCBvcGVucyB0aGUgZnVsbCBwdWJsaWMgcmVwb3J0LjwvcD4KIDx1bD48bGk+U2hvd3MgTDAgdG8gTDQsIGNvbG91"
-    "ci1jb2RlZCwgd2l0aCB5b3VyIG93biBkb21haW4gY2hlY2tlZDwvbGk+CiA8bGk+Tm8gY29va2llcywgbm8gdHJhY2tpbmcsIG5v"
-    "IGRlcGVuZGVuY2llczwvbGk+CiA8bGk+SWYgaXQgY2FuJ3QgcmVhY2ggdXMgaXQgc2hvd3Mgbm90aGluZywgc28gaXQgY2FuIG5l"
-    "dmVyIGJyZWFrIHlvdXIgcGFnZTwvbGk+PC91bD4KIDxwcmU+Jmx0O2RpdiBjbGFzcz0ic2ViYmktYmFkZ2UiIGRhdGEtZG9tYWlu"
-    "PSJ5b3VyLWNvbXBhbnkuY29tIiZndDsmbHQ7L2RpdiZndDsKJmx0O3NjcmlwdCBzcmM9Imh0dHBzOi8vc2ViYmkucHJvL3Rvb2xz"
-    "L3NlYmJpX3Byb29mX2JhZGdlLmpzIiBhc3luYyZndDsmbHQ7L3NjcmlwdCZndDs8L3ByZT4KIDxkaXYgY2xhc3M9InJvdyI+PGEg"
-    "Y2xhc3M9ImRsIiBocmVmPSIvdG9vbHMvc2ViYmlfcHJvb2ZfYmFkZ2UuaHRtbCIgZG93bmxvYWQ+4qyHIERvd25sb2FkIHRoZSBz"
-    "bmlwcGV0PC9hPjxidXR0b24gY2xhc3M9ImhvdyIgZGF0YS10PSJiYWRnZSI+SG93IGl0IHdvcmtzPC9idXR0b24+PHNwYW4gY2xh"
-    "c3M9InBpbGwiPkFueSB3ZWJzaXRlPC9zcGFuPjwvZGl2PgogPGRpdiBjbGFzcz0ic3RlcHMiIGlkPSJzLWJhZGdlIj48b2w+PGxp"
-    "PlBhc3RlIHRoZSB0d28gbGluZXMgaW50byB5b3VyIHBhZ2Ugd2hlcmUgeW91IHdhbnQgdGhlIGJhZGdlLCBhbmQgY2hhbmdlIGRh"
-    "dGEtZG9tYWluIHRvIHlvdXIgZG9tYWluLjwvbGk+PGxpPlRoZSBiYWRnZSBhc2tzIHNlYmJpLnBybyBmb3IgeW91ciBsZXZlbCBh"
-    "bmQgc2hvd3MgaXQuPC9saT48bGk+V2FudCBhIGhpZ2hlciBsZXZlbD8gUHVibGlzaCBhbiBpbnRlZ3JpdHkgZGVjbGFyYXRpb24g"
-    "YW5kIGdldCB3aXRuZXNzZWQuIDxhIGhyZWY9Ii9zdGFydCIgc3R5bGU9ImNvbG9yOiNkNTliZmYiPlN0YXJ0IGhlcmUuPC9hPjwv"
-    "bGk+PC9vbD48L2Rpdj4KPC9kaXY+Cgo8L2Rpdj4KCjxzZWN0aW9uPgogPGgyPldoeSB0aGV5J3JlIGZyZWU8L2gyPgogPHAgY2xh"
-    "c3M9ImxlYWQiPkV2ZXJ5IHRvb2wgaGVyZSBpcyBhIHNtYWxsIHBpZWNlIG9mIHRoZSBzYW1lIGVuZ2luZSB0aGF0IHJ1bnMgc2Vi"
-    "YmkucHJvOiBkZXRlcm1pbmlzdGljIGNoZWNrcywgbG9jYWwgaGFzaGluZywgYW5kIHJlY29yZHMgYW55b25lIGNhbiB2ZXJpZnku"
-    "IFVzZSB0aGVtIG9uIHRoZWlyIG93biBmb3IgYXMgbG9uZyBhcyB5b3UgbGlrZS4gV2hlbiB5b3Ugd2FudCB0aGUgZnVsbCB0aGlu"
-    "Zywgd2l0aCB5b3VyIGRlY2lzaW9ucyBzZWFsZWQgaW50byBhIGNoYWluIHRoYXQncyB0aW1lc3RhbXBlZCBpbiBCaXRjb2luIGFu"
-    "ZCB3aXRuZXNzZWQgYnkgaW5kZXBlbmRlbnQgb3JnYW5pc2F0aW9ucywgaXQncyA1MHAgcGVyIGRldmljZSBwZXIgbW9udGggYW5k"
-    "IGZyZWUgZm9yIHRoZSBmaXJzdCA5MCBkYXlzLjwvcD4KIDxkaXYgY2xhc3M9ImZpbmFsIj48YSBjbGFzcz0iY3RhIiBocmVmPSIv"
-    "c3RhcnQiPlN0YXJ0IGhlcmUg4oaSPC9hPjxhIGNsYXNzPSJjdGEgZ2hvc3QiIGhyZWY9Ii9wcm92ZSI+Q2hlY2sgb3VyIHByb29m"
-    "czwvYT48L2Rpdj4KPC9zZWN0aW9uPgo8L2Rpdj4KPHNjcmlwdD4KQXJyYXkucHJvdG90eXBlLmZvckVhY2guY2FsbChkb2N1bWVu"
-    "dC5xdWVyeVNlbGVjdG9yQWxsKCIuaG93IiksZnVuY3Rpb24oYil7Yi5vbmNsaWNrPWZ1bmN0aW9uKCl7CiB2YXIgcz1kb2N1bWVu"
-    "dC5nZXRFbGVtZW50QnlJZCgicy0iK2IuZGF0YXNldC50KTtzLmNsYXNzTGlzdC50b2dnbGUoIm9uIik7Yi50ZXh0Q29udGVudD1z"
-    "LmNsYXNzTGlzdC5jb250YWlucygib24iKT8iSGlkZSI6KGIuZGF0YXNldC50PT09Imd1YXJkIj8iSG93IHRvIHJ1biBpdCI6KGIu"
-    "ZGF0YXNldC50PT09ImJhZGdlIj8iSG93IGl0IHdvcmtzIjoiSG93IHRvIGluc3RhbGwiKSl9fSk7CmlmKGxvY2F0aW9uLmhhc2gp"
-    "e3ZhciBlbD1kb2N1bWVudC5xdWVyeVNlbGVjdG9yKGxvY2F0aW9uLmhhc2gpO2lmKGVsKXNldFRpbWVvdXQoZnVuY3Rpb24oKXtl"
-    "bC5zY3JvbGxJbnRvVmlldyh7YmVoYXZpb3I6InNtb290aCIsYmxvY2s6ImNlbnRlciJ9KX0sMjAwKX0KPC9zY3JpcHQ+PC9ib2R5"
-    "PjwvaHRtbD4K"
-)
-_B1 = (
-    "Ly8gPT1Vc2VyU2NyaXB0PT0KLy8gQG5hbWUgICAgICAgICBzZWJiaS5wcm8gVG9rZW4gTWV0ZXIKLy8gQG5hbWVzcGFjZSAgICBo"
-    "dHRwczovL3NlYmJpLnByby90b29scwovLyBAdmVyc2lvbiAgICAgIDEuMC4wCi8vIEBkZXNjcmlwdGlvbiAgQSBmbG9hdGluZyBi"
-    "dWJibGUgdGhhdCBjb3VudHMgdGhlIHRva2VucyB5b3UgYXJlIGFib3V0IHRvIHNlbmQgdG8gYW55IEFJLCB3aGF0IHRoZXkgY29z"
-    "dCBhdCB5b3VyIG93biBwcmljZSwgYW5kIGhvdyBtdWNoIHlvdSBoYXZlIHNhdmVkIGJ5IHJlcGVhdGluZyB5b3Vyc2VsZi4KLy8g"
-    "QGF1dGhvciAgICAgICBzZWJiaS5wcm8KLy8gQG1hdGNoICAgICAgICAqOi8vKi8qCi8vIEBncmFudCAgICAgICAgbm9uZQovLyBA"
-    "cnVuLWF0ICAgICAgIGRvY3VtZW50LWlkbGUKLy8gPT0vVXNlclNjcmlwdD09Ci8qCiAgRXZlcnl0aGluZyBpcyBtZWFzdXJlZCBp"
-    "biB5b3VyIGJyb3dzZXIuIE5vdGhpbmcgaXMgc2VudCBhbnl3aGVyZS4KICBEcmFnIHRoZSBidWJibGUgdG8gbW92ZSBpdC4gVGFw"
-    "IGl0IHRvIG9wZW4sIHRhcCBhZ2FpbiB0byBjbG9zZS4KICBTZXQgeW91ciBvd24gcHJpY2UgcGVyIG1pbGxpb24gdG9rZW5zIGlu"
-    "IHRoZSBwYW5lbDsgaXQgaXMgcmVtZW1iZXJlZCBvbiB0aGlzIGRldmljZS4KICBUb2tlbiBjb3VudHMgYXJlIGVzdGltYXRlcyAo"
-    "YWJvdXQgNCBjaGFyYWN0ZXJzIHBlciB0b2tlbiBpbiBFbmdsaXNoKTsKICB5b3VyIHByb3ZpZGVyJ3Mgb3duIGNvdW50IGlzIHRo"
-    "ZSBvbmx5IGV4YWN0IGZpZ3VyZS4KKi8KKGZ1bmN0aW9uKCl7CiJ1c2Ugc3RyaWN0IjsKaWYgKHdpbmRvdy5fX3NlYmJpTWV0ZXIp"
-    "IHJldHVybjsgd2luZG93Ll9fc2ViYmlNZXRlciA9IHRydWU7CnZhciBLPSJzZWJiaS5tZXRlciIsIFM9e3ByaWNlOjAsIHNlbnQ6"
-    "MCwgcmVwZWF0czowLCBzYXZlZDowLCBzZWVuOnt9fTsKdHJ5eyB2YXIgbz1KU09OLnBhcnNlKGxvY2FsU3RvcmFnZS5nZXRJdGVt"
-    "KEspfHwie30iKTsgZm9yKHZhciBrIGluIG8pIFNba109b1trXTsgfWNhdGNoKGUpe30KZnVuY3Rpb24gc2F2ZSgpeyB0cnl7IGxv"
-    "Y2FsU3RvcmFnZS5zZXRJdGVtKEssIEpTT04uc3RyaW5naWZ5KFMpKTsgfWNhdGNoKGUpe30gfQpmdW5jdGlvbiBlc3QodCl7IHJl"
-    "dHVybiBNYXRoLm1heCgwLCBNYXRoLnJvdW5kKCh0fHwiIikubGVuZ3RoLzQpKTsgfQpmdW5jdGlvbiBtb25leShuKXsgcmV0dXJu"
-    "IFMucHJpY2U/ICIkIisobipTLnByaWNlLzFlNikudG9GaXhlZCg0KSA6ICJzZXQgYSBwcmljZSI7IH0KZnVuY3Rpb24gaGFzaCh0"
-    "KXsgdmFyIGg9NTM4MSxpPXQubGVuZ3RoOyB3aGlsZShpKSBoPShoKjMzKV50LmNoYXJDb2RlQXQoLS1pKTsgcmV0dXJuIChoPj4+"
-    "MCkudG9TdHJpbmcoMzYpOyB9Cgp2YXIgY3NzPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoInN0eWxlIik7CmNzcy50ZXh0Q29udGVu"
-    "dD0iI3NibXtwb3NpdGlvbjpmaXhlZDtyaWdodDoxNnB4O2JvdHRvbToxNnB4O3otaW5kZXg6MjE0NzQ4MzY0Nztmb250OjUwMCAx"
-    "MnB4LzEuNCB1aS1tb25vc3BhY2UsTWVubG8sbW9ub3NwYWNlO2NvbG9yOiNmZmZ9IisKIiNzYm0gLmJ7d2lkdGg6NThweDtoZWln"
-    "aHQ6NThweDtib3JkZXItcmFkaXVzOjUwJTtjdXJzb3I6Z3JhYjtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3Rp"
-    "ZnktY29udGVudDpjZW50ZXI7ZmxleC1kaXJlY3Rpb246Y29sdW1uOyIrCiJiYWNrZ3JvdW5kOnJhZGlhbC1ncmFkaWVudChjaXJj"
-    "bGUgYXQgMzIlIDI4JSxyZ2JhKDI1NSwyNTUsMjU1LC45NSkgMCxyZ2JhKDI1NSwyNTUsMjU1LC4zKSAxMiUscmdiYSgxMjcsMjI3"
-    "LDE3NiwuMzUpIDMyJSxyZ2JhKDIwMSwxNjgsNzYsLjQpIDY0JSxyZ2JhKDEwLDE1LDMwLC43KSAxMDAlKTsiKwoiYm94LXNoYWRv"
-    "dzppbnNldCAtOHB4IC0xMHB4IDE4cHggcmdiYSgxMCwxNSwzMCwuNiksaW5zZXQgNnB4IDZweCAxNHB4IHJnYmEoMjU1LDI1NSwy"
-    "NTUsLjM1KSwwIDEwcHggMjRweCByZ2JhKDAsMCwwLC40NSk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4zNSk7"
-    "dGV4dC1zaGFkb3c6MCAxcHggM3B4IHJnYmEoMCwwLDAsLjcpfSIrCiIjc2JtIC5iIGJ7Zm9udC1zaXplOjEzcHh9I3NibSAuYiBp"
-    "e2ZvbnQtc3R5bGU6bm9ybWFsO2ZvbnQtc2l6ZTo4LjVweDtvcGFjaXR5Oi44NX0iKwoiI3NibSAucHtkaXNwbGF5Om5vbmU7d2lk"
-    "dGg6MjMwcHg7bWFyZ2luLWJvdHRvbTo4cHg7YmFja2dyb3VuZDpyZ2JhKDEwLDE1LDMwLC45Nik7Ym9yZGVyOjFweCBzb2xpZCBy"
-    "Z2JhKDIwMSwxNjgsNzYsLjQpO2JvcmRlci1yYWRpdXM6MTJweDtwYWRkaW5nOjEycHg7Ym94LXNoYWRvdzowIDEycHggMzBweCBy"
-    "Z2JhKDAsMCwwLC41KX0iKwoiI3NibS5vbiAucHtkaXNwbGF5OmJsb2NrfSNzYm0gLnJ7ZGlzcGxheTpmbGV4O2p1c3RpZnktY29u"
-    "dGVudDpzcGFjZS1iZXR3ZWVuO3BhZGRpbmc6M3B4IDB9I3NibSAuciBzcGFue2NvbG9yOiM4YTkzYWR9I3NibSAuciBie2NvbG9y"
-    "OiM3ZmUzYjA7Zm9udC13ZWlnaHQ6NjAwfSIrCiIjc2JtIGlucHV0e3dpZHRoOjEwMCU7bWFyZ2luLXRvcDo2cHg7YmFja2dyb3Vu"
-    "ZDojMGQxNDI0O2JvcmRlcjoxcHggc29saWQgcmdiYSgyMDEsMTY4LDc2LC40KTtib3JkZXItcmFkaXVzOjZweDtjb2xvcjojZmZm"
-    "O3BhZGRpbmc6NnB4O2ZvbnQ6MTJweCB1aS1tb25vc3BhY2UsbW9ub3NwYWNlfSIrCiIjc2JtIGF7Y29sb3I6I2M5YTg0Yzt0ZXh0"
-    "LWRlY29yYXRpb246bm9uZTtmb250LXNpemU6MTAuNXB4O2Rpc3BsYXk6YmxvY2s7bWFyZ2luLXRvcDo4cHg7dGV4dC1hbGlnbjpj"
-    "ZW50ZXJ9IjsKZG9jdW1lbnQuZG9jdW1lbnRFbGVtZW50LmFwcGVuZENoaWxkKGNzcyk7Cgp2YXIgYm94PWRvY3VtZW50LmNyZWF0"
-    "ZUVsZW1lbnQoImRpdiIpOyBib3guaWQ9InNibSI7CmJveC5pbm5lckhUTUw9JzxkaXYgY2xhc3M9InAiPicrCiAnPGRpdiBjbGFz"
-    "cz0iciI+PHNwYW4+aW4gdGhlIGJveCBub3c8L3NwYW4+PGIgaWQ9InNibS1ub3ciPjA8L2I+PC9kaXY+JysKICc8ZGl2IGNsYXNz"
-    "PSJyIj48c3Bhbj5jb3N0IG9mIHRoaXMgb25lPC9zcGFuPjxiIGlkPSJzYm0tY29zdCI+LTwvYj48L2Rpdj4nKwogJzxkaXYgY2xh"
-    "c3M9InIiPjxzcGFuPnNlbnQgdGhpcyBzZXNzaW9uPC9zcGFuPjxiIGlkPSJzYm0tc2VudCI+MDwvYj48L2Rpdj4nKwogJzxkaXYg"
-    "Y2xhc3M9InIiPjxzcGFuPnJlcGVhdHMgc3BvdHRlZDwvc3Bhbj48YiBpZD0ic2JtLXJlcCI+MDwvYj48L2Rpdj4nKwogJzxkaXYg"
-    "Y2xhc3M9InIiPjxzcGFuPmF2b2lkYWJsZSBieSBjYWNoaW5nPC9zcGFuPjxiIGlkPSJzYm0tc2F2ZWQiPjA8L2I+PC9kaXY+JysK"
-    "ICc8aW5wdXQgaWQ9InNibS1wcmljZSIgaW5wdXRtb2RlPSJkZWNpbWFsIiBwbGFjZWhvbGRlcj0ieW91ciAkIHBlciAxTSB0b2tl"
-    "bnMiPicrCiAnPGEgaHJlZj0iaHR0cHM6Ly9zZWJiaS5wcm8vdG9vbHMiIHRhcmdldD0iX2JsYW5rIiByZWw9Im5vb3BlbmVyIj5z"
-    "ZWJiaS5wcm8gdG9vbHMgJiM4NTk5OzwvYT48L2Rpdj4nKwogJzxkaXYgY2xhc3M9ImIiPjxiIGlkPSJzYm0tYmFkZ2UiPjA8L2I+"
-    "PGk+dG9rZW5zPC9pPjwvZGl2Pic7CmRvY3VtZW50LmRvY3VtZW50RWxlbWVudC5hcHBlbmRDaGlsZChib3gpOwp2YXIgYmFkZ2U9"
-    "Ym94LnF1ZXJ5U2VsZWN0b3IoIiNzYm0tYmFkZ2UiKSwgYnViPWJveC5xdWVyeVNlbGVjdG9yKCIuYiIpOwpmdW5jdGlvbiBwYWlu"
-    "dChuKXsgYmFkZ2UudGV4dENvbnRlbnQgPSBuPjk5OT8gKG4vMTAwMCkudG9GaXhlZCgxKSsiayIgOiBuOwogYm94LnF1ZXJ5U2Vs"
-    "ZWN0b3IoIiNzYm0tbm93IikudGV4dENvbnRlbnQ9bjsKIGJveC5xdWVyeVNlbGVjdG9yKCIjc2JtLWNvc3QiKS50ZXh0Q29udGVu"
-    "dD1tb25leShuKTsKIGJveC5xdWVyeVNlbGVjdG9yKCIjc2JtLXNlbnQiKS50ZXh0Q29udGVudD1TLnNlbnQ7CiBib3gucXVlcnlT"
-    "ZWxlY3RvcigiI3NibS1yZXAiKS50ZXh0Q29udGVudD1TLnJlcGVhdHM7CiBib3gucXVlcnlTZWxlY3RvcigiI3NibS1zYXZlZCIp"
-    "LnRleHRDb250ZW50PVMuc2F2ZWQrIiB0b2tlbnMgIisoUy5wcmljZT8iKCIrbW9uZXkoUy5zYXZlZCkrIikiOiIiKTsgfQpib3gu"
-    "cXVlcnlTZWxlY3RvcigiI3NibS1wcmljZSIpLnZhbHVlPVMucHJpY2V8fCIiOwpib3gucXVlcnlTZWxlY3RvcigiI3NibS1wcmlj"
-    "ZSIpLmFkZEV2ZW50TGlzdGVuZXIoImlucHV0IixmdW5jdGlvbigpeyBTLnByaWNlPXBhcnNlRmxvYXQodGhpcy52YWx1ZSl8fDA7"
-    "IHNhdmUoKTsgcGFpbnQoY3VyKTsgfSk7Cgp2YXIgY3VyPTA7CmZ1bmN0aW9uIHRleHQoZWwpeyByZXR1cm4gZWw/IChlbC52YWx1"
-    "ZSE9bnVsbD8gZWwudmFsdWUgOiBlbC5pbm5lclRleHQpIDogIiI7IH0KZnVuY3Rpb24gbGl2ZSgpeyB2YXIgYT1kb2N1bWVudC5h"
-    "Y3RpdmVFbGVtZW50LCB0PXRleHQoYSk7CiBpZighdCAmJiBkb2N1bWVudC5xdWVyeVNlbGVjdG9yKCJ0ZXh0YXJlYSIpKSB0PXRl"
-    "eHQoZG9jdW1lbnQucXVlcnlTZWxlY3RvcigidGV4dGFyZWEiKSk7CiBjdXI9ZXN0KHQpOyBwYWludChjdXIpOyB9CnNldEludGVy"
-    "dmFsKGxpdmUsIDcwMCk7CmRvY3VtZW50LmFkZEV2ZW50TGlzdGVuZXIoImtleWRvd24iLCBmdW5jdGlvbihlKXsKIGlmKGUua2V5"
-    "PT09IkVudGVyIiAmJiAhZS5zaGlmdEtleSl7IHZhciB0PXRleHQoZG9jdW1lbnQuYWN0aXZlRWxlbWVudCk7IGlmKCF0KSByZXR1"
-    "cm47CiAgdmFyIG49ZXN0KHQpOyBpZighbikgcmV0dXJuOyBTLnNlbnQrPW47IHZhciBoPWhhc2godC50cmltKCkpOwogIGlmKFMu"
-    "c2VlbltoXSl7IFMucmVwZWF0cysrOyBTLnNhdmVkKz1uOyB9IGVsc2UgeyBTLnNlZW5baF09MTsgfQogIHNhdmUoKTsgc2V0VGlt"
-    "ZW91dChsaXZlLDMwMCk7IH0gfSwgdHJ1ZSk7Cgp2YXIgZHJhZz1mYWxzZSxveD0wLG95PTAsbW92ZWQ9ZmFsc2U7CmJ1Yi5hZGRF"
-    "dmVudExpc3RlbmVyKCJwb2ludGVyZG93biIsZnVuY3Rpb24oZSl7ZHJhZz10cnVlO21vdmVkPWZhbHNlO294PWUuY2xpZW50WDtv"
-    "eT1lLmNsaWVudFk7YnViLnNldFBvaW50ZXJDYXB0dXJlKGUucG9pbnRlcklkKX0pOwpidWIuYWRkRXZlbnRMaXN0ZW5lcigicG9p"
-    "bnRlcm1vdmUiLGZ1bmN0aW9uKGUpeyBpZighZHJhZykgcmV0dXJuOyB2YXIgZHg9ZS5jbGllbnRYLW94LCBkeT1lLmNsaWVudFkt"
-    "b3k7CiBpZihNYXRoLmFicyhkeCkrTWF0aC5hYnMoZHkpPjYpeyBtb3ZlZD10cnVlOyBib3guc3R5bGUucmlnaHQ9KHBhcnNlSW50"
-    "KGJveC5zdHlsZS5yaWdodHx8MTYpLWR4KSsicHgiOyBib3guc3R5bGUuYm90dG9tPShwYXJzZUludChib3guc3R5bGUuYm90dG9t"
-    "fHwxNiktZHkpKyJweCI7IG94PWUuY2xpZW50WDsgb3k9ZS5jbGllbnRZOyB9IH0pOwpidWIuYWRkRXZlbnRMaXN0ZW5lcigicG9p"
-    "bnRlcnVwIixmdW5jdGlvbigpeyBkcmFnPWZhbHNlOyBpZighbW92ZWQpIGJveC5jbGFzc0xpc3QudG9nZ2xlKCJvbiIpOyB9KTsK"
-    "cGFpbnQoMCk7Cn0pKCk7Cg=="
-)
-_B2 = (
-    "Ly8gPT1Vc2VyU2NyaXB0PT0KLy8gQG5hbWUgICAgICAgICBzZWJiaS5wcm8gUmVjZWlwdCBMZW5zCi8vIEBuYW1lc3BhY2UgICAg"
-    "aHR0cHM6Ly9zZWJiaS5wcm8vdG9vbHMKLy8gQHZlcnNpb24gICAgICAxLjAuMAovLyBAZGVzY3JpcHRpb24gIEZpbmRzIGV2ZXJ5"
-    "IFNIQS0yNTYgcmVjZWlwdCBvbiBhbnkgcGFnZSB5b3UgcmVhZCBhbmQgY2hlY2tzIGl0IGFnYWluc3QgdGhlIHNlYmJpLnBybyBj"
-    "aGFpbiBpbiBvbmUgdGFwLiBGb3IgYXVkaXRvcnMsIHJldmlld2VycyBhbmQgYW55b25lIGhhbmRlZCBhIGhhc2guCi8vIEBhdXRo"
-    "b3IgICAgICAgc2ViYmkucHJvCi8vIEBtYXRjaCAgICAgICAgKjovLyovKgovLyBAZ3JhbnQgICAgICAgIG5vbmUKLy8gQHJ1bi1h"
-    "dCAgICAgICBkb2N1bWVudC1pZGxlCi8vID09L1VzZXJTY3JpcHQ9PQovKgogIEhpZ2hsaWdodHMgNjQtY2hhcmFjdGVyIGhhc2hl"
-    "cyB3aGVyZXZlciB0aGV5IGFwcGVhcjogZW1haWxzIGluIHRoZSBicm93c2VyLAogIHdpa2lzLCB0aWNrZXRzLCBQREZzIHJlbmRl"
-    "cmVkIGFzIHRleHQsIHNwcmVhZHNoZWV0cyBvbiB0aGUgd2ViLgogIFRhcCBvbmUgYW5kIGl0IGFza3MgaHR0cHM6Ly9zZWJiaS5w"
-    "cm8vYS92ZXJpZnkgd2hldGhlciB0aGF0IHJlY29yZCBpcyBpbiB0aGUKICBjaGFpbiwgYW5kIGhvdyBkZWVwIGl0IGlzIGJ1cmll"
-    "ZC4gT25seSB0aGUgaGFzaCBpcyBldmVyIHNlbnQuCiovCihmdW5jdGlvbigpewoidXNlIHN0cmljdCI7CmlmKHdpbmRvdy5fX3Nl"
-    "YmJpTGVucykgcmV0dXJuOyB3aW5kb3cuX19zZWJiaUxlbnM9dHJ1ZTsKdmFyIFJFPS9cYlswLTlhLWZdezY0fVxiL2csIEFQST0i"
-    "aHR0cHM6Ly9zZWJiaS5wcm8vYS92ZXJpZnk/aGFzaD0iOwp2YXIgY3NzPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoInN0eWxlIik7"
-    "CmNzcy50ZXh0Q29udGVudD0iLnNibHtiYWNrZ3JvdW5kOnJnYmEoMjAxLDE2OCw3NiwuMTgpO2JvcmRlci1ib3R0b206MS41cHgg"
-    "ZG90dGVkICNjOWE4NGM7Y3Vyc29yOnBvaW50ZXI7Ym9yZGVyLXJhZGl1czozcHh9IisKIi5zYmwub2t7YmFja2dyb3VuZDpyZ2Jh"
-    "KDEyNywyMjcsMTc2LC4yMik7Ym9yZGVyLWJvdHRvbS1jb2xvcjojMkU3RDU3fS5zYmwubm97YmFja2dyb3VuZDpyZ2JhKDI1NSwx"
-    "MzgsMTI4LC4yMik7Ym9yZGVyLWJvdHRvbS1jb2xvcjojOUMyRjI2fSIrCiIjc2JsLXR7cG9zaXRpb246Zml4ZWQ7ei1pbmRleDoy"
-    "MTQ3NDgzNjQ3O21heC13aWR0aDoyODBweDtiYWNrZ3JvdW5kOiMwYTBmMWU7Y29sb3I6I2ZmZjtib3JkZXI6MXB4IHNvbGlkIHJn"
-    "YmEoMjAxLDE2OCw3NiwuNSk7Ym9yZGVyLXJhZGl1czoxMHB4OyIrCiJwYWRkaW5nOjEwcHggMTJweDtmb250OjEycHgvMS41IHVp"
-    "LW1vbm9zcGFjZSxNZW5sbyxtb25vc3BhY2U7Ym94LXNoYWRvdzowIDEwcHggMzBweCByZ2JhKDAsMCwwLC41KTtkaXNwbGF5Om5v"
-    "bmU7d29yZC1icmVhazpicmVhay1hbGx9IisKIiNzYmwtdCBhe2NvbG9yOiM3ZmUzYjB9I3NibC1je3Bvc2l0aW9uOmZpeGVkO3Jp"
-    "Z2h0OjE2cHg7Ym90dG9tOjg2cHg7ei1pbmRleDoyMTQ3NDgzNjQ2O2JhY2tncm91bmQ6IzBhMGYxZTtjb2xvcjojZmZmO2JvcmRl"
-    "cjoxcHggc29saWQgcmdiYSgyMDEsMTY4LDc2LC41KTsiKwoiYm9yZGVyLXJhZGl1czo5OTlweDtwYWRkaW5nOjdweCAxMnB4O2Zv"
-    "bnQ6NjAwIDExcHggdWktbW9ub3NwYWNlLG1vbm9zcGFjZTtib3gtc2hhZG93OjAgOHB4IDIwcHggcmdiYSgwLDAsMCwuNCl9IjsK"
-    "ZG9jdW1lbnQuZG9jdW1lbnRFbGVtZW50LmFwcGVuZENoaWxkKGNzcyk7CnZhciB0aXA9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgi"
-    "ZGl2Iik7IHRpcC5pZD0ic2JsLXQiOyBkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQuYXBwZW5kQ2hpbGQodGlwKTsKdmFyIGNvdW50"
-    "PWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpOyBjb3VudC5pZD0ic2JsLWMiOyBkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQu"
-    "YXBwZW5kQ2hpbGQoY291bnQpOwoKZnVuY3Rpb24gd2Fsayhyb290KXsKIHZhciB3PWRvY3VtZW50LmNyZWF0ZVRyZWVXYWxrZXIo"
-    "cm9vdCwgTm9kZUZpbHRlci5TSE9XX1RFWFQsIHthY2NlcHROb2RlOmZ1bmN0aW9uKG4pewogIGlmKCFuLm5vZGVWYWx1ZSB8fCBu"
-    "Lm5vZGVWYWx1ZS5sZW5ndGg8NjQpIHJldHVybiBOb2RlRmlsdGVyLkZJTFRFUl9SRUpFQ1Q7CiAgdmFyIHA9bi5wYXJlbnROb2Rl"
-    "LCB0PXAmJnAubm9kZU5hbWU7CiAgaWYodD09PSJTQ1JJUFQifHx0PT09IlNUWUxFInx8dD09PSJURVhUQVJFQSJ8fChwJiZwLmNs"
-    "YXNzTGlzdCYmcC5jbGFzc0xpc3QuY29udGFpbnMoInNibCIpKSkgcmV0dXJuIE5vZGVGaWx0ZXIuRklMVEVSX1JFSkVDVDsKICBy"
-    "ZXR1cm4gUkUudGVzdChuLm5vZGVWYWx1ZSk/IE5vZGVGaWx0ZXIuRklMVEVSX0FDQ0VQVCA6IE5vZGVGaWx0ZXIuRklMVEVSX1JF"
-    "SkVDVDsgfX0sIGZhbHNlKTsKIHZhciBoaXRzPVtdLG47IHdoaWxlKChuPXcubmV4dE5vZGUoKSkpIGhpdHMucHVzaChuKTsKIHZh"
-    "ciBmb3VuZD0wOwogaGl0cy5mb3JFYWNoKGZ1bmN0aW9uKG5vZGUpewogIHZhciBwYXJ0cz1ub2RlLm5vZGVWYWx1ZS5zcGxpdChS"
-    "RSksIGtlZXA9bm9kZS5ub2RlVmFsdWUubWF0Y2goUkUpfHxbXSwgZnJhZz1kb2N1bWVudC5jcmVhdGVEb2N1bWVudEZyYWdtZW50"
-    "KCk7CiAgcGFydHMuZm9yRWFjaChmdW5jdGlvbihwLGkpeyBmcmFnLmFwcGVuZENoaWxkKGRvY3VtZW50LmNyZWF0ZVRleHROb2Rl"
-    "KHApKTsKICAgaWYoa2VlcFtpXSl7IHZhciBzPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoInNwYW4iKTsgcy5jbGFzc05hbWU9InNi"
-    "bCI7IHMudGV4dENvbnRlbnQ9a2VlcFtpXTsgcy50aXRsZT0iVGFwIHRvIGNoZWNrIGFnYWluc3QgdGhlIHNlYmJpLnBybyBjaGFp"
-    "biI7IGZyYWcuYXBwZW5kQ2hpbGQocyk7IGZvdW5kKys7IH0gfSk7CiAgbm9kZS5wYXJlbnROb2RlLnJlcGxhY2VDaGlsZChmcmFn"
-    "LG5vZGUpOyB9KTsKIHJldHVybiBmb3VuZDsgfQoKZnVuY3Rpb24gc2hvdyhlbCxtc2cpeyB2YXIgcj1lbC5nZXRCb3VuZGluZ0Ns"
-    "aWVudFJlY3QoKTsgdGlwLmlubmVySFRNTD1tc2c7IHRpcC5zdHlsZS5kaXNwbGF5PSJibG9jayI7CiB0aXAuc3R5bGUubGVmdD1N"
-    "YXRoLm1heCg4LE1hdGgubWluKGlubmVyV2lkdGgtMjkyLHIubGVmdCkpKyJweCI7CiB0aXAuc3R5bGUudG9wPShyLmJvdHRvbSs4"
-    "K3RpcC5vZmZzZXRIZWlnaHQ+aW5uZXJIZWlnaHQ/IHIudG9wLXRpcC5vZmZzZXRIZWlnaHQtOCA6IHIuYm90dG9tKzgpKyJweCI7"
-    "IH0KZG9jdW1lbnQuYWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLGZ1bmN0aW9uKGUpewogdmFyIGVsPWUudGFyZ2V0OyBpZighZWwu"
-    "Y2xhc3NMaXN0fHwhZWwuY2xhc3NMaXN0LmNvbnRhaW5zKCJzYmwiKSl7IHRpcC5zdHlsZS5kaXNwbGF5PSJub25lIjsgcmV0dXJu"
-    "OyB9CiB2YXIgaD1lbC50ZXh0Q29udGVudDsgc2hvdyhlbCwiQXNraW5nIHRoZSBjaGFpbiZoZWxsaXA7Iik7CiBmZXRjaChBUEkr"
-    "aCx7Y2FjaGU6Im5vLXN0b3JlIn0pLnRoZW4oZnVuY3Rpb24ocil7cmV0dXJuIHIudGV4dCgpfSkudGhlbihmdW5jdGlvbih0KXsK"
-    "ICB2YXIgb2s9dC5pbmRleE9mKCJWRVJJRklFRCIpPT09MDsgZWwuY2xhc3NMaXN0LmFkZChvaz8ib2siOiJubyIpOwogIHNob3co"
-    "ZWwsIjxiPiIrKG9rPyImIzEwMDAzOyAiOiImIzEwMDA3OyAiKSt0LnRyaW0oKSsiPC9iPjxicj48YSBocmVmPSdodHRwczovL3Nl"
-    "YmJpLnByby9hdWRpdG9ycycgdGFyZ2V0PSdfYmxhbmsnIHJlbD0nbm9vcGVuZXInPnNlYmJpLnBybyBhdWRpdG9yIHRvb2xzICYj"
-    "ODU5OTs8L2E+Iik7CiB9KS5jYXRjaChmdW5jdGlvbigpeyBzaG93KGVsLCJDb3VsZCBub3QgcmVhY2ggdGhlIGNoYWluLiIpOyB9"
-    "KTsgfSx0cnVlKTsKCnZhciBuPXdhbGsoZG9jdW1lbnQuYm9keSk7CmNvdW50LnRleHRDb250ZW50PW4/IG4rIiByZWNlaXB0Iiso"
-    "bj09PTE/IiI6InMiKSsiIG9uIHRoaXMgcGFnZSIgOiAibm8gcmVjZWlwdHMgb24gdGhpcyBwYWdlIjsKc2V0VGltZW91dChmdW5j"
-    "dGlvbigpe2NvdW50LnN0eWxlLmRpc3BsYXk9Im5vbmUifSw2MDAwKTsKfSkoKTsK"
-)
-_B3 = (
-    "Ly8gPT1Vc2VyU2NyaXB0PT0KLy8gQG5hbWUgICAgICAgICBzZWJiaS5wcm8gUHJvbXB0IFNoaWVsZAovLyBAbmFtZXNwYWNlICAg"
-    "IGh0dHBzOi8vc2ViYmkucHJvL3Rvb2xzCi8vIEB2ZXJzaW9uICAgICAgMS4wLjAKLy8gQGRlc2NyaXB0aW9uICBXYXJucyB5b3Ug"
-    "YmVmb3JlIHlvdSBwYXN0ZSBhIHNlY3JldCBpbnRvIGFuIEFJLCBhbmQgbWFza3MgaXQgaW4gb25lIHRhcC4gRW1haWxzLCBBUEkg"
-    "a2V5cywgY2FyZCBudW1iZXJzLCBiZWFyZXIgdG9rZW5zIGFuZCBVSyBuYXRpb25hbCBpbnN1cmFuY2UgbnVtYmVycywgY2F1Z2h0"
-    "IGluIHRoZSBib3ggYmVmb3JlIHRoZXkgbGVhdmUgeW91ciBtYWNoaW5lLgovLyBAYXV0aG9yICAgICAgIHNlYmJpLnBybwovLyBA"
-    "bWF0Y2ggICAgICAgICo6Ly8qLyoKLy8gQGdyYW50ICAgICAgICBub25lCi8vIEBydW4tYXQgICAgICAgZG9jdW1lbnQtaWRsZQov"
-    "LyA9PS9Vc2VyU2NyaXB0PT0KLyoKICBSdW5zIGVudGlyZWx5IGluIHlvdXIgYnJvd3Nlci4gTm90aGluZyBpcyBzZW50IGFueXdo"
-    "ZXJlLCBldmVyLgogIFdoZW4gYSBzZWNyZXQgYXBwZWFycyBpbiB0aGUgYm94IHlvdSBhcmUgdHlwaW5nIGluLCBhIGJhciByaXNl"
-    "cyBmcm9tIHRoZQogIGJvdHRvbSBuYW1pbmcgd2hhdCBpdCBmb3VuZC4gVGFwICJNYXNrIHRoZW0iIGFuZCB0aGUgc2VjcmV0cyBh"
-    "cmUgcmVwbGFjZWQKICB3aXRoIFtSRURBQ1RFRF0gaW4gcGxhY2UsIGxlYXZpbmcgdGhlIHJlc3Qgb2YgeW91ciBwcm9tcHQgdW50"
-    "b3VjaGVkLgoqLwooZnVuY3Rpb24oKXsKInVzZSBzdHJpY3QiOwppZih3aW5kb3cuX19zZWJiaVNoaWVsZCkgcmV0dXJuOyB3aW5k"
-    "b3cuX19zZWJiaVNoaWVsZD10cnVlOwp2YXIgUlVMRVM9WwogWyJlbWFpbCIsIC9bQS1aYS16MC05Ll8lKy1dK0BbQS1aYS16MC05"
-    "Li1dK1wuW0EtWmEtel17Mix9L2csICJbUkVEQUNURURfRU1BSUxdIl0sCiBbImJlYXJlciB0b2tlbiIsIC9cYkJlYXJlclxzK1tB"
-    "LVphLXowLTkuX1wtXXsxMix9L2dpLCAiQmVhcmVyIFtSRURBQ1RFRF0iXSwKIFsiQVBJIGtleSIsIC9cYig/OnNrfHBrfHJrfGFw"
-    "aXxrZXkpWy1fXSg/OmxpdmV8dGVzdHxwcm9kKT9bLV9dP1tBLVphLXowLTldezEyLH1cYi9naSwgIltSRURBQ1RFRF9LRVldIl0s"
-    "CiBbIkFXUyBrZXkiLCAvXGJBS0lBWzAtOUEtWl17MTZ9XGIvZywgIltSRURBQ1RFRF9BV1NfS0VZXSJdLAogWyJwcml2YXRlIGtl"
-    "eSBibG9jayIsIC8tLS0tLUJFR0lOIFtBLVogXSpQUklWQVRFIEtFWS0tLS0tL2csICJbUkVEQUNURURfUFJJVkFURV9LRVldIl0s"
-    "CiBbImNhcmQgbnVtYmVyIiwgL1xiKD86XGRbIC1dPyl7MTMsMTZ9XGIvZywgIltSRURBQ1RFRF9DQVJEXSJdLAogWyJOSSBudW1i"
-    "ZXIiLCAvXGJbQS1DRUdISi1QUi1UVy1aXXsyfVxzP1xkezJ9XHM/XGR7Mn1ccz9cZHsyfVxzP1tBLURdXGIvZywgIltSRURBQ1RF"
-    "RF9OSV0iXQpdOwp2YXIgY3NzPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoInN0eWxlIik7CmNzcy50ZXh0Q29udGVudD0iI3Nic3tw"
-    "b3NpdGlvbjpmaXhlZDtsZWZ0OjUwJTt0cmFuc2Zvcm06dHJhbnNsYXRlWCgtNTAlKSB0cmFuc2xhdGVZKDEyMCUpO2JvdHRvbTox"
-    "NnB4O3otaW5kZXg6MjE0NzQ4MzY0NztkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDoxMnB4OyIrCiJiYWNrZ3Jv"
-    "dW5kOiMwYTBmMWU7Y29sb3I6I2ZmZjtib3JkZXI6MS41cHggc29saWQgI2ZmOGE4MDtib3JkZXItcmFkaXVzOjEycHg7cGFkZGlu"
-    "ZzoxMXB4IDE0cHg7Zm9udDo1MDAgMTIuNXB4IHVpLW1vbm9zcGFjZSxNZW5sbyxtb25vc3BhY2U7IisKImJveC1zaGFkb3c6MCAx"
-    "MnB4IDM0cHggcmdiYSgwLDAsMCwuNTUpO3RyYW5zaXRpb246dHJhbnNmb3JtIC4zNXMgY3ViaWMtYmV6aWVyKC4yLC45LC4zLDEp"
-    "O21heC13aWR0aDo5NHZ3fSIrCiIjc2JzLnVwe3RyYW5zZm9ybTp0cmFuc2xhdGVYKC01MCUpIHRyYW5zbGF0ZVkoMCl9I3NicyBi"
-    "e2NvbG9yOiNmZjhhODB9IisKIiNzYnMgYnV0dG9ue2JhY2tncm91bmQ6I2M5YTg0Yztjb2xvcjojMGEwZjFlO2JvcmRlcjowO2Jv"
-    "cmRlci1yYWRpdXM6N3B4O3BhZGRpbmc6OHB4IDEycHg7Zm9udDo2MDAgMTJweCB1aS1tb25vc3BhY2UsbW9ub3NwYWNlO2N1cnNv"
-    "cjpwb2ludGVyfSIrCiIjc2JzIC54e2JhY2tncm91bmQ6dHJhbnNwYXJlbnQ7Y29sb3I6IzhhOTNhZDtib3JkZXI6MXB4IHNvbGlk"
-    "IHJnYmEoMjU1LDI1NSwyNTUsLjIpfSI7CmRvY3VtZW50LmRvY3VtZW50RWxlbWVudC5hcHBlbmRDaGlsZChjc3MpOwp2YXIgYmFy"
-    "PWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpOyBiYXIuaWQ9InNicyI7CmJhci5pbm5lckhUTUw9JzxzcGFuIGlkPSJzYnMt"
-    "bXNnIj48L3NwYW4+PGJ1dHRvbiBpZD0ic2JzLWdvIj5NYXNrIHRoZW08L2J1dHRvbj48YnV0dG9uIGNsYXNzPSJ4IiBpZD0ic2Jz"
-    "LW5vIj5JZ25vcmU8L2J1dHRvbj4nOwpkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQuYXBwZW5kQ2hpbGQoYmFyKTsKdmFyIG1zZz1i"
-    "YXIucXVlcnlTZWxlY3RvcigiI3Nicy1tc2ciKSwgdGFyZ2V0PW51bGwsIGlnbm9yZWQ9e307CgpmdW5jdGlvbiBzY2FuKHQpeyB2"
-    "YXIgZm91bmQ9W107IFJVTEVTLmZvckVhY2goZnVuY3Rpb24ocil7IHJbMV0ubGFzdEluZGV4PTA7IGlmKHJbMV0udGVzdCh0KSkg"
-    "Zm91bmQucHVzaChyWzBdKTsgfSk7IHJldHVybiBmb3VuZDsgfQpmdW5jdGlvbiBtYXNrKHQpeyBSVUxFUy5mb3JFYWNoKGZ1bmN0"
-    "aW9uKHIpeyByWzFdLmxhc3RJbmRleD0wOyB0PXQucmVwbGFjZShyWzFdLCByWzJdKTsgfSk7IHJldHVybiB0OyB9CmZ1bmN0aW9u"
-    "IHZhbChlbCl7IHJldHVybiBlbD8gKGVsLnZhbHVlIT1udWxsPyBlbC52YWx1ZSA6IGVsLmlubmVyVGV4dCkgOiAiIjsgfQpmdW5j"
-    "dGlvbiBzZXRWYWwoZWwsdil7IGlmKGVsLnZhbHVlIT1udWxsKXsgZWwudmFsdWU9djsgZWwuZGlzcGF0Y2hFdmVudChuZXcgRXZl"
-    "bnQoImlucHV0Iix7YnViYmxlczp0cnVlfSkpOyB9IGVsc2UgeyBlbC5pbm5lclRleHQ9djsgfSB9CgpzZXRJbnRlcnZhbChmdW5j"
-    "dGlvbigpewogdmFyIGVsPWRvY3VtZW50LmFjdGl2ZUVsZW1lbnQ7IGlmKCFlbCkgcmV0dXJuOwogdmFyIGVkaXRhYmxlID0gZWwu"
-    "dmFsdWUhPW51bGwgfHwgZWwuaXNDb250ZW50RWRpdGFibGU7IGlmKCFlZGl0YWJsZSl7IGJhci5jbGFzc0xpc3QucmVtb3ZlKCJ1"
-    "cCIpOyByZXR1cm47IH0KIHZhciB0PXZhbChlbCk7IGlmKCF0IHx8IHQubGVuZ3RoPDgpeyBiYXIuY2xhc3NMaXN0LnJlbW92ZSgi"
-    "dXAiKTsgcmV0dXJuOyB9CiB2YXIgZj1zY2FuKHQpLCBrZXk9Zi5qb2luKCJ8IikrIjoiK3QubGVuZ3RoOwogaWYoZi5sZW5ndGgg"
-    "JiYgIWlnbm9yZWRba2V5XSl7IHRhcmdldD1lbDsgbXNnLmlubmVySFRNTD0iU2VjcmV0IGluIHRoZSBib3g6IDxiPiIrZi5qb2lu"
-    "KCIsICIpKyI8L2I+IjsgYmFyLmNsYXNzTGlzdC5hZGQoInVwIik7IH0KIGVsc2UgYmFyLmNsYXNzTGlzdC5yZW1vdmUoInVwIik7"
-    "Cn0sIDgwMCk7CmJhci5xdWVyeVNlbGVjdG9yKCIjc2JzLWdvIikub25jbGljaz1mdW5jdGlvbigpeyBpZih0YXJnZXQpeyBzZXRW"
-    "YWwodGFyZ2V0LCBtYXNrKHZhbCh0YXJnZXQpKSk7IH0gYmFyLmNsYXNzTGlzdC5yZW1vdmUoInVwIik7IH07CmJhci5xdWVyeVNl"
-    "bGVjdG9yKCIjc2JzLW5vIikub25jbGljaz1mdW5jdGlvbigpeyB2YXIgdD12YWwodGFyZ2V0KTsgaWdub3JlZFtzY2FuKHQpLmpv"
-    "aW4oInwiKSsiOiIrdC5sZW5ndGhdPTE7IGJhci5jbGFzc0xpc3QucmVtb3ZlKCJ1cCIpOyB9Owp9KSgpOwo="
-)
-_B4 = (
-    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKc2ViYmlfc3BlbmRfZ3VhcmQucHkgIC0gIGEgaGFyZCBidWRnZXQgZm9yIGFueSBB"
-    "SSBhZ2VudAo9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CgpPbmUgZmlsZSwg"
-    "c3RhbmRhcmQgbGlicmFyeSBvbmx5LiBQdXQgYSBjZWlsaW5nIG9uIHdoYXQgYW4gYWdlbnQgY2FuIHNwZW5kLAphbmQgc3RvcCBp"
-    "dCBkZWFkIHdoZW4gdGhlIGNlaWxpbmcgaXMgcmVhY2hlZC4KCiAgICBmcm9tIHNlYmJpX3NwZW5kX2d1YXJkIGltcG9ydCBHdWFy"
-    "ZCwgQnVkZ2V0U3BlbnQKCiAgICBndWFyZCA9IEd1YXJkKGRhaWx5X2xpbWl0X2dicD01LjAwLCBwcmljZV9wZXJfbWlsbGlvbj0z"
-    "LjAwKQoKICAgIEBndWFyZC5tZXRlcgogICAgZGVmIGFza19tb2RlbChwcm9tcHQpOgogICAgICAgIC4uLiAgICAgICAgICAgICAg"
-    "ICAgICAgICAjIHlvdXIgZXhpc3RpbmcgY2FsbCwgdW5jaGFuZ2VkCgogICAgdHJ5OgogICAgICAgIGFza19tb2RlbCgic3VtbWFy"
-    "aXNlIHRoaXMiKQogICAgZXhjZXB0IEJ1ZGdldFNwZW50IGFzIGU6CiAgICAgICAgcHJpbnQoInN0b3BwZWQ6IiwgZSkgICAgICMg"
-    "dGhlIGNhbGwgbmV2ZXIgaGFwcGVuZWQKCldoYXQgaXQgZG9lcwogIC0gRXN0aW1hdGVzIHRoZSBjb3N0IG9mIGV2ZXJ5IGNhbGwg"
-    "QkVGT1JFIGl0IGlzIG1hZGUgYW5kIHJlZnVzZXMgdGhlIGNhbGwKICAgIHRoYXQgd291bGQgYnJlYWsgdGhlIGJ1ZGdldCwgcmF0"
-    "aGVyIHRoYW4gcmVwb3J0aW5nIGl0IGFmdGVyd2FyZHMuCiAgLSBDYXRjaGVzIHJ1bmF3YXkgbG9vcHM6IHRoZSBzYW1lIHByb21w"
-    "dCByZXBlYXRlZCBpcyBzZXJ2ZWQgZnJvbSBhIGxvY2FsCiAgICBjYWNoZSwgYW5kIGEgYnVyc3Qgb2YgY2FsbHMgaW4gYSBmZXcg"
-    "c2Vjb25kcyB0cmlwcyBhIGNpcmN1aXQgYnJlYWtlci4KICAtIEtlZXBzIGEgbG9jYWwsIGhhc2gtY2hhaW5lZCByZWNvcmQgb2Yg"
-    "ZXZlcnkgZGVjaXNpb24gaW4gc3BlbmRfZ3VhcmQubG9nLAogICAgc28gdGhlIHNwZW5kIHJlY29yZCBjYW5ub3QgYmUgcXVpZXRs"
-    "eSBlZGl0ZWQgYWZ0ZXIgYW4gaW5jaWRlbnQuCiAgLSBTZW5kcyBub3RoaW5nIGFueXdoZXJlLiBQcm9tcHRzIG5ldmVyIGxlYXZl"
-    "IHRoZSBtYWNoaW5lOyBvbmx5IHlvdSByZWFkCiAgICB0aGUgbG9nLgoKUnVuIGl0IGRpcmVjdGx5IGZvciBhIGRlbW9uc3RyYXRp"
-    "b246ICBweXRob24zIHNlYmJpX3NwZW5kX2d1YXJkLnB5CiIiIgoKaW1wb3J0IGZ1bmN0b29scwppbXBvcnQgaGFzaGxpYgppbXBv"
-    "cnQganNvbgppbXBvcnQgb3MKaW1wb3J0IHRocmVhZGluZwppbXBvcnQgdGltZQoKX192ZXJzaW9uX18gPSAiMS4wLjAiCkxPRyA9"
-    "IG9zLmVudmlyb24uZ2V0KCJTRUJCSV9HVUFSRF9MT0ciLCAic3BlbmRfZ3VhcmQubG9nIikKCgpjbGFzcyBCdWRnZXRTcGVudChF"
-    "eGNlcHRpb24pOgogICAgIiIiVGhlIGNhbGwgd2FzIHJlZnVzZWQuIEl0IGRpZCBub3QgaGFwcGVuLiIiIgoKCmNsYXNzIEd1YXJk"
-    "OgogICAgZGVmIF9faW5pdF9fKHNlbGYsIGRhaWx5X2xpbWl0X2dicD01LjAsIHByaWNlX3Blcl9taWxsaW9uPTMuMDAsCiAgICAg"
-    "ICAgICAgICAgICAgYnVyc3Q9MjUsIGJ1cnN0X3NlY29uZHM9MTAsIGNhY2hlPVRydWUsIGxvZz1MT0cpOgogICAgICAgIHNlbGYu"
-    "bGltaXQgPSBmbG9hdChkYWlseV9saW1pdF9nYnApCiAgICAgICAgc2VsZi5wcmljZSA9IGZsb2F0KHByaWNlX3Blcl9taWxsaW9u"
-    "KQogICAgICAgIHNlbGYuYnVyc3QsIHNlbGYud2luZG93ID0gaW50KGJ1cnN0KSwgZmxvYXQoYnVyc3Rfc2Vjb25kcykKICAgICAg"
-    "ICBzZWxmLmNhY2hlX29uLCBzZWxmLmxvZ19wYXRoID0gYm9vbChjYWNoZSksIGxvZwogICAgICAgIHNlbGYuX2xvY2sgPSB0aHJl"
-    "YWRpbmcuUkxvY2soKQogICAgICAgIHNlbGYuX3NwZW50LCBzZWxmLl9kYXkgPSAwLjAsIHRpbWUuc3RyZnRpbWUoIiVZLSVtLSVk"
-    "IikKICAgICAgICBzZWxmLl9yZWNlbnQsIHNlbGYuX2NhY2hlLCBzZWxmLl90aXAgPSBbXSwge30sICJHRU5FU0lTIgoKICAgICMg"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSByZWNvcmQKICAg"
-    "IGRlZiBfc2VhbChzZWxmLCBldmVudCk6CiAgICAgICAgbGluZSA9IHsidHMiOiByb3VuZCh0aW1lLnRpbWUoKSwgMyksICJwcmV2"
-    "Ijogc2VsZi5fdGlwfQogICAgICAgIGxpbmUudXBkYXRlKGV2ZW50KQogICAgICAgIGJvZHkgPSBqc29uLmR1bXBzKGxpbmUsIHNv"
-    "cnRfa2V5cz1UcnVlLCBzZXBhcmF0b3JzPSgiLCIsICI6IikpCiAgICAgICAgbGluZVsiaGFzaCJdID0gc2VsZi5fdGlwID0gaGFz"
-    "aGxpYi5zaGEyNTYoYm9keS5lbmNvZGUoKSkuaGV4ZGlnZXN0KCkKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdpdGggb3Blbihz"
-    "ZWxmLmxvZ19wYXRoLCAiYSIsIGVuY29kaW5nPSJ1dGYtOCIpIGFzIGY6CiAgICAgICAgICAgICAgICBmLndyaXRlKGpzb24uZHVt"
-    "cHMobGluZSwgc29ydF9rZXlzPVRydWUsIHNlcGFyYXRvcnM9KCIsIiwgIjoiKSkgKyAiXG4iKQogICAgICAgIGV4Y2VwdCBFeGNl"
-    "cHRpb246CiAgICAgICAgICAgIHBhc3MKICAgICAgICByZXR1cm4gbGluZVsiaGFzaCJdCgogICAgQHN0YXRpY21ldGhvZAogICAg"
-    "ZGVmIHRva2Vucyh0ZXh0KToKICAgICAgICAiIiJFc3RpbWF0ZTogYWJvdXQgZm91ciBjaGFyYWN0ZXJzIHBlciB0b2tlbiBpbiBF"
-    "bmdsaXNoLiIiIgogICAgICAgIHJldHVybiBtYXgoMSwgcm91bmQobGVuKHRleHQgb3IgIiIpIC8gNCkpCgogICAgZGVmIGNvc3Qo"
-    "c2VsZiwgdGV4dCk6CiAgICAgICAgcmV0dXJuIHNlbGYudG9rZW5zKHRleHQpICogc2VsZi5wcmljZSAvIDFfMDAwXzAwMAoKICAg"
-    "IGRlZiBzcGVudF90b2RheShzZWxmKToKICAgICAgICB3aXRoIHNlbGYuX2xvY2s6CiAgICAgICAgICAgIHNlbGYuX3JvbGwoKQog"
-    "ICAgICAgICAgICByZXR1cm4gcm91bmQoc2VsZi5fc3BlbnQsIDYpCgogICAgZGVmIHJlbWFpbmluZyhzZWxmKToKICAgICAgICBy"
-    "ZXR1cm4gcm91bmQobWF4KDAuMCwgc2VsZi5saW1pdCAtIHNlbGYuc3BlbnRfdG9kYXkoKSksIDYpCgogICAgZGVmIF9yb2xsKHNl"
-    "bGYpOgogICAgICAgIHRvZGF5ID0gdGltZS5zdHJmdGltZSgiJVktJW0tJWQiKQogICAgICAgIGlmIHRvZGF5ICE9IHNlbGYuX2Rh"
-    "eToKICAgICAgICAgICAgc2VsZi5fZGF5LCBzZWxmLl9zcGVudCwgc2VsZi5fcmVjZW50ID0gdG9kYXksIDAuMCwgW10KCiAgICAj"
-    "IC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gZ2F0ZQogICAg"
-    "ZGVmIGNoZWNrKHNlbGYsIHByb21wdCk6CiAgICAgICAgIiIiRGVjaWRlIGJlZm9yZSB0aGUgY2FsbC4gUmV0dXJucyBhIGNhY2hl"
-    "ZCBhbnN3ZXIsIG9yIE5vbmUgdG8gcHJvY2VlZC4iIiIKICAgICAgICB3aXRoIHNlbGYuX2xvY2s6CiAgICAgICAgICAgIHNlbGYu"
-    "X3JvbGwoKQogICAgICAgICAgICBub3cgPSB0aW1lLnRpbWUoKQogICAgICAgICAgICBzZWxmLl9yZWNlbnQgPSBbdCBmb3IgdCBp"
-    "biBzZWxmLl9yZWNlbnQgaWYgbm93IC0gdCA8IHNlbGYud2luZG93XQogICAgICAgICAgICBrZXkgPSBoYXNobGliLnNoYTI1Nigo"
-    "cHJvbXB0IG9yICIiKS5lbmNvZGUoKSkuaGV4ZGlnZXN0KCkKCiAgICAgICAgICAgIGlmIHNlbGYuY2FjaGVfb24gYW5kIGtleSBp"
-    "biBzZWxmLl9jYWNoZToKICAgICAgICAgICAgICAgIHNlbGYuX3NlYWwoeyJldmVudCI6ICJjYWNoZV9oaXQiLCAia2V5Ijoga2V5"
-    "WzoxNl0sICJzYXZlZCI6IHNlbGYuY29zdChwcm9tcHQpfSkKICAgICAgICAgICAgICAgIHJldHVybiBzZWxmLl9jYWNoZVtrZXld"
-    "CgogICAgICAgICAgICBpZiBsZW4oc2VsZi5fcmVjZW50KSA+PSBzZWxmLmJ1cnN0OgogICAgICAgICAgICAgICAgc2VsZi5fc2Vh"
-    "bCh7ImV2ZW50IjogInJlZnVzZWQiLCAid2h5IjogInJ1bmF3YXkiLCAiY2FsbHMiOiBsZW4oc2VsZi5fcmVjZW50KX0pCiAgICAg"
-    "ICAgICAgICAgICByYWlzZSBCdWRnZXRTcGVudCgiJWQgY2FsbHMgaW4gJS4wZiBzZWNvbmRzIGxvb2tzIGxpa2UgYSBydW5hd2F5"
-    "IGxvb3AiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAlIChsZW4oc2VsZi5fcmVjZW50KSwgc2VsZi53aW5kb3cp"
-    "KQoKICAgICAgICAgICAgZHVlID0gc2VsZi5jb3N0KHByb21wdCkKICAgICAgICAgICAgaWYgc2VsZi5fc3BlbnQgKyBkdWUgPiBz"
-    "ZWxmLmxpbWl0OgogICAgICAgICAgICAgICAgc2VsZi5fc2VhbCh7ImV2ZW50IjogInJlZnVzZWQiLCAid2h5IjogImJ1ZGdldCIs"
-    "ICJzcGVudCI6IHJvdW5kKHNlbGYuX3NwZW50LCA2KSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICJsaW1pdCI6IHNlbGYu"
-    "bGltaXR9KQogICAgICAgICAgICAgICAgcmFpc2UgQnVkZ2V0U3BlbnQoInRoaXMgY2FsbCBuZWVkcyDCoyUuNGYgYW5kIG9ubHkg"
-    "wqMlLjRmIGlzIGxlZnQgdG9kYXkiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAlIChkdWUsIHNlbGYucmVtYWlu"
-    "aW5nKCkpKQoKICAgICAgICAgICAgc2VsZi5fcmVjZW50LmFwcGVuZChub3cpCiAgICAgICAgICAgIHNlbGYuX3NwZW50ICs9IGR1"
-    "ZQogICAgICAgICAgICBzZWxmLl9zZWFsKHsiZXZlbnQiOiAiYWxsb3dlZCIsICJrZXkiOiBrZXlbOjE2XSwgInRva2VucyI6IHNl"
-    "bGYudG9rZW5zKHByb21wdCksCiAgICAgICAgICAgICAgICAgICAgICAgICJjb3N0Ijogcm91bmQoZHVlLCA2KSwgInNwZW50Ijog"
-    "cm91bmQoc2VsZi5fc3BlbnQsIDYpfSkKICAgICAgICAgICAgcmV0dXJuIE5vbmUKCiAgICBkZWYgcmVjb3JkKHNlbGYsIHByb21w"
-    "dCwgYW5zd2VyKToKICAgICAgICBpZiBzZWxmLmNhY2hlX29uOgogICAgICAgICAgICB3aXRoIHNlbGYuX2xvY2s6CiAgICAgICAg"
-    "ICAgICAgICBzZWxmLl9jYWNoZVtoYXNobGliLnNoYTI1NigocHJvbXB0IG9yICIiKS5lbmNvZGUoKSkuaGV4ZGlnZXN0KCldID0g"
-    "YW5zd2VyCgogICAgZGVmIG1ldGVyKHNlbGYsIGZuKToKICAgICAgICAiIiJEZWNvcmF0b3IuIFRoZSBmaXJzdCBzdHJpbmcgYXJn"
-    "dW1lbnQgaXMgdHJlYXRlZCBhcyB0aGUgcHJvbXB0LiIiIgogICAgICAgIEBmdW5jdG9vbHMud3JhcHMoZm4pCiAgICAgICAgZGVm"
-    "IGlubmVyKCphcmdzLCAqKmt3YXJncyk6CiAgICAgICAgICAgIHByb21wdCA9IG5leHQoKGEgZm9yIGEgaW4gYXJncyBpZiBpc2lu"
-    "c3RhbmNlKGEsIHN0cikpLAogICAgICAgICAgICAgICAgICAgICAgICAgIG5leHQoKHYgZm9yIHYgaW4ga3dhcmdzLnZhbHVlcygp"
-    "IGlmIGlzaW5zdGFuY2Uodiwgc3RyKSksICIiKSkKICAgICAgICAgICAgY2FjaGVkID0gc2VsZi5jaGVjayhwcm9tcHQpCiAgICAg"
-    "ICAgICAgIGlmIGNhY2hlZCBpcyBub3QgTm9uZToKICAgICAgICAgICAgICAgIHJldHVybiBjYWNoZWQKICAgICAgICAgICAgb3V0"
-    "ID0gZm4oKmFyZ3MsICoqa3dhcmdzKQogICAgICAgICAgICBzZWxmLnJlY29yZChwcm9tcHQsIG91dCkKICAgICAgICAgICAgcmV0"
-    "dXJuIG91dAogICAgICAgIHJldHVybiBpbm5lcgoKICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBhdWRpdAogICAgZGVmIHZlcmlmeV9sb2coc2VsZik6CiAgICAgICAgIiIiUmUtd2Fs"
-    "ayB0aGUgbG9jYWwgbG9nLiBSZXR1cm5zIChvaywgbGluZXNfY2hlY2tlZCwgZmlyc3RfYmFkX2xpbmUpLiIiIgogICAgICAgIHRp"
-    "cCwgbiA9ICJHRU5FU0lTIiwgMAogICAgICAgIHRyeToKICAgICAgICAgICAgd2l0aCBvcGVuKHNlbGYubG9nX3BhdGgsICJyIiwg"
-    "ZW5jb2Rpbmc9InV0Zi04IikgYXMgZjoKICAgICAgICAgICAgICAgIGZvciBuLCByYXcgaW4gZW51bWVyYXRlKGYsIDEpOgogICAg"
-    "ICAgICAgICAgICAgICAgIHJvdyA9IGpzb24ubG9hZHMocmF3KQogICAgICAgICAgICAgICAgICAgIGNsYWltZWQgPSByb3cucG9w"
-    "KCJoYXNoIiwgTm9uZSkKICAgICAgICAgICAgICAgICAgICByb3dbInByZXYiXSA9IHRpcAogICAgICAgICAgICAgICAgICAgIGJv"
-    "ZHkgPSBqc29uLmR1bXBzKHJvdywgc29ydF9rZXlzPVRydWUsIHNlcGFyYXRvcnM9KCIsIiwgIjoiKSkKICAgICAgICAgICAgICAg"
-    "ICAgICB0aXAgPSBoYXNobGliLnNoYTI1Nihib2R5LmVuY29kZSgpKS5oZXhkaWdlc3QoKQogICAgICAgICAgICAgICAgICAgIGlm"
-    "IGNsYWltZWQgIT0gdGlwOgogICAgICAgICAgICAgICAgICAgICAgICByZXR1cm4gRmFsc2UsIG4sIG4KICAgICAgICBleGNlcHQg"
-    "RmlsZU5vdEZvdW5kRXJyb3I6CiAgICAgICAgICAgIHJldHVybiBUcnVlLCAwLCBOb25lCiAgICAgICAgcmV0dXJuIFRydWUsIG4s"
-    "IE5vbmUKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgZyA9IEd1YXJkKGRhaWx5X2xpbWl0X2dicD0wLjAxLCBwcmlj"
-    "ZV9wZXJfbWlsbGlvbj0zLjAwKQoKICAgIEBnLm1ldGVyCiAgICBkZWYgYXNrKHByb21wdCk6CiAgICAgICAgcmV0dXJuICJhbnN3"
-    "ZXIgdG86ICIgKyBwcm9tcHRbOjMwXQoKICAgIHByaW50KCJzZWJiaS5wcm8gU3BlbmQgR3VhcmQiLCBfX3ZlcnNpb25fXykKICAg"
-    "IHByaW50KCIgZmlyc3QgY2FsbCAgICAgOiIsIGFzaygidGVsbCBtZSBhYm91dCBBSSBnb3Zlcm5hbmNlICIgKiAyMClbOjQwXSkK"
-    "ICAgIHByaW50KCIgc2FtZSBhZ2FpbiAgICAgOiIsIGFzaygidGVsbCBtZSBhYm91dCBBSSBnb3Zlcm5hbmNlICIgKiAyMClbOjQw"
-    "XSwgIihzZXJ2ZWQgZnJvbSBjYWNoZSwgY29zdCBub3RoaW5nKSIpCiAgICBwcmludCgiIHNwZW50IHRvZGF5ICAgIDogwqMlLjVm"
-    "IG9mIMKjJS4yZiIgJSAoZy5zcGVudF90b2RheSgpLCBnLmxpbWl0KSkKICAgIHRyeToKICAgICAgICBhc2soImEgdmVyeSBleHBl"
-    "bnNpdmUgbmV3IHF1ZXN0aW9uICIgKiAyMDAwKQogICAgZXhjZXB0IEJ1ZGdldFNwZW50IGFzIGU6CiAgICAgICAgcHJpbnQoIiBy"
-    "ZWZ1c2VkICAgICAgICA6IiwgZSkKICAgIG9rLCBuLCBiYWQgPSBnLnZlcmlmeV9sb2coKQogICAgcHJpbnQoIiBsb2NhbCBsb2cg"
-    "ICAgICA6IiwgImludGFjdCIgaWYgb2sgZWxzZSAiQlJPS0VOIGF0IGxpbmUgJXMiICUgYmFkLCAiKCVkIGxpbmVzKSIgJSBuKQog"
-    "ICAgcHJpbnQoIiBtb3JlIHRvb2xzICAgICA6IGh0dHBzOi8vc2ViYmkucHJvL3Rvb2xzIikK"
-)
-_B5 = (
-    "PCEtLSBzZWJiaS5wcm8gUHJvb2YgQmFkZ2UgIHYxLjAuMCAgwrcgIGh0dHBzOi8vc2ViYmkucHJvL3Rvb2xzCiAgICAgUHV0IGEg"
-    "bGl2ZSBiYWRnZSBvbiB5b3VyIG93biBzaXRlIHNob3dpbmcgeW91ciBBSSBpbnRlZ3JpdHkgbGV2ZWwsCiAgICAgY2hlY2tlZCBh"
-    "Z2FpbnN0IHNlYmJpLnBybyBldmVyeSB0aW1lIHNvbWVvbmUgbG9hZHMgdGhlIHBhZ2UuCiAgICAgQ29weSB0aGUgdHdvIGxpbmVz"
-    "IGJlbG93IGludG8geW91ciBwYWdlIHdoZXJlIHlvdSB3YW50IHRoZSBiYWRnZS4KICAgICBDaGFuZ2UgZGF0YS1kb21haW4gdG8g"
-    "eW91ciBvd24gZG9tYWluLiBOb3RoaW5nIGVsc2UgdG8gaW5zdGFsbC4gLS0+Cgo8ZGl2IGNsYXNzPSJzZWJiaS1iYWRnZSIgZGF0"
-    "YS1kb21haW49InlvdXItY29tcGFueS5jb20iPjwvZGl2Pgo8c2NyaXB0IHNyYz0iaHR0cHM6Ly9zZWJiaS5wcm8vdG9vbHMvc2Vi"
-    "YmlfcHJvb2ZfYmFkZ2UuanMiIGFzeW5jPjwvc2NyaXB0PgoKPCEtLSBUaGF0IGlzIHRoZSB3aG9sZSB0aGluZy4gVGhlIGJhZGdl"
-    "IHNob3dzOgogICAgICAgY2hlY2tpbmfigKYgICAgICB3aGlsZSBpdCBhc2tzCiAgICAgICBMMCB0byBMNCAgICAgICB5b3VyIGxp"
-    "dmUgQUkgaW50ZWdyaXR5IGxldmVsLCBzZWFsZWQgb24gdGhlIGNoYWluCiAgICAgICBhIHRhcC10aHJvdWdoICB0byB0aGUgZnVs"
-    "bCBwdWJsaWMgcmVwb3J0IGFueW9uZSBjYW4gcmVhZAogICAgIElmIHNlYmJpLnBybyBjYW5ub3QgYmUgcmVhY2hlZCwgdGhlIGJh"
-    "ZGdlIHF1aWV0bHkgc2hvd3Mgbm90aGluZywKICAgICBzbyBpdCBjYW4gbmV2ZXIgYnJlYWsgeW91ciBwYWdlLiAtLT4K"
-)
-_B6 = (
-    "Lyogc2ViYmkucHJvIFByb29mIEJhZGdlIHYxLjAuMCDigJQgaHR0cHM6Ly9zZWJiaS5wcm8vdG9vbHMKICAgRHJvcC1pbiBsaXZl"
-    "IGJhZGdlOiA8ZGl2IGNsYXNzPSJzZWJiaS1iYWRnZSIgZGF0YS1kb21haW49InlvdXItY29tcGFueS5jb20iPjwvZGl2PgogICBB"
-    "c2tzIGh0dHBzOi8vc2ViYmkucHJvL2EvYXVkaXQgZm9yIHRoZSBkb21haW4ncyBBSSBpbnRlZ3JpdHkgbGV2ZWwgYW5kIHNob3dz"
-    "IGl0LgogICBObyBjb29raWVzLCBubyB0cmFja2luZywgbm8gZGVwZW5kZW5jaWVzLiBGYWlscyBzaWxlbnRseSBpZiB1bnJlYWNo"
-    "YWJsZS4gKi8KKGZ1bmN0aW9uKCl7CiJ1c2Ugc3RyaWN0IjsKdmFyIENPTD17TDQ6IiM3ZmUzYjAiLEwzOiIjYzlhODRjIixMMjoi"
-    "I2NmZDZlNiIsTDE6IiM4ZmQwZmYiLEwwOiIjOGE5M2FkIn07CnZhciBjc3M9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgic3R5bGUi"
-    "KTsKY3NzLnRleHRDb250ZW50PSIuc2ViYmktYmFkZ2V7ZGlzcGxheTppbmxpbmUtZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2Fw"
-    "OjhweDtiYWNrZ3JvdW5kOiMwYTBmMWU7Y29sb3I6I2ZmZjtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjAxLDE2OCw3NiwuNDUpOyIr"
-    "CiJib3JkZXItcmFkaXVzOjk5OXB4O3BhZGRpbmc6N3B4IDEzcHggN3B4IDlweDtmb250OjUwMCAxMnB4LzEgdWktbW9ub3NwYWNl"
-    "LFNGTW9uby1SZWd1bGFyLE1lbmxvLG1vbm9zcGFjZTt0ZXh0LWRlY29yYXRpb246bm9uZTtib3gtc2hhZG93OjAgNHB4IDE0cHgg"
-    "cmdiYSgwLDAsMCwuMjUpfSIrCiIuc2ViYmktYmFkZ2UgLmRvdHt3aWR0aDo5cHg7aGVpZ2h0OjlweDtib3JkZXItcmFkaXVzOjUw"
-    "JTtiYWNrZ3JvdW5kOiM4YTkzYWQ7Ym94LXNoYWRvdzowIDAgOHB4IGN1cnJlbnRDb2xvcn0iKwoiLnNlYmJpLWJhZGdlIC5sdntm"
-    "b250LXdlaWdodDo3MDB9LnNlYmJpLWJhZGdlIC5ieXtvcGFjaXR5Oi42O2ZvbnQtc2l6ZToxMHB4fSI7CmRvY3VtZW50LmhlYWQu"
-    "YXBwZW5kQ2hpbGQoY3NzKTsKZnVuY3Rpb24gcmVuZGVyKGVsLGxldmVsLGRvbWFpbix0eHQpewogdmFyIHNob3J0PShTdHJpbmco"
-    "bGV2ZWwpLm1hdGNoKC9MWzAtNF0vKXx8WyJMMCJdKVswXSwgYz1DT0xbc2hvcnRdfHxDT0wuTDA7CiB2YXIgYT1kb2N1bWVudC5j"
-    "cmVhdGVFbGVtZW50KCJhIik7CiBhLmNsYXNzTmFtZT1lbC5jbGFzc05hbWU7IGEuaHJlZj0iaHR0cHM6Ly9zZWJiaS5wcm8veC9p"
-    "bnRlZ3JpdHkvY2hlY2s/ZG9tYWluPSIrZW5jb2RlVVJJQ29tcG9uZW50KGRvbWFpbik7CiBhLnRhcmdldD0iX2JsYW5rIjsgYS5y"
-    "ZWw9Im5vb3BlbmVyIjsgYS50aXRsZT10eHR8fCJBSSBpbnRlZ3JpdHksIGNoZWNrZWQgbGl2ZSBieSBzZWJiaS5wcm8iOwogYS5p"
-    "bm5lckhUTUw9JzxzcGFuIGNsYXNzPSJkb3QiIHN0eWxlPSJiYWNrZ3JvdW5kOicrYysnO2NvbG9yOicrYysnIj48L3NwYW4+PHNw"
-    "YW4gY2xhc3M9Imx2IiBzdHlsZT0iY29sb3I6JytjKyciPicrc2hvcnQrJzwvc3Bhbj4nKwogICAgICAgICAgICAgJzxzcGFuPkFJ"
-    "IGludGVncml0eTwvc3Bhbj48c3BhbiBjbGFzcz0iYnkiPnNlYmJpLnBybzwvc3Bhbj4nOwogZWwucGFyZW50Tm9kZS5yZXBsYWNl"
-    "Q2hpbGQoYSxlbCk7Cn0KZnVuY3Rpb24gZ28oZWwpewogdmFyIGQ9ZWwuZ2V0QXR0cmlidXRlKCJkYXRhLWRvbWFpbiIpfHxsb2Nh"
-    "dGlvbi5ob3N0bmFtZTsKIGVsLnRleHRDb250ZW50PSJjaGVja2luZ+KApiI7CiBmZXRjaCgiaHR0cHM6Ly9zZWJiaS5wcm8vYS9h"
-    "dWRpdD9kb21haW49IitlbmNvZGVVUklDb21wb25lbnQoZCkse2NhY2hlOiJuby1zdG9yZSJ9KQogIC50aGVuKGZ1bmN0aW9uKHIp"
-    "e3JldHVybiByLnRleHQoKX0pCiAgLnRoZW4oZnVuY3Rpb24odCl7IHZhciBtPXQubWF0Y2goL0xbMC00XVtBLVpfXSovKTsgcmVu"
-    "ZGVyKGVsLG0/bVswXToiTDAiLGQsdC50cmltKCkpOyB9KQogIC5jYXRjaChmdW5jdGlvbigpeyBlbC5zdHlsZS5kaXNwbGF5PSJu"
-    "b25lIjsgfSk7Cn0KZnVuY3Rpb24gaW5pdCgpeyBBcnJheS5wcm90b3R5cGUuZm9yRWFjaC5jYWxsKGRvY3VtZW50LnF1ZXJ5U2Vs"
-    "ZWN0b3JBbGwoIi5zZWJiaS1iYWRnZSIpLGdvKTsgfQppZihkb2N1bWVudC5yZWFkeVN0YXRlPT09ImxvYWRpbmciKSBkb2N1bWVu"
-    "dC5hZGRFdmVudExpc3RlbmVyKCJET01Db250ZW50TG9hZGVkIixpbml0KTsgZWxzZSBpbml0KCk7Cn0pKCk7Cg=="
-)
+SITE = (os.environ.get("HOST") or "https://sebbi.pro").strip().rstrip("/")
 
 
-def _d(b):
-    return base64.b64decode("".join(b.split()))
+def _int_env(name, default, lo, hi):
+    try:
+        return max(lo, min(hi, int(os.environ.get(name, default))))
+    except (TypeError, ValueError):
+        return default
 
 
-_FILES = {
-    '/tools': (_d(_B0), 'text/html; charset=utf-8', None),
-    '/tools/sebbi_token_meter.user.js': (_d(_B1), 'text/javascript; charset=utf-8', 'sebbi_token_meter.user.js'),
-    '/tools/sebbi_receipt_lens.user.js': (_d(_B2), 'text/javascript; charset=utf-8', 'sebbi_receipt_lens.user.js'),
-    '/tools/sebbi_prompt_shield.user.js': (_d(_B3), 'text/javascript; charset=utf-8', 'sebbi_prompt_shield.user.js'),
-    '/tools/sebbi_spend_guard.py': (_d(_B4), 'text/x-python; charset=utf-8', 'sebbi_spend_guard.py'),
-    '/tools/sebbi_proof_badge.html': (_d(_B5), 'text/plain; charset=utf-8', 'sebbi_proof_badge.html'),
-    '/tools/sebbi_proof_badge.js': (_d(_B6), 'text/javascript; charset=utf-8', None),
-}
+MAX_BYTES = _int_env("STUDIO_MAX_MB", 20000, 20, 100000) * 1024 * 1024
+TEASER_MAX = 120 * 1024 * 1024
+POSTER_MAX = 4 * 1024 * 1024
+CHUNK_MAX = 9 * 1024 * 1024
+MONTHLY_FEE = _int_env("STUDIO_MONTHLY_FEE", 50, 0, 1000)
+FEE_PERIOD = 30 * 86400
+SHARE = 0.70
+PRICES = (10, 20, 50, 100)
+KEEP_FREE = 1024 * 1024 * 1024
+
+
+def _packs():
+    out = []
+    for p in (os.environ.get("STUDIO_PACKS") or "100,500").split(","):
+        try:
+            v = int(p.strip())
+        except ValueError:
+            continue
+        if 50 <= v <= 10000 and v not in out:
+            out.append(v)
+    return sorted(out) or [100, 500]
+
+
+PACKS = _packs()
+
+
+def _fee_env(name, default):
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+CARD_FEE_PCT = _fee_env("STUDIO_CARD_FEE_PCT", 1.5)
+CARD_FEE_PENCE = _fee_env("STUDIO_CARD_FEE_PENCE", 20)
+
+
+def _charge(credit):
+    """What the viewer pays so that, after Stripe's card fee, the full credit is left."""
+    return int(math.ceil((credit + CARD_FEE_PENCE) / (1 - CARD_FEE_PCT / 100.0)))
+
+ID_RE = re.compile(r"^[a-z0-9]{8}$")
+VIEWER_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+OWNER_RE = re.compile(r"^owner:cr_[a-f0-9]{20}$")
+SESSION_RE = re.compile(r"^cs_[A-Za-z0-9_]{8,200}$")
+TITLE_CLEAN = re.compile(r"[<>\"\\\x00-\x1f]")
+ALPHA = "abcdefghijkmnpqrstuvwxyz23456789"
+
+KINDS = {"full": ("full", MAX_BYTES), "teaser": ("teaser", TEASER_MAX), "poster": ("jpg", POSTER_MAX)}
+
+_ctx = {}
+_cr = None
+_ready = False
 _patched = False
+_dir_cache = None
+_ulocks = defaultdict(threading.Lock)
+_wins = defaultdict(deque)
+_wins_lock = threading.Lock()
+
+_CREATE_GZ = (
+    "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"
+)
+
+
+def _page(b):
+    return gzip.decompress(base64.b64decode("".join(b.split())))
+
+
+CREATE_HTML = _page(_CREATE_GZ)
+
+
+# ------------------------------------------------------------------ plumbing
+
+def _credits():
+    """The credits module holds balances, creator accounts and Stripe."""
+    global _cr
+    if _cr is not None:
+        return _cr
+    m = sys.modules.get("modules.credits") or importlib.import_module("modules.credits")
+    if "conn" in _ctx:
+        m._ctx.update(_ctx)
+        m._setup()
+    _cr = m
+    return m
+
+
+def _storage():
+    """(folder, survives_redeploys)"""
+    global _dir_cache
+    if _dir_cache:
+        return _dir_cache
+    cands = []
+    if os.environ.get("STUDIO_DIR", "").strip():
+        cands.append((os.environ["STUDIO_DIR"].strip(), True))
+    db = os.environ.get("DB_PATH", "").strip()
+    if db and os.path.dirname(db):
+        cands.append((os.path.join(os.path.dirname(db), "studio"), True))
+    if os.path.isdir("/data"):
+        cands.append(("/data/studio", True))
+    cands.append((os.path.abspath("studio_media"), False))
+    for d, persistent in cands:
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                _dir_cache = (d, persistent)
+                return _dir_cache
+        except Exception:
+            continue
+    _dir_cache = (os.path.abspath("."), False)
+    return _dir_cache
+
+
+def _path(vid, kind, part=False):
+    return os.path.join(_storage()[0], "%s.%s%s" % (vid, KINDS[kind][0], ".part" if part else ""))
+
+
+def _setup():
+    global _ready
+    if _ready or "conn" not in _ctx:
+        return
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS studio_video(id TEXT PRIMARY KEY,account TEXT,creator TEXT,"
+                  "title TEXT,price INTEGER,free_seconds INTEGER,created REAL,status TEXT,"
+                  "full_size INTEGER,full_mime TEXT,teaser_size INTEGER,teaser_mime TEXT,"
+                  "plays INTEGER DEFAULT 0,unlocks INTEGER DEFAULT 0,earned INTEGER DEFAULT 0,"
+                  "fees INTEGER DEFAULT 0,fee_period INTEGER DEFAULT -1,fee_taken INTEGER DEFAULT 0,"
+                  "likes INTEGER DEFAULT 0,comments INTEGER DEFAULT 0,sha256 TEXT,"
+                  "audit_hash TEXT,block_index INTEGER,live_at REAL)")
+        try:
+            c.execute("ALTER TABLE studio_video ADD COLUMN tags TEXT DEFAULT ''")
+        except Exception:
+            pass
+        c.execute("CREATE INDEX IF NOT EXISTS studio_video_account ON studio_video(account)")
+        c.execute("CREATE INDEX IF NOT EXISTS studio_video_status ON studio_video(status)")
+        c.execute("CREATE TABLE IF NOT EXISTS studio_meta(k TEXT PRIMARY KEY,v TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS studio_report(id INTEGER PRIMARY KEY AUTOINCREMENT,video TEXT,"
+                  "reason TEXT,at REAL,who TEXT)")
+        row = c.execute("SELECT v FROM studio_meta WHERE k='secret'").fetchone()
+        if not row:
+            c.execute("INSERT INTO studio_meta(k,v) VALUES('secret',?)", (secrets.token_hex(32),))
+        c.commit()
+    _credits()
+    _ready = True
+
+
+def _secret():
+    with _ctx["lock"]:
+        return _ctx["conn"].execute("SELECT v FROM studio_meta WHERE k='secret'").fetchone()[0]
+
+
+def _token(vid, viewer):
+    return hmac.new(_secret().encode(), ("%s|%s" % (vid, viewer)).encode(), hashlib.sha256).hexdigest()[:40]
+
+
+def _seal(kind, detail, extra):
+    ex = {"studio_version": VERSION}
+    ex.update(extra or {})
+    try:
+        return _credits()._seal(kind, detail, ex)
+    except Exception:
+        return None, None
+
+
+def _limit(who, group, per_min, per_hour):
+    t = time.time()
+    k = group + "|" + who
+    with _wins_lock:
+        w = _wins[k]
+        while w and w[0] < t - 3600:
+            w.popleft()
+        if len(w) >= per_hour or sum(1 for x in w if x > t - 60) >= per_min:
+            return False
+        w.append(t)
+        if len(_wins) > 20000:
+            for key in [x for x, v in _wins.items() if not v or v[-1] < t - 3600][:5000]:
+                del _wins[key]
+    return True
+
+
+def _ip(h):
+    try:
+        xff = h.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()[:64]
+        return str(h.client_address[0])[:64]
+    except Exception:
+        return "unknown"
+
+
+def _slug(name):
+    return urllib.parse.quote(str(name or "").replace(" ", "_"))
+
+
+def _size(n):
+    return "%.1f GB" % (n / 1073741824.0) if n >= 1073741824 else "%d MB" % max(1, n // 1048576)
+
+
+def _gbp(p):
+    return "£%d.%02d" % (p // 100, p % 100) if p >= 100 else "%dp" % p
+
+
+COLS = ("id,account,creator,title,price,free_seconds,created,status,full_size,full_mime,teaser_size,"
+        "teaser_mime,plays,unlocks,earned,fees,fee_period,fee_taken,likes,comments,sha256,audit_hash,"
+        "block_index,live_at,tags")
+
+
+def _video(vid):
+    if not ID_RE.match(vid or ""):
+        return None
+    with _ctx["lock"]:
+        r = _ctx["conn"].execute("SELECT " + COLS + " FROM studio_video WHERE id=?", (vid,)).fetchone()
+    return dict(zip(COLS.split(","), r)) if r else None
+
+
+def _public(v):
+    return {"id": v["id"], "title": v["title"], "creator": v["creator"], "price": v["price"],
+            "price_label": _gbp(v["price"]), "free_seconds": v["free_seconds"],
+            "plays": v["plays"], "paid_views": v["unlocks"], "likes": v["likes"],
+            "comments": v["comments"], "link": SITE + "/v/" + v["id"],
+            "teaser": "/v/%s/teaser" % v["id"], "poster": "/v/%s/poster.jpg" % v["id"],
+            "channel": SITE + "/cinema/@" + _slug(v["creator"]),
+            "live_at": v["live_at"], "block_index": v["block_index"],
+            "tags": [t for t in (v.get("tags") or "").split(" ") if t]}
+
+
+def _acct(q, b):
+    key = str(b.get("key") or q.get("key") or "").strip()
+    return _credits()._account(key)
+
+
+def _ensure_viewer(viewer):
+    with _ctx["lock"]:
+        _ctx["conn"].execute("INSERT OR IGNORE INTO credit_viewer(id,balance,spent,created) VALUES(?,0,0,?)",
+                             (viewer, time.time()))
+        _ctx["conn"].commit()
+        r = _ctx["conn"].execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()
+    return r[0] if r else 0
+
+
+def _unlocked(vid, viewer):
+    with _ctx["lock"]:
+        r = _ctx["conn"].execute("SELECT block_index FROM credit_unlock WHERE viewer=? AND video=?",
+                                 (viewer, "st:" + vid)).fetchone()
+    return (True, r[0]) if r else (False, None)
+
+
+# ------------------------------------------------------------------ creators
+
+def a_join(q, b, h):
+    if not _limit(_ip(h), "join", 3, 10):
+        return {"error": "slow_down", "message": "Too many tries. Wait a minute."}, 429
+    return _credits().c_creator_join(q, b)
+
+
+def a_signin(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key", "message": "That key wasn't recognised."}, 403
+    return {"name": acct["name"], "creator_id": acct["id"],
+            "channel": SITE + "/cinema/@" + _slug(acct["name"])}, 200
+
+
+def a_new(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key", "message": "Sign in again, your key wasn't recognised."}, 403
+    if not _limit(acct["id"], "new", 6, 40):
+        return {"error": "slow_down", "message": "That's a lot of uploads. Try again in a few minutes."}, 429
+    title = TITLE_CLEAN.sub("", str(b.get("title") or "")).strip()[:80]
+    if len(title) < 2:
+        return {"error": "title", "message": "Give your video a name so people can find it."}, 400
+    if not b.get("rights"):
+        return {"error": "rights", "message": "Tick the box to confirm the video is yours to sell."}, 400
+    try:
+        price = int(b.get("price") or 10)
+    except (TypeError, ValueError):
+        price = 10
+    if price not in PRICES:
+        price = 10
+    tags = []
+    for t in re.split(r"[\s,]+", str(b.get("tags") or "")):
+        t = re.sub(r"[^A-Za-z0-9_]", "", t.lstrip("#"))[:24].lower()
+        if t and "#" + t not in tags:
+            tags.append("#" + t)
+    tags = " ".join(tags[:8])
+    try:
+        free = max(3, min(30, int(b.get("free_seconds") or 8)))
+    except (TypeError, ValueError):
+        free = 8
+    try:
+        size = int(b.get("full_size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        return {"error": "no_video", "message": "Pick a video first."}, 400
+    if size > MAX_BYTES:
+        return {"error": "too_big", "message": "That video is %d MB. The limit is %d MB - trim it and try again."
+                % (size // 1048576, MAX_BYTES // 1048576)}, 413
+    mime = str(b.get("full_mime") or "video/mp4")[:60]
+    if not mime.startswith("video/"):
+        mime = "video/mp4"
+    try:
+        free_disk = shutil.disk_usage(_storage()[0]).free
+    except Exception:
+        free_disk = 0
+    if free_disk < size + TEASER_MAX + KEEP_FREE:
+        print("STUDIO: upload of %d MB refused, %d MB free on the video volume" % (size // 1048576, free_disk // 1048576), flush=True)
+        return {"error": "full", "message": "That video is %s. There isn't room for it right now - try a shorter clip, "
+                "or try again later." % _size(size)}, 507
+    _sweep()
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        for _ in range(20):
+            vid = "".join(secrets.choice(ALPHA) for _ in range(8))
+            if not c.execute("SELECT 1 FROM studio_video WHERE id=?", (vid,)).fetchone():
+                break
+        c.execute("INSERT INTO studio_video(id,account,creator,title,price,free_seconds,created,status,"
+                  "full_size,full_mime,tags) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (vid, acct["id"], acct["name"], title, price, free, time.time(), "uploading", size, mime, tags))
+        c.commit()
+    return {"id": vid, "link": SITE + "/v/" + vid, "short": SITE.split("//")[-1] + "/v/" + vid,
+            "title": title, "price": price, "free_seconds": free, "creator": acct["name"],
+            "channel": SITE + "/cinema/@" + _slug(acct["name"]), "chunk": 4 * 1024 * 1024}, 200
+
+
+def _sweep():
+    """Clear uploads that were started and never finished (older than a day)."""
+    cutoff = time.time() - 86400
+    with _ctx["lock"]:
+        old = [r[0] for r in _ctx["conn"].execute(
+            "SELECT id FROM studio_video WHERE status='uploading' AND created<? LIMIT 50", (cutoff,)).fetchall()]
+    for vid in old:
+        for kind in KINDS:
+            try:
+                os.remove(_path(vid, kind, True))
+            except OSError:
+                pass
+        with _ctx["lock"]:
+            _ctx["conn"].execute("UPDATE studio_video SET status='abandoned' WHERE id=?", (vid,))
+            _ctx["conn"].commit()
+
+
+def _magic_ok(kind, head):
+    if kind == "poster":
+        return head[:3] == b"\xff\xd8\xff"
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return True
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return True
+    return False
+
+
+def chunk(h, q):
+    """Raw bytes, appended at an offset. Retries and resumes are safe."""
+    vid = str(q.get("id") or "")
+    kind = str(q.get("kind") or "")
+    try:
+        offset = int(q.get("offset") or 0)
+        n = int(h.headers.get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        return {"error": "bad_request"}, 400
+    if kind not in KINDS or n < 0 or n > CHUNK_MAX:
+        return {"error": "bad_request", "message": "Bad upload piece."}, 400
+    data = _read(h, n)
+    if data is None:
+        return {"error": "cut_off", "message": "Connection dropped. Retrying."}, 400
+    acct = _credits()._account(h.headers.get("X-Creator-Key", ""))
+    if not acct:
+        return {"error": "bad_key", "message": "Sign in again."}, 403
+    v = _video(vid)
+    if not v or v["account"] != acct["id"]:
+        return {"error": "not_found"}, 404
+    if v["status"] != "uploading":
+        return {"error": "finished", "message": "That video is already live."}, 409
+    cap = KINDS[kind][1] if kind != "full" else v["full_size"]
+    p = _path(vid, kind, True)
+    with _ulocks[vid + kind]:
+        got = os.path.getsize(p) if os.path.exists(p) else 0
+        if offset > got:
+            return {"error": "gap", "got": got}, 409
+        if offset + len(data) > cap:
+            return {"error": "too_big", "message": "That file is bigger than it said it was."}, 413
+        if offset == 0 and not _magic_ok(kind, data[:16]):
+            return {"error": "not_video", "message": "That doesn't look like a video file we can play."}, 415
+        if offset + len(data) <= got and offset < got:
+            return {"got": got}, 200
+        with open(p, "r+b" if os.path.exists(p) else "wb") as f:
+            f.seek(offset)
+            f.write(data)
+            f.truncate(offset + len(data))
+        got = offset + len(data)
+    return {"got": got}, 200
+
+
+def _read(h, n):
+    out = bytearray()
+    while len(out) < n:
+        try:
+            part = h.rfile.read(min(65536, n - len(out)))
+        except Exception:
+            return None
+        if not part:
+            return None
+        out += part
+    return bytes(out)
+
+
+def _sha_file(p):
+    s = hashlib.sha256()
+    with open(p, "rb") as f:
+        for blk in iter(lambda: f.read(1048576), b""):
+            s.update(blk)
+    return s.hexdigest()
+
+
+def a_finish(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key", "message": "Sign in again."}, 403
+    v = _video(str(b.get("id") or ""))
+    if not v or v["account"] != acct["id"]:
+        return {"error": "not_found"}, 404
+    if v["status"] == "live":
+        return {"live": True, "video": _public(v)}, 200
+    if v["status"] != "uploading":
+        return {"error": "gone"}, 410
+    fp, tp, pp = _path(v["id"], "full", True), _path(v["id"], "teaser", True), _path(v["id"], "poster", True)
+    fs = os.path.getsize(fp) if os.path.exists(fp) else 0
+    ts = os.path.getsize(tp) if os.path.exists(tp) else 0
+    if fs != v["full_size"]:
+        return {"error": "incomplete", "message": "The video didn't finish uploading.", "got": fs}, 409
+    if ts <= 0:
+        return {"error": "incomplete", "message": "The teaser didn't finish uploading."}, 409
+    tmime = str(b.get("teaser_mime") or "video/mp4")
+    tmime = "video/webm" if "webm" in tmime else "video/mp4"
+    os.replace(fp, _path(v["id"], "full"))
+    os.replace(tp, _path(v["id"], "teaser"))
+    if os.path.exists(pp):
+        os.replace(pp, _path(v["id"], "poster"))
+    with _ctx["lock"]:
+        _ctx["conn"].execute("UPDATE studio_video SET status='live',teaser_size=?,teaser_mime=?,live_at=? WHERE id=?",
+                             (ts, tmime, time.time(), v["id"]))
+        _ctx["conn"].commit()
+    threading.Thread(target=_fingerprint, args=(v["id"], v["creator"], v["price"], fs), daemon=True).start()
+    return {"live": True, "video": _public(_video(v["id"]))}, 200
+
+
+def _fingerprint(vid, creator, price, size):
+    """Hash the full video and seal it. Runs after the video is live, so a long video never holds the upload up."""
+    try:
+        digest = _sha_file(_path(vid, "full"))
+        ah, blk = _seal("studio_video_live", "video=%s;creator=%s;price=%d;sha256=%s" % (vid, creator, price, digest),
+                        {"video": vid, "creator": creator, "price_pence": price, "video_sha256": digest, "bytes": size})
+        with _ctx["lock"]:
+            _ctx["conn"].execute("UPDATE studio_video SET sha256=?,audit_hash=?,block_index=? WHERE id=?",
+                                 (digest, ah, blk, vid))
+            _ctx["conn"].commit()
+    except Exception as e:
+        print("STUDIO: fingerprint of %s failed: %s" % (vid, e), flush=True)
+
+
+def a_mine(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key", "message": "Sign in again, your key wasn't recognised."}, 403
+    with _ctx["lock"]:
+        rows = _ctx["conn"].execute("SELECT " + COLS + " FROM studio_video WHERE account=? AND status='live' "
+                                    "ORDER BY created DESC LIMIT 200", (acct["id"],)).fetchall()
+    vids = []
+    owner = "owner:" + acct["id"]
+    for r in rows:
+        v = dict(zip(COLS.split(","), r))
+        p = _public(v)
+        p.update({"earned": v["earned"], "fees": v["fees"],
+                  "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], owner, _token(v["id"], owner))})
+        vids.append(p)
+    balance, views = _credits()._creator_totals(acct["name"])
+    return {"name": acct["name"], "balance_pence": balance, "balance_label": _gbp(balance) if balance else "0p",
+            "paid_views": views, "videos": vids, "earn": SITE + "/earn",
+            "channel": SITE + "/cinema/@" + _slug(acct["name"])}, 200
+
+
+def a_delete(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key"}, 403
+    v = _video(str(b.get("id") or ""))
+    if not v or v["account"] != acct["id"]:
+        return {"error": "not_found"}, 404
+    _remove(v, "creator")
+    return {"removed": True}, 200
+
+
+def _remove(v, by):
+    for kind in KINDS:
+        for part in (False, True):
+            try:
+                os.remove(_path(v["id"], kind, part))
+            except OSError:
+                pass
+    with _ctx["lock"]:
+        _ctx["conn"].execute("UPDATE studio_video SET status='removed' WHERE id=?", (v["id"],))
+        _ctx["conn"].commit()
+    _seal("studio_video_removed", "video=%s;by=%s" % (v["id"], by), {"video": v["id"], "by": by})
+
+
+# ------------------------------------------------------------------ viewers
+
+def _viewer_from(q, b):
+    viewer = str(b.get("viewer") or q.get("viewer") or "").strip()
+    return viewer if VIEWER_RE.match(viewer) else None
+
+
+def a_state(q, b, h):
+    v = _video(str(q.get("id") or b.get("id") or ""))
+    if not v or v["status"] != "live":
+        return {"error": "not_found", "message": "That video isn't here any more."}, 404
+    viewer = _viewer_from(q, b)
+    packs = [p for p in PACKS if p >= v["price"]] or [v["price"]]
+    out = {"video": _public(v),
+           "packs": [{"pence": p, "label": _gbp(p), "views": p // max(1, v["price"]),
+                      "charge": _charge(p), "charge_label": _gbp(_charge(p)),
+                      "fee": _charge(p) - p, "fee_label": _gbp(_charge(p) - p)} for p in packs],
+           "pay_ready": bool(_credits()._stripe_key())}
+    if viewer:
+        out["balance_pence"] = _ensure_viewer(viewer)
+        done, blk = _unlocked(v["id"], viewer)
+        out["unlocked"] = done
+        if done:
+            out["block_index"] = blk
+            out["full"] = "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer))
+    return out, 200
+
+
+def _period_fee(v, share, now):
+    period = int((now - (v["live_at"] or v["created"])) // FEE_PERIOD)
+    taken = v["fee_taken"] if v["fee_period"] == period else 0
+    fee = min(share, max(0, MONTHLY_FEE - taken))
+    return period, taken + fee, fee
+
+
+def _unlock(v, viewer):
+    """Spend the viewer's credit on one video. Returns (payload, code)."""
+    done, blk = _unlocked(v["id"], viewer)
+    if done:
+        return {"unlocked": True, "already": True, "block_index": blk,
+                "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer)),
+                "balance_pence": _ensure_viewer(viewer)}, 200
+    _ensure_viewer(viewer)
+    price = v["price"]
+    now = time.time()
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        cur = c.execute("UPDATE credit_viewer SET balance=balance-?,spent=spent+? WHERE id=? AND balance>=?",
+                        (price, price, viewer, price))
+        if cur.rowcount != 1:
+            bal = c.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()[0]
+            c.commit()
+            return {"unlocked": False, "reason": "not_enough_credit", "price_pence": price,
+                    "balance_pence": bal}, 402
+        ins = c.execute("INSERT OR IGNORE INTO credit_unlock(viewer,video,creator,price,at) VALUES(?,?,?,?,?)",
+                        (viewer, "st:" + v["id"], v["creator"], price, now))
+        if ins.rowcount != 1:
+            c.execute("UPDATE credit_viewer SET balance=balance+?,spent=spent-? WHERE id=?", (price, price, viewer))
+            c.commit()
+            return _unlock(v, viewer)
+        fresh = dict(zip(COLS.split(","), c.execute("SELECT " + COLS + " FROM studio_video WHERE id=?",
+                                                     (v["id"],)).fetchone()))
+        share = int(round(price * SHARE))
+        period, taken, fee = _period_fee(fresh, share, now)
+        net = share - fee
+        c.execute("INSERT OR IGNORE INTO credit_creator(name,balance,views) VALUES(?,0,0)", (v["creator"],))
+        c.execute("UPDATE credit_creator SET balance=balance+?,views=views+1 WHERE name=?", (net, v["creator"]))
+        c.execute("UPDATE studio_video SET unlocks=unlocks+1,earned=earned+?,fees=fees+?,fee_period=?,fee_taken=? "
+                  "WHERE id=?", (share, fee, period, taken, v["id"]))
+        bal = c.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()[0]
+        c.commit()
+    ah, blk = _seal("paid_view", "video=st:%s;creator=%s;price=%d;creator_share=%d;monthly_fee=%d"
+                    % (v["id"], v["creator"], price, net, fee),
+                    {"video": "st:" + v["id"], "creator": v["creator"], "price_pence": price,
+                     "creator_share_pence": share, "monthly_fee_pence": fee, "creator_pence": net,
+                     "platform_pence": price - net})
+    with _ctx["lock"]:
+        _ctx["conn"].execute("UPDATE credit_unlock SET audit_hash=?,block_index=? WHERE viewer=? AND video=?",
+                             (ah, blk, viewer, "st:" + v["id"]))
+        _ctx["conn"].commit()
+    return {"unlocked": True, "price_pence": price, "creator_pence": net, "balance_pence": bal,
+            "sealed_in_chain": ah, "block_index": blk,
+            "verify": SITE + "/x/walk/block?index=%s" % blk,
+            "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer))}, 200
+
+
+def a_unlock(q, b, h):
+    v = _video(str(b.get("id") or ""))
+    viewer = _viewer_from(q, b)
+    if not v or v["status"] != "live" or not viewer:
+        return {"error": "not_found"}, 404
+    if not _limit(viewer, "unlock", 20, 300):
+        return {"error": "slow_down", "message": "Slow down a moment."}, 429
+    return _unlock(v, viewer)
+
+
+def a_pay(q, b, h):
+    v = _video(str(b.get("id") or ""))
+    viewer = _viewer_from(q, b)
+    if not v or v["status"] != "live" or not viewer:
+        return {"error": "not_found"}, 404
+    if not _limit(_ip(h), "pay", 6, 40):
+        return {"error": "slow_down", "message": "Wait a moment and tap again."}, 429
+    cr = _credits()
+    if not cr._stripe_key():
+        return {"error": "pay_off", "message": "Payments are being switched on. Try again shortly."}, 503
+    try:
+        pence = int(b.get("pence") or PACKS[0])
+    except (TypeError, ValueError):
+        pence = PACKS[0]
+    if pence not in PACKS:
+        pence = PACKS[0]
+    pence = max(pence, v["price"])
+    charge = _charge(pence)
+    _ensure_viewer(viewer)
+    back = SITE + "/cinema/v/" + v["id"]
+    params = {
+        "mode": "payment",
+        "submit_type": "pay",
+        "success_url": back + "?paid={CHECKOUT_SESSION_ID}",
+        "cancel_url": back,
+        "line_items[0][quantity]": "1",
+        "line_items[0][price_data][currency]": "gbp",
+        "line_items[0][price_data][unit_amount]": str(charge),
+        "line_items[0][price_data][product_data][name]": "10p Wing credit %s + %s card fee" % (_gbp(pence), _gbp(charge - pence)),
+        "line_items[0][price_data][product_data][description]":
+            "%s credit unlocks \"%s\" now, the rest stays on this phone. The %s card fee is Stripe's charge "
+            "for taking the payment." % (_gbp(pence), v["title"][:50], _gbp(charge - pence)),
+        "metadata[studio_video]": v["id"],
+        "metadata[viewer]": viewer,
+        "metadata[credit_pence]": str(pence),
+        "payment_intent_data[description]": "10p Wing credit (sebbi.pro)",
+        "payment_intent_data[metadata][studio_video]": v["id"],
+    }
+    data, err = cr._stripe("POST", "checkout/sessions", params,
+                           idem="st-%s-%s-%d-%d" % (v["id"], viewer, charge, int(time.time() // 30)))
+    if err or not data or not data.get("url"):
+        return {"error": "stripe", "message": "Couldn't open the payment page: %s" % (err or "no link")}, 502
+    return {"checkout": data["url"], "pence": pence, "charge": charge}, 200
+
+
+def a_paid(q, b, h):
+    v = _video(str(b.get("id") or ""))
+    viewer = _viewer_from(q, b)
+    session = str(b.get("session") or "").strip()
+    if not v or not viewer or not SESSION_RE.match(session):
+        return {"error": "bad_request"}, 400
+    cr = _credits()
+    s, err = cr._stripe("GET", "checkout/sessions/" + session)
+    if err or not s:
+        return {"error": "stripe", "message": "Couldn't confirm the payment yet. Tap unlock again in a moment."}, 502
+    if s.get("payment_status") != "paid":
+        return {"error": "not_paid", "message": "The payment hasn't gone through."}, 402
+    meta = s.get("metadata") or {}
+    if str(meta.get("viewer") or s.get("client_reference_id") or "") != viewer:
+        return {"error": "other_phone", "message": "That payment was made on another phone."}, 403
+    try:
+        paid = int(s.get("amount_total") or 0)
+        pence = int(meta.get("credit_pence") or paid)
+    except (TypeError, ValueError):
+        paid, pence = 0, 0
+    if pence <= 0 or paid < pence or str(s.get("currency") or "gbp").lower() != "gbp":
+        return {"error": "bad_amount"}, 400
+    credit = cr._credit_payment(session, viewer, pence, "studio")
+    out, code = _unlock(v, viewer) if v["status"] == "live" else ({"unlocked": False}, 404)
+    out["payment"] = {"credit_pence": pence, "paid_pence": paid, "duplicate": credit.get("duplicate", False)}
+    return out, code
+
+
+def a_report(q, b, h):
+    v = _video(str(b.get("id") or ""))
+    if not v:
+        return {"error": "not_found"}, 404
+    if not _limit(_ip(h), "report", 3, 20):
+        return {"received": True}, 200
+    reason = TITLE_CLEAN.sub("", str(b.get("reason") or ""))[:300]
+    who = hashlib.sha256(_ip(h).encode()).hexdigest()[:16]
+    with _ctx["lock"]:
+        _ctx["conn"].execute("INSERT INTO studio_report(video,reason,at,who) VALUES(?,?,?,?)",
+                             (v["id"], reason, time.time(), who))
+        _ctx["conn"].commit()
+    _seal("studio_report", "video=%s" % v["id"], {"video": v["id"]})
+    return {"received": True, "message": "Thanks. It will be looked at."}, 200
+
+
+def a_admin(q, b, h):
+    key = os.environ.get("CREDITS_ADMIN_KEY", "").strip()
+    given = str(q.get("key") or b.get("key") or "")
+    if not key or not hmac.compare_digest(key, given):
+        return {"error": "not_allowed"}, 403
+    do = str(q.get("do") or b.get("do") or "list")
+    if do == "remove":
+        v = _video(str(q.get("id") or b.get("id") or ""))
+        if not v:
+            return {"error": "not_found"}, 404
+        _remove(v, "admin")
+        return {"removed": v["id"]}, 200
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        reps = c.execute("SELECT video,reason,at FROM studio_report ORDER BY id DESC LIMIT 100").fetchall()
+        vids = c.execute("SELECT id,creator,title,status,unlocks,earned,created FROM studio_video "
+                         "ORDER BY created DESC LIMIT 100").fetchall()
+    return {"reports": [{"video": r[0], "link": SITE + "/v/" + r[0], "reason": r[1],
+                         "at": time.strftime("%Y-%m-%d %H:%M", time.gmtime(r[2]))} for r in reps],
+            "videos": [{"id": r[0], "creator": r[1], "title": r[2], "status": r[3], "paid_views": r[4],
+                        "earned": r[5], "link": SITE + "/v/" + r[0],
+                        "remove": SITE + "/v/api/admin?key=KEY&do=remove&id=" + r[0]} for r in vids]}, 200
+
+
+API = {"join": a_join, "signin": a_signin, "new": a_new, "finish": a_finish, "mine": a_mine,
+       "delete": a_delete, "state": a_state, "unlock": a_unlock, "pay": a_pay, "paid": a_paid,
+       "report": a_report, "admin": a_admin}
+
+
+# ------------------------------------------------------------------ transport
+
+def _send(h, obj, code=200):
+    body = json.dumps(obj).encode("utf-8")
+    h.send_response(code)
+    h.send_header("Content-Type", "application/json; charset=utf-8")
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def _send_bytes(h, body, ctype, code=200, cache="no-cache", extra=None):
+    h.send_response(code)
+    h.send_header("Content-Type", ctype)
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", cache)
+    for k, val in (extra or {}).items():
+        h.send_header(k, val)
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def _send_file(h, path, ctype, cache="public, max-age=86400"):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        _send(h, {"error": "not_found"}, 404)
+        return
+    start, end, code = 0, size - 1, 200
+    m = re.match(r"^bytes=(\d*)-(\d*)$", (h.headers.get("Range") or "").strip())
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+        else:
+            start = max(0, size - int(m.group(2)))
+        if start > end or start >= size:
+            h.send_response(416)
+            h.send_header("Content-Range", "bytes */%d" % size)
+            h.send_header("Content-Length", "0")
+            h.end_headers()
+            return
+        code = 206
+    h.send_response(code)
+    h.send_header("Content-Type", ctype)
+    h.send_header("Accept-Ranges", "bytes")
+    h.send_header("Content-Length", str(end - start + 1))
+    h.send_header("Cache-Control", cache)
+    if code == 206:
+        h.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+    h.end_headers()
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                blk = f.read(min(262144, left))
+                if not blk:
+                    break
+                h.wfile.write(blk)
+                left -= len(blk)
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        pass
+
+
+def _playable(mime):
+    return "video/mp4" if mime in ("video/quicktime", "video/x-m4v", "") else mime
+
+
+def _get(h, path, q):
+    if path in ("/create", "/create/"):
+        _send_bytes(h, CREATE_HTML, "text/html; charset=utf-8")
+        return True
+    if path.startswith("/v/api/"):
+        name = path[7:].strip("/")
+        if name in ("state", "admin"):
+            _api(h, name, q, {})
+            return True
+        _send(h, {"error": "use_post"}, 405)
+        return True
+    parts = [x for x in path.split("/") if x]
+    if len(parts) < 2 or parts[0] != "v":
+        return False
+    vid = parts[1].lower()
+    v = _video(vid)
+    if not v or v["status"] != "live":
+        if len(parts) == 2:
+            h.send_response(302)
+            h.send_header("Location", "/cinema?wing=ten")
+            h.send_header("Content-Length", "0")
+            h.end_headers()
+            return True
+        _send(h, {"error": "not_found"}, 404)
+        return True
+    if len(parts) == 2:
+        h.send_response(302)
+        h.send_header("Location", "/cinema/v/" + vid)
+        h.send_header("Cache-Control", "no-store")
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+        return True
+    what = parts[2]
+    if what == "teaser":
+        if not h.headers.get("Range") or h.headers.get("Range", "").startswith("bytes=0-"):
+            with _ctx["lock"]:
+                _ctx["conn"].execute("UPDATE studio_video SET plays=plays+1 WHERE id=?", (vid,))
+                _ctx["conn"].commit()
+        _send_file(h, _path(vid, "teaser"), v["teaser_mime"] or "video/mp4")
+        return True
+    if what in ("poster.jpg", "poster"):
+        p = _path(vid, "poster")
+        if os.path.exists(p):
+            _send_file(h, p, "image/jpeg")
+        else:
+            _send_bytes(h, b"", "image/jpeg", 404)
+        return True
+    if what == "full":
+        viewer = str(q.get("viewer") or "")
+        t = str(q.get("t") or "")
+        good = (VIEWER_RE.match(viewer) or OWNER_RE.match(viewer)) and hmac.compare_digest(t, _token(vid, viewer))
+        if good and OWNER_RE.match(viewer):
+            good = viewer == "owner:" + v["account"]
+        elif good:
+            good = _unlocked(vid, viewer)[0]
+        if not good:
+            _send(h, {"error": "locked", "message": "Unlock this video to watch it."}, 403)
+            return True
+        _send_file(h, _path(vid, "full"), _playable(v["full_mime"] or ""), cache="private, max-age=3600")
+        return True
+    _send(h, {"error": "not_found"}, 404)
+    return True
+
+
+def _api(h, name, q, body):
+    if "conn" not in _ctx:
+        _send(h, {"error": "not_armed", "message": "Open /x/studio/status once."}, 503)
+        return
+    _setup()
+    fn = API.get(name)
+    if not fn:
+        _send(h, {"error": "not_found"}, 404)
+        return
+    try:
+        out, code = fn(q, body, h)
+    except Exception as e:
+        print("STUDIO ERR %s: %s" % (name, e), flush=True)
+        out, code = {"error": "failed", "message": "Something went wrong. Try again."}, 500
+    _send(h, out, code)
+
+
+def _post(h, path, q):
+    name = path[7:].strip("/")
+    if "conn" not in _ctx:
+        _send(h, {"error": "not_armed"}, 503)
+        return True
+    _setup()
+    if name == "chunk":
+        try:
+            out, code = chunk(h, q)
+        except Exception as e:
+            print("STUDIO CHUNK ERR: %s" % e, flush=True)
+            out, code = {"error": "failed", "message": "Upload piece failed. Retrying."}, 500
+        _send(h, out, code)
+        return True
+    try:
+        n = min(int(h.headers.get("Content-Length") or 0), 20000)
+        raw = _read(h, n) if n else b""
+        body = json.loads((raw or b"{}").decode("utf-8") or "{}")
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+    _api(h, name, q, body)
+    return True
 
 
 def _find_handler_class(ctx):
@@ -555,1276 +1247,86 @@ def _find_handler_class(ctx):
     return None
 
 
-def _install_page(ctx):
+def _split(h):
+    u = urllib.parse.urlparse(h.path)
+    return u.path, {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+
+
+def _install(ctx):
     global _patched
+    if isinstance(ctx, dict) and "conn" in ctx:
+        _ctx.update(ctx)
+        _setup()
     if _patched:
         return True
     cls = _find_handler_class(ctx)
     if cls is None:
         return False
-    if getattr(cls, "_toolspage_patched", False):
+    if getattr(cls, "_studio4_patched", False):
         _patched = True
         return True
-    original_do_GET = cls.do_GET
+    og = cls.do_GET
+    op = getattr(cls, "do_POST", None)
 
     def do_GET(self):
-        path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
-        hit = _FILES.get(path)
-        if hit:
-            body, ctype, fname = hit
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            if fname:
-                self.send_header("Content-Disposition", 'attachment; filename="%s"' % fname)
-            self.end_headers()
-            self.wfile.write(body)
+        path, q = _split(self)
+        if path in ("/create", "/create/") or path.startswith("/v/"):
+            try:
+                if _get(self, path, q):
+                    return
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as e:
+                print("STUDIO GET ERR: %s" % e, flush=True)
+                try:
+                    _send(self, {"error": "failed"}, 500)
+                except Exception:
+                    pass
+                return
+        return og(self)
+
+    def do_POST(self):
+        path, q = _split(self)
+        if path.startswith("/v/api/"):
+            _post(self, path, q)
             return
-        return original_do_GET(self)
+        return op(self) if op else None
 
     cls.do_GET = do_GET
-    cls._toolspage_patched = True
+    if op:
+        cls.do_POST = do_POST
+    cls._studio4_patched = True
     _patched = True
     return True
 
 
 def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    return ({"module": "toolspage", "version": VERSION, "armed": armed,
-             "serves": sorted(_FILES.keys()),
-             "page": "https://sebbi.pro/tools"}, 200)
-
-
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-```
-
-
-## `modules/verifier.py`
-
-717 lines, 26299 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/verifier.py  -  hand the verifier out at a URL
-
-WHY THIS EXISTS
----------------
-A proof that can only be checked by the party who issued it is not a proof.
-So the proof bundles at /x/continuity/proof are useless unless somebody can
-easily get hold of something that checks them, and telling people to clone a
-repository is a gate.
-
-This serves the standalone verifier as a plain file:
-
-    curl -sO https://sebbi.pro/verify-authority.py
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify-authority.py -
-
-The script it hands out has no dependencies and makes no network calls. It
-checks the Ed25519 signature, recomputes every digest, re-runs the whole
-derivation from the published rules, and reaches its own verdict - then says
-so if that verdict disagrees with ours.
-
-WHAT IT DELIBERATELY DOES NOT DO
---------------------------------
-It does not phone home, and this module records nothing about who downloaded
-it. A verification tool that reports back to the party being verified is not
-a verification tool.
-
-    GET /verify-authority.py   the script
-    GET /x/verifier/status     what is installed, and the script's digest
-"""
-
-import hashlib
-import sys
-
-VERSION = "1.1"
-
-PUBLIC = {("GET", "status")}
-
-# Deliberately NOT "/verify" - that is the sealed-post verification page and
-# this module would silently hijack it, handing a visitor a Python download
-# where they expected a page. A route grab is a bug even when the code works.
-FILE_PATHS = ("/verify-authority.py", "/verify_authority.py")
-
-_patched = [False]
-
-
-SCRIPT = r'''#!/usr/bin/env python3
-"""
-verify_authority.py  -  check an AILeash authority proof without AILeash
-
-    python3 verify_authority.py proof.json
-    curl -s "https://sebbi.pro/x/continuity/proof?evaluation=e_..." \\
-        | python3 verify_authority.py -
-
-WHAT THIS IS FOR
-----------------
-A proof that can only be checked by the party who issued it is not a proof.
-This script takes a bundle and reaches its own conclusion using nothing but
-the Python standard library. It does not call the issuing system, it does not
-import anything you have to install, and it does not take a single field of
-the bundle at face value.
-
-It does four separate things, and each one can fail on its own:
-
-  1. SIGNATURE   Ed25519 over the canonical bundle. Confirms the bundle came
-                 from the holder of the named key and has not been edited by
-                 anybody since.
-
-  2. INTEGRITY   Recomputes every grant digest, the lineage digest and the
-                 parameter digest from the fields in front of it. Confirms
-                 the bundle is internally consistent with its own contents.
-
-  3. DERIVATION  Re-runs the authority rules from scratch: root issued by a
-                 human, an unbroken parent chain, scope covered at every hop,
-                 constraints narrowing on every axis, purpose narrowing,
-                 validity windows contained, nothing revoked, and the action
-                 itself inside the effective limits of the whole lineage.
-
-  4. AGREEMENT   Compares the verdict this script reached with the verdict the
-                 bundle claims. Disagreement is reported as a failure of the
-                 issuer, not of this script.
-
-WHAT A PASS MEANS
------------------
-That the authority for this action was derivable, at that time, from that
-human grant - or, for a refusal, that it genuinely was not, and that the named
-grant and invariant really are where it broke.
-
-WHAT A PASS DOES NOT MEAN
--------------------------
-That the root grant should ever have been issued. That the parameters describe
-something that really happened. That the risk engine was right. Derivation is
-not merit and it is not truth.
-
-The risk half of a composed verdict cannot be re-derived here, because that
-needs the issuer's scoring engine. Where the bundle's authority verdict is
-BLOCK, the composed verdict stands regardless, because the composition takes
-the worse of the two.
-"""
-
-import binascii
-import hashlib
-import json
-import sys
-
-GRANT_PREFIX = b"AILEASH-GRANT-v1:"
-EVAL_PREFIX = b"AILEASH-AUTHEVAL-v1:"
-BUNDLE_PREFIX = b"AILEASH-AUTHORITY-PROOF-v1:"
-
-MAX_DEPTH = 32
-RANK = {"ALLOW": 0, "CHALLENGE": 1, "BLOCK": 2}
-
-
-# ======================================================================
-# Ed25519, RFC 8032, standard library only
-# ======================================================================
-
-_Q = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
-_D = -121665 * pow(121666, _Q - 2, _Q) % _Q
-_I = pow(2, (_Q - 1) // 4, _Q)
-
-
-def _h(m):
-    return hashlib.sha512(m).digest()
-
-
-def _inv(x):
-    return pow(x, _Q - 2, _Q)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_D * y * y + 1)
-    x = pow(xx, (_Q + 3) // 8, _Q)
-    if (x * x - xx) % _Q != 0:
-        x = (x * _I) % _Q
-    if x % 2 != 0:
-        x = _Q - x
-    return x
-
-
-_BY = 4 * _inv(5) % _Q
-_BX = _xrecover(_BY)
-_B = (_BX % _Q, _BY % _Q, 1, (_BX * _BY) % _Q)
-_IDENT = (0, 1, 1, 0)
-
-
-def _add(p, q):
-    x1, y1, z1, t1 = p
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % _Q
-    b = (y1 + x1) * (y2 + x2) % _Q
-    c = t1 * 2 * _D * t2 % _Q
-    dd = z1 * 2 * z2 % _Q
-    e, f, g, hh = b - a, dd - c, dd + c, b + a
-    return (e * f % _Q, g * hh % _Q, f * g % _Q, e * hh % _Q)
-
-
-def _scalarmult(p, e):
-    if e == 0:
-        return _IDENT
-    q = _scalarmult(p, e // 2)
-    q = _add(q, q)
-    if e & 1:
-        q = _add(q, p)
-    return q
-
-
-def _encodepoint(p):
-    x, y, z, _t = p
-    zi = _inv(z)
-    x, y = x * zi % _Q, y * zi % _Q
-    bits = [(y >> i) & 1 for i in range(255)] + [x & 1]
-    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(32))
-
-
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _hint(m):
-    h = _h(m)
-    return sum(2 ** i * _bit(h, i) for i in range(512))
-
-
-def _isoncurve(p):
-    x, y, z, t = p
-    return (z % _Q != 0 and x * y % _Q == z * t % _Q
-            and (y * y - x * x - z * z - _D * t * t) % _Q == 0)
-
-
-def _decodepoint(s):
-    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
-    x = _xrecover(y)
-    if x & 1 != _bit(s, 255):
-        x = _Q - x
-    p = (x, y, 1, (x * y) % _Q)
-    if not _isoncurve(p):
-        raise ValueError("point off curve")
-    return p
-
-
-def ed25519_verify(sig, msg, pk):
-    if len(sig) != 64 or len(pk) != 32:
-        return False
+    armed = _install(ctx)
+    d, persistent = _storage()
+    counts = {}
+    if "conn" in _ctx:
+        with _ctx["lock"]:
+            c = _ctx["conn"]
+            counts = {"live_videos": c.execute("SELECT COUNT(*) FROM studio_video WHERE status='live'").fetchone()[0],
+                      "paid_views": c.execute("SELECT COALESCE(SUM(unlocks),0) FROM studio_video").fetchone()[0],
+                      "creator_earnings_pence": c.execute("SELECT COALESCE(SUM(earned),0) FROM studio_video").fetchone()[0],
+                      "reports": c.execute("SELECT COUNT(*) FROM studio_report").fetchone()[0]}
     try:
-        rr = _decodepoint(sig[:32])
-        a = _decodepoint(pk)
+        free_gb = round(shutil.disk_usage(d).free / 1073741824, 1)
     except Exception:
-        return False
-    s = int.from_bytes(sig[32:64], "little")
-    if s >= _L:
-        return False
-    hh = _hint(sig[:32] + pk + msg)
-    return _encodepoint(_scalarmult(_B, s)) == _encodepoint(_add(rr, _scalarmult(a, hh)))
-
-
-# ======================================================================
-# the rules, reimplemented from the published spec
-# ======================================================================
-
-def canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def sha(prefix, text):
-    return hashlib.sha256(prefix + text.encode("utf-8")).hexdigest()
-
-
-def grant_digest(g):
-    material = {
-        "id": g["id"], "parent": g["parent"], "issuer": g["issuer"],
-        "issuer_kind": g["issuer_kind"], "subject": g["subject"],
-        "subject_kind": g["subject_kind"], "scope": sorted(g["scope"]),
-        "constraints": g["constraints"], "purpose": g["purpose"],
-        "purpose_tags": sorted(g["purpose_tags"]),
-        "not_before": g["not_before"], "not_after": g["not_after"],
-        "depth": g["depth"], "delegations_left": g["delegations_left"],
-        "created": g["created"], "risk_accepted_by": g.get("risk_accepted_by"),
-    }
-    return sha(GRANT_PREFIX, canon(material))
-
-
-def covers(held, wanted):
-    if held == wanted or held == "*":
-        return True
-    if held.endswith(".*"):
-        return wanted == held[:-2] or wanted.startswith(held[:-1])
-    return False
-
-
-def wildcard_breadth(scope, capability):
-    best = None
-    for held in scope:
-        if not covers(held, capability):
-            continue
-        if held == capability:
-            return 0
-        width = (capability.count(".") + 2 if held == "*"
-                 else capability.count(".") - held[:-2].count("."))
-        best = width if best is None else min(best, width)
-    return best
-
-
-def direction(key):
-    for p in ("max_", "min_", "allowed_", "denied_", "may_"):
-        if key.startswith(p):
-            return p
-    return None
-
-
-def num(v):
-    if isinstance(v, bool) or v is None:
-        raise ValueError("not a number")
-    return float(v)
-
-
-def as_set(v):
-    if isinstance(v, (list, tuple, set)):
-        return set(v)
-    return {v}
-
-
-def narrower(parent_c, child_c):
-    for key in sorted(child_c):
-        d = direction(key)
-        cval = child_c[key]
-        if d is None:
-            return False, "constraint '%s' has no narrowing rule" % key
-        if key not in parent_c:
-            return False, "constraint '%s' is not expressed by the parent" % key
-        pval = parent_c[key]
-        try:
-            if d == "max_" and num(cval) > num(pval):
-                return False, "%s raised from %s to %s" % (key, pval, cval)
-            if d == "min_" and num(cval) < num(pval):
-                return False, "%s lowered from %s to %s" % (key, pval, cval)
-            if d == "allowed_" and not as_set(cval) <= as_set(pval):
-                return False, "%s adds values the parent does not hold" % key
-            if d == "denied_" and not as_set(pval) <= as_set(cval):
-                return False, "%s drops values the parent denies" % key
-            if d == "may_" and bool(cval) and not bool(pval):
-                return False, "%s enabled where the parent withholds it" % key
-        except (TypeError, ValueError):
-            return False, "constraint '%s' is not comparable" % key
-    return True, None
-
-
-def effective(chain):
-    eff = {}
-    for g in chain:
-        for k, v in g["constraints"].items():
-            d = direction(k)
-            if k not in eff:
-                eff[k] = v
-                continue
-            cur = eff[k]
-            try:
-                if d == "max_":
-                    eff[k] = min(num(cur), num(v))
-                elif d == "min_":
-                    eff[k] = max(num(cur), num(v))
-                elif d == "allowed_":
-                    eff[k] = sorted(as_set(cur) & as_set(v))
-                elif d == "denied_":
-                    eff[k] = sorted(as_set(cur) | as_set(v))
-                elif d == "may_":
-                    eff[k] = bool(cur) and bool(v)
-            except (TypeError, ValueError):
-                eff[k] = v
-    return eff
-
-
-def params_against(params, eff):
-    hard, unconstrained = [], []
-    for key in sorted(params):
-        val = params[key]
-        checked = False
-        for cname, cval in eff.items():
-            d = direction(cname)
-            if not d or cname[len(d):] != key:
-                continue
-            checked = True
-            try:
-                if d == "max_" and num(val) > num(cval):
-                    hard.append("%s=%s exceeds %s=%s" % (key, val, cname, cval))
-                elif d == "min_" and num(val) < num(cval):
-                    hard.append("%s=%s is below %s=%s" % (key, val, cname, cval))
-                elif d == "allowed_" and val not in as_set(cval):
-                    hard.append("%s=%s is outside %s" % (key, val, cname))
-                elif d == "denied_" and val in as_set(cval):
-                    hard.append("%s=%s is denied by %s" % (key, val, cname))
-                elif d == "may_" and bool(val) and not bool(cval):
-                    hard.append("%s requested where %s withholds it" % (key, cname))
-            except (TypeError, ValueError):
-                hard.append("%s cannot be compared with %s" % (key, cname))
-        if not checked:
-            unconstrained.append(key)
-    return hard, unconstrained
-
-
-# ======================================================================
-# the four checks
-# ======================================================================
-
-class Report(object):
-    def __init__(self):
-        self.rows = []
-        self.failed = False
-
-    def add(self, ok, name, detail=""):
-        self.rows.append((ok, name, detail))
-        if not ok:
-            self.failed = True
-
-    def note(self, name, detail=""):
-        self.rows.append((None, name, detail))
-
-    def render(self):
-        out = []
-        for ok, name, detail in self.rows:
-            mark = "  ok  " if ok else ("FAIL  " if ok is False else "  --  ")
-            out.append(mark + name + (("\n        " + detail) if detail else ""))
-        return "\n".join(out)
-
-
-def check_signature(bundle, rep):
-    sig_hex = bundle.get("signature")
-    pk_hex = (bundle.get("issued_by") or {}).get("public_key")
-    if not sig_hex or not pk_hex:
-        rep.add(False, "Signature present", "the bundle carries no signature or no key")
-        return
-    body = dict(bundle)
-    body.pop("signature", None)
-    body.pop("verify_with", None)
+        free_gb = None
+    stripe = False
     try:
-        sig = binascii.unhexlify(sig_hex)
-        pk = binascii.unhexlify(pk_hex)
+        stripe = bool(_credits()._stripe_key())
     except Exception:
-        rep.add(False, "Signature is readable hex")
-        return
-    ok = ed25519_verify(sig, BUNDLE_PREFIX + canon(body).encode("utf-8"), pk)
-    rep.add(ok, "Ed25519 signature over the canonical bundle",
-            "key " + pk_hex[:16] + "…  Verify this key independently at the issuer's "
-            "published address before trusting who signed." if ok else
-            "the bundle was altered after signing, or it was not signed by this key")
-
-
-def check_integrity(bundle, rep):
-    lineage = bundle.get("lineage") or []
-    bad = []
-    for g in lineage:
-        try:
-            if grant_digest(g) != g.get("digest"):
-                bad.append(g.get("id"))
-        except Exception:
-            bad.append(g.get("id"))
-    rep.add(not bad, "Every grant digest recomputes from its own fields",
-            "" if not bad else "mismatched: " + ", ".join(str(b) for b in bad))
-
-    claimed = (bundle.get("decision") or {}).get("lineage_digest")
-    mine = sha(EVAL_PREFIX, canon([g.get("digest") for g in lineage]))
-    rep.add(mine == claimed, "Lineage digest matches the ordered path",
-            "" if mine == claimed else "computed " + mine[:20] + "… claimed " + str(claimed)[:20] + "…")
-
-    req = bundle.get("request") or {}
-    claimed_p = (bundle.get("decision") or {}).get("params_digest")
-    mine_p = sha(EVAL_PREFIX, canon({"action": req.get("action"),
-                                     "params": req.get("params") or {}}))
-    rep.add(mine_p == claimed_p, "Parameter digest matches the request as stated",
-            "" if mine_p == claimed_p else "the parameters shown are not the "
-            "parameters that were judged")
-
-
-def rederive(bundle, rep):
-    """Run the published rules from scratch and reach an independent verdict."""
-    lineage = bundle.get("lineage") or []
-    decision = bundle.get("decision") or {}
-    req = bundle.get("request") or {}
-    at = decision.get("evaluated_at_epoch")
-
-    hard, soft = [], []
-    broken_at = broken_invariant = None
-
-    def fail(grant, invariant, detail):
-        nonlocal broken_at, broken_invariant
-        hard.append(detail)
-        if broken_at is None:
-            broken_at, broken_invariant = grant, invariant
-
-    if not lineage:
-        fail(None, "authority_continuity", "the bundle carries no authority path")
-    else:
-        root = lineage[0]
-        if root.get("parent") is not None:
-            fail(root["id"], "authority_continuity",
-                 "the path does not begin at a parentless root")
-        if root.get("issuer_kind") != "human":
-            fail(root["id"], "identity_continuity",
-                 "the root grant was not issued by a human principal")
-
-        previous = None
-        for g in lineage:
-            if g.get("revoked_at") is not None:
-                fail(g["id"], "authority_continuity",
-                     "grant %s was revoked" % g["id"])
-            if at is not None:
-                if at < g["not_before"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s was not yet valid at the time of the decision" % g["id"])
-                if at >= g["not_after"]:
-                    fail(g["id"], "temporal_validity",
-                         "grant %s had expired at the time of the decision" % g["id"])
-            if previous is not None:
-                if g.get("parent") != previous.get("id"):
-                    fail(g["id"], "authority_continuity",
-                         "grant %s does not point at the grant above it" % g["id"])
-                missing = [c for c in g["scope"]
-                           if not any(covers(p, c) for p in previous["scope"])]
-                if missing:
-                    fail(g["id"], "boundary_integrity",
-                         "%s holds scope its parent does not: %s"
-                         % (g["id"], ", ".join(sorted(missing))))
-                ok, why = narrower(previous["constraints"], g["constraints"])
-                if not ok:
-                    fail(g["id"], "boundary_integrity", "%s: %s" % (g["id"], why))
-                if not set(g["purpose_tags"]) <= set(previous["purpose_tags"]):
-                    fail(g["id"], "intent_continuity",
-                         "%s carries purpose tags its parent does not" % g["id"])
-                if (g["not_before"] < previous["not_before"]
-                        or g["not_after"] > previous["not_after"]):
-                    fail(g["id"], "temporal_validity",
-                         "%s is valid outside its parent's window" % g["id"])
-                if g["depth"] != previous["depth"] + 1:
-                    fail(g["id"], "authority_continuity",
-                         "%s records a depth inconsistent with its parent" % g["id"])
-            previous = g
-
-        if len(lineage) - 1 > MAX_DEPTH:
-            fail(lineage[-1]["id"], "boundary_integrity", "delegation depth exceeds the ceiling")
-
-        if not any(g.get("risk_accepted_by") for g in lineage):
-            fail(lineage[0]["id"], "identity_continuity",
-                 "no grant in this path names who accepted the risk")
-
-        leaf = lineage[-1]
-        action = req.get("action")
-        params = req.get("params") or {}
-
-        if action and not any(covers(c, action) for c in leaf["scope"]):
-            fail(leaf["id"], "boundary_integrity",
-                 "action '%s' is outside the scope of the grant exercised" % action)
-        elif action:
-            breadth = wildcard_breadth(leaf["scope"], action)
-            if breadth and breadth >= 2:
-                soft.append("action '%s' is only covered by a broad wildcard" % action)
-
-        eff = effective(lineage)
-        failures, unconstrained = params_against(params, eff)
-        for f in failures:
-            fail(leaf["id"], "boundary_integrity", f)
-        for u in unconstrained:
-            soft.append("parameter '%s' is not constrained anywhere in the path" % u)
-
-        tag = req.get("purpose_tag")
-        if tag:
-            if tag not in leaf["purpose_tags"]:
-                soft.append("declared purpose '%s' is not carried by the grant" % tag)
-        else:
-            soft.append("the action declared no purpose")
-
-    verdict = "BLOCK" if hard else ("CHALLENGE" if soft else "ALLOW")
-    return verdict, hard, soft, broken_at, broken_invariant
-
-
-def check_agreement(bundle, rep, mine, hard, soft, broken_at, broken_invariant):
-    decision = bundle.get("decision") or {}
-    claimed = decision.get("authority_verdict") or decision.get("verdict")
-
-    rep.add(mine == claimed,
-            "Independently re-derived authority verdict: " + mine,
-            "" if mine == claimed else
-            "the issuer claims " + str(claimed) + " and this script reaches " + mine +
-            " from the same path. One of us is wrong and the rules are published.")
-
-    if mine == "BLOCK":
-        same_grant = (broken_at == decision.get("broken_at"))
-        same_inv = (broken_invariant == decision.get("broken_invariant"))
-        rep.add(same_grant and same_inv,
-                "Refusal reproduces at the same grant and invariant",
-                ("grant %s, invariant %s" % (broken_at, broken_invariant))
-                if same_grant and same_inv else
-                "this script breaks at grant %s / %s, the issuer says %s / %s"
-                % (broken_at, broken_invariant,
-                   decision.get("broken_at"), decision.get("broken_invariant")))
-        rep.note("Why authority could not be derived")
-        for h in hard:
-            rep.note("  " + h)
-    elif soft:
-        rep.note("Why this could not be settled without a person")
-        for x in soft:
-            rep.note("  " + x)
-
-    risk = decision.get("risk_verdict")
-    if risk and mine != "BLOCK":
-        rep.note("Risk verdict reported as " + str(risk) + ", not re-derivable here",
-                 "the composed verdict is the worse of the two; the scoring engine "
-                 "is not part of this bundle and is not checked by this script")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    src = sys.argv[1]
-    raw = sys.stdin.read() if src == "-" else open(src, "r").read()
-    try:
-        bundle = json.loads(raw)
-    except Exception as exc:
-        print("Not readable JSON: " + str(exc))
-        return 2
-
-    rep = Report()
-    print("=" * 66)
-    print("AUTHORITY PROOF  ·  independent verification")
-    print("=" * 66)
-    d = bundle.get("decision") or {}
-    print("evaluation   " + str(d.get("evaluation")))
-    print("action       " + str((bundle.get("request") or {}).get("action")))
-    print("at           " + str(d.get("evaluated_at")))
-    print("hops         " + str(max(0, len(bundle.get("lineage") or []) - 1)))
-    if bundle.get("lineage"):
-        print("authorised   " + str(bundle["lineage"][0].get("issuer")))
-        print("executed     " + str(bundle["lineage"][-1].get("subject")))
-        acc = [g.get("risk_accepted_by") for g in bundle["lineage"] if g.get("risk_accepted_by")]
-        print("risk owner   " + str(acc[-1] if acc else None))
-    print("-" * 66)
-
-    check_signature(bundle, rep)
-    check_integrity(bundle, rep)
-    mine, hard, soft, ba, bi = rederive(bundle, rep)
-    check_agreement(bundle, rep, mine, hard, soft, ba, bi)
-
-    print(rep.render())
-    print("-" * 66)
-    if rep.failed:
-        print("RESULT: NOT VERIFIED. Something above did not hold.")
-        return 1
-    print("RESULT: VERIFIED - " + mine)
-    if mine == "BLOCK":
-        print("This is a proof that the action was NOT authorised, and where it failed.")
-    print("Checked with no network access, no dependencies, and nothing taken on")
-    print("the issuer's word except the meaning of their public key.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-
-
-def _digest():
-    return hashlib.sha256(SCRIPT.encode("utf-8")).hexdigest()
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if m is not None and hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_verifier_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-
-        if p in FILE_PATHS:
-            body = SCRIPT.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Disposition",
-                                 'attachment; filename="verify-authority.py"')
-                self.send_header("Cache-Control", "public, max-age=300")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-
-        return original(self)
-
-    H.do_GET = do_GET
-    H._verifier_patched = True
-    _patched[0] = True
-    print("VERIFIER: /verify-authority.py installed", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("VERIFIER: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    action = (action or "").strip("/").lower()
-
-    if method == "GET" and action in ("", "status"):
-        return {
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "module_version": VERSION,
-            "serving": list(FILE_PATHS),
-            "script_bytes": len(SCRIPT),
-            "script_sha256": _digest(),
-            "how_to_use": [
-                "curl -sO https://sebbi.pro/verify-authority.py",
-                "curl -s 'https://sebbi.pro/x/continuity/proof?evaluation=<id>' "
-                "| python3 verify-authority.py -",
-            ],
-            "dependencies": "none - Python standard library only",
-            "network": "the script makes no network calls and reports nothing back. "
-                       "A verification tool that phones home to the party being "
-                       "verified is not a verification tool.",
-            "note": "Check script_sha256 against the file you downloaded. And read it "
-                    "before you run it, as you would with anything else handed to you "
-                    "by the party you are checking.",
-        }, 200
-
-    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
-
-```
-
-
-## `modules/walk.py`
-
-496 lines, 17886 bytes
-
-```python
-"""
-walk.py v1.1.0 - the whole chain, genesis to tip, readable by anyone.
-
-Lives at modules/walk.py and answers at https://sebbi.pro/x/walk/<action>.
-Every route is public. Nothing is written, nothing is sealed, no table is
-created. It only reads audit_log.
-
-WHY IT EXISTS
-Until now nobody outside could walk the chain end to end: /api/verify-chain
-returns a count and a tip, and /x/witness/chain needs a key. A verifier could
-check pieces (inclusion, consistency, witnessed tips) but never the whole run
-from the first block. This serves every block in write order, from genesis,
-in pages, so the full walk can be done from outside without asking anyone.
-
-HOW A BLOCK IS SEALED (server.py seal(), unchanged)
-    audit_hash = sha256( json.dumps(
-        {"prev_hash": prev, "ts": ts, "event": event, "result": result},
-        sort_keys=True).encode() ).hexdigest()
-    The first block's prev is the literal string "GENESIS".
-
-WHAT A VERIFIER DOES WITH THIS
-For a public block the exact preimage string is served. So, in any language:
-    1. sha256(utf8(preimage)) must equal audit_hash
-    2. parse preimage; its prev_hash must equal the previous block's audit_hash
-    3. the first block's prev_hash must be "GENESIS"
-No need to copy Python's JSON formatting - the bytes that were hashed are given.
-
-WHAT IS WITHHELD, AND WHY
-Blocks sealed under a customer's API key (any key not owned by the
-operator), blocks from sources not on the public
-list below, and any block whose payload contains a field that looks like a
-secret, are served WITHOUT their payload: index, position, time, prev_hash and
-audit_hash only. Publishing customer decisions or child-safety events to the
-open internet is not something a verification route gets to decide. For a
-withheld block an outsider can check linkage but cannot recompute the hash; the
-customer who holds the original event can. Every withheld block says why.
-
-THE RESET
-The chain restarted from genesis on 7 September 2026. A block index quoted
-before that date belongs to the earlier chain. If the same number exists here,
-it is a different block.
-
-Module contract: handle(method, action, data, api_key, ctx) -> (dict, status).
-"""
-
-import json
-import hashlib
-import os
-import re
-import threading
-
-VERSION = "1.1.0"
-HOST = "https://sebbi.pro"
-BASE = HOST + "/x/walk/"
-GENESIS_PREV = "GENESIS"
-RESET_DATE = "2026-09-07"
-DEFAULT_LIMIT = 100
-
-# Keys registered to these addresses are the operator's own. Blocks sealed
-# under them are NOT treated as customer data; they go through the public
-# list and secret checks like any other block. Override with the env var
-# WALK_OPERATOR_EMAILS (comma separated).
-OPERATOR_EMAILS = tuple(
-    e.strip().lower() for e in os.environ.get(
-        "WALK_OPERATOR_EMAILS",
-        "justrightdecorators@gmail.com,justin@monopcontent.com").split(",")
-    if e.strip())
-MAX_LIMIT = 500
-
-# user_id prefixes whose payloads are protocol traffic and safe to publish.
-# Anything not starting with one of these is withheld. Extend here, one line.
-PUBLIC_PREFIXES = (
-    "wit:",
-    "peer:",
-    "praxis:",
-    "bind:",
-    "signed:",
-    "system_",
-    "public-witness",
-)
-
-# Field names that must never be published, anywhere in a payload.
-SENSITIVE_KEY = re.compile(
-    r"(secret|password|passwd|passcode|token|api_?key|credential|private|"
-    r"seed|authori[sz]ation|bearer|cookie|session|^pin$)",
-    re.I,
-)
-# Values that look like AILeash API keys.
-SENSITIVE_VALUE = re.compile(r"^(al|sb|se)_live_[0-9a-f]{16,}")
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "status"),
-    ("GET", "genesis"),
-    ("GET", "blocks"),
-    ("GET", "block"),
-    ("GET", "verify"),
-}
-
-WHAT_THIS_PROVES = (
-    "For public blocks: that each served preimage hashes to the stored "
-    "audit_hash and names the previous block's hash, from genesis forward. "
-    "For withheld blocks: only that the stored links are continuous - the "
-    "hash cannot be recomputed without the payload. Pair the tip with a "
-    "witnessed or anchored tip to show this chain is the one other parties "
-    "saw. This route is served by the operator; the evidence is the "
-    "arithmetic you do on it, not the operator's word."
-)
-
-RESET_NOTE = (
-    "This chain restarted from genesis on " + RESET_DATE + ". A block index "
-    "quoted before that date belongs to the earlier chain. If the same number "
-    "exists here, it is a different block."
-)
-
-_cache_lock = threading.Lock()
-_cache = {"key": None, "result": None}
-
-
-# ---------------------------------------------------------------- helpers
-
-def _q(data, name, default=None):
-    if not isinstance(data, dict):
-        return default
-    v = data.get(name, default)
-    if isinstance(v, list):
-        v = v[0] if v else default
-    return v
-
-
-def _int(v, default, lo, hi):
-    try:
-        return max(lo, min(hi, int(v)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _sha(s):
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _preimage(prev, ts, event, result):
-    return json.dumps(
-        {"prev_hash": prev, "ts": ts, "event": event, "result": result},
-        sort_keys=True,
-    )
-
-
-def _has_api_key_col(conn):
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(audit_log)").fetchall()]
-    return "api_key" in cols
-
-
-def _select(conn):
-    ak = "api_key" if _has_api_key_col(conn) else "''"
-    return ("SELECT id, ts, user_id, event_json, result_json, prev_hash, "
-            "audit_hash, " + ak + " FROM audit_log")
-
-
-def _scan(obj):
-    """True if any key or string value looks like a secret."""
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if SENSITIVE_KEY.search(str(k)):
-                return True
-            if _scan(v):
-                return True
-    elif isinstance(obj, list):
-        for v in obj:
-            if _scan(v):
-                return True
-    elif isinstance(obj, str):
-        if SENSITIVE_VALUE.match(obj):
-            return True
-    return False
-
-
-def _customer_keys(conn):
-    """Every API key NOT owned by the operator. If the key table cannot be
-    read, return None, which makes every keyed block count as a customer's -
-    the safe direction."""
-    try:
-        marks = ",".join("?" for _ in OPERATOR_EMAILS) or "''"
-        rows = conn.execute(
-            "SELECT key FROM api_keys WHERE lower(email) NOT IN (" + marks + ")",
-            OPERATOR_EMAILS).fetchall()
-        return set(r[0] for r in rows)
-    except Exception:
-        return None
-
-
-def _is_customer(api_key, customer_keys):
-    if not api_key:
-        return False
-    if customer_keys is None:
-        return True
-    return api_key in customer_keys
-
-
-def _classify(user_id, api_key, event, result, customer_keys):
-    if _is_customer(api_key, customer_keys):
-        return False, "customer_key"
-    uid = str(user_id or "")
-    if not uid.startswith(PUBLIC_PREFIXES):
-        return False, "not_on_public_list"
-    if _scan(event) or _scan(result):
-        return False, "sensitive_field"
-    return True, None
-
-
-def _prefix(uid):
-    uid = str(uid or "")
-    return uid.split(":")[0] + ":" if ":" in uid else uid[:12]
-
-
-def _block(row, position, customer_keys):
-    bid, ts, uid, ej, rj, prev, h, ak = row
-    out = {
-        "block_index": bid,
-        "position": position,
-        "ts": ts,
-        "prev_hash": prev,
-        "audit_hash": h,
-    }
-    try:
-        event = json.loads(ej)
-        result = json.loads(rj)
-    except Exception:
-        out["payload"] = "withheld"
-        out["withheld_reason"] = "unparseable"
-        out["server_recomputes"] = False
-        return out, False, "unparseable"
-    pre = _preimage(prev, ts, event, result)
-    out["server_recomputes"] = (_sha(pre) == h)
-    public, reason = _classify(uid, ak, event, result, customer_keys)
-    if public:
-        out["preimage"] = pre
-    else:
-        out["payload"] = "withheld"
-        out["withheld_reason"] = reason
-    return out, public, reason
-
-
-def _position_of(conn, bid):
-    """Zero-based write-order position of block bid."""
-    r = conn.execute("SELECT COUNT(*) FROM audit_log WHERE id < ?", (bid,)).fetchone()
-    return r[0] if r else 0
-
-
-def _hash_before(conn, bid):
-    r = conn.execute(
-        "SELECT audit_hash FROM audit_log WHERE id < ? ORDER BY id DESC LIMIT 1",
-        (bid,)).fetchone()
-    return r[0] if r else GENESIS_PREV
-
-
-def _full_walk(ctx):
-    """Walk every block once. Cached until the chain grows."""
-    conn, lock = ctx["conn"], ctx["lock"]
-    with lock:
-        key = conn.execute("SELECT COUNT(*), MAX(id) FROM audit_log").fetchone()
-    with _cache_lock:
-        if _cache["key"] == key and _cache["result"] is not None:
-            return _cache["result"]
-    with lock:
-        rows = conn.execute(_select(conn) + " ORDER BY id ASC").fetchall()
-        ckeys = _customer_keys(conn)
-
-    withheld = {}
-    hidden_prefixes = {}
-    public_count = 0
-    links_ok = True
-    recompute_ok = True
-    first_break = None
-    prev_hash = GENESIS_PREV
-    for pos, row in enumerate(rows):
-        blk, public, reason = _block(row, pos, ckeys)
-        if public:
-            public_count += 1
-        else:
-            withheld[reason] = withheld.get(reason, 0) + 1
-            if reason == "not_on_public_list":
-                p = _prefix(row[2])
-                hidden_prefixes[p] = hidden_prefixes.get(p, 0) + 1
-        if blk["prev_hash"] != prev_hash:
-            links_ok = False
-            if first_break is None:
-                first_break = {"block_index": blk["block_index"], "position": pos,
-                               "problem": "prev_hash does not match the previous block"}
-        if not blk["server_recomputes"]:
-            recompute_ok = False
-            if first_break is None:
-                first_break = {"block_index": blk["block_index"], "position": pos,
-                               "problem": "stored payload does not recompute to audit_hash"}
-        prev_hash = blk["audit_hash"]
-
-    result = {
-        "blocks": len(rows),
-        "first_block_index": rows[0][0] if rows else None,
-        "last_block_index": rows[-1][0] if rows else None,
-        "genesis_hash": rows[0][6] if rows else None,
-        "genesis_prev_is_GENESIS": (rows[0][5] == GENESIS_PREV) if rows else None,
-        "tip": rows[-1][6] if rows else None,
-        "links_ok": links_ok,
-        "recompute_ok": recompute_ok,
-        "first_break": first_break,
-        "public_blocks": public_count,
-        "withheld_blocks": withheld,
-    }
-    if hidden_prefixes:
-        print("WALK not_on_public_list prefixes: " +
-              json.dumps(hidden_prefixes, sort_keys=True), flush=True)
-    with _cache_lock:
-        _cache["key"] = key
-        _cache["result"] = result
-    return result
-
-
-# ---------------------------------------------------------------- routes
-
-def _spec():
-    return {
-        "module": "walk",
-        "version": VERSION,
-        "purpose": "Every block of the chain, genesis to tip, in write order, "
-                   "public, so the whole chain can be walked from outside.",
-        "routes": {
-            "status": BASE + "status",
-            "genesis": BASE + "genesis",
-            "blocks": BASE + "blocks?after=0&limit=" + str(DEFAULT_LIMIT),
-            "block": BASE + "block?index=1",
-            "verify": BASE + "verify",
-            "spec": BASE + "spec",
-        },
-        "paging": "blocks?after=<block_index>&limit=<1-" + str(MAX_LIMIT) + ">. "
-                  "Start with after=0. Each page gives previous_audit_hash (the "
-                  "hash of the block just before the page) and next_after for "
-                  "the next call. has_more false means you have reached the tip.",
-        "seal_formula": "audit_hash = sha256(json.dumps({\"prev_hash\": prev, "
-                        "\"ts\": ts, \"event\": event, \"result\": result}, "
-                        "sort_keys=True)). First block prev = \"GENESIS\".",
-        "verify_steps": [
-            "sha256(utf8(preimage)) must equal audit_hash",
-            "json-parse preimage; its prev_hash must equal the previous block's audit_hash",
-            "the first block's prev_hash must be the literal string GENESIS",
-            "for withheld blocks, check prev_hash equals the previous audit_hash (linkage only)",
-        ],
-        "fields": {
-            "block_index": "the database id - the number receipts quote as block_index",
-            "position": "zero-based order in the chain. This is the leaf index in "
-                        "the RFC 6962 tree at " + HOST + "/x/consistency/root. "
-                        "block_index and position are different numbers; do not mix them",
-            "preimage": "the exact string that was hashed (public blocks only)",
-            "server_recomputes": "our own server's check that the stored row hashes "
-                                 "to audit_hash. Our word, not proof - recompute it yourself",
-            "withheld_reason": "customer_key | not_on_public_list | sensitive_field | unparseable",
-        },
-        "withholding": "Blocks sealed under a customer API key (any key not owned by the operator), blocks from sources "
-                       "not on the public list, and payloads carrying anything that "
-                       "looks like a secret are served without payload. Linkage stays "
-                       "checkable; the hash is recomputable only by whoever holds the "
-                       "original event.",
-        "public_sources": list(PUBLIC_PREFIXES),
-        "reset": RESET_NOTE,
-        "what_this_proves": WHAT_THIS_PROVES,
-    }
-
-
-def _status(ctx):
-    w = _full_walk(ctx)
-    out = {
-        "module": "walk",
-        "version": VERSION,
-        "blocks": w["blocks"],
-        "first_block_index": w["first_block_index"],
-        "last_block_index": w["last_block_index"],
-        "genesis_hash": w["genesis_hash"],
-        "tip": w["tip"],
-        "public_blocks": w["public_blocks"],
-        "withheld_blocks": w["withheld_blocks"],
-        "start_here": BASE + "blocks?after=0&limit=" + str(DEFAULT_LIMIT),
-        "reset": RESET_NOTE,
-        "what_this_proves": WHAT_THIS_PROVES,
-    }
-    return out
-
-
-def _genesis(ctx):
-    conn, lock = ctx["conn"], ctx["lock"]
-    with lock:
-        row = conn.execute(_select(conn) + " ORDER BY id ASC LIMIT 1").fetchone()
-        ckeys = _customer_keys(conn)
-    if not row:
-        return {"error": "empty_chain"}, 404
-    blk, _, _ = _block(row, 0, ckeys)
-    return {
-        "genesis": blk,
-        "prev_is_GENESIS": row[5] == GENESIS_PREV,
-        "reset": RESET_NOTE,
-        "next": BASE + "blocks?after=" + str(row[0]) + "&limit=" + str(DEFAULT_LIMIT),
-    }, 200
-
-
-def _blocks(data, ctx):
-    after = _int(_q(data, "after", 0), 0, 0, 10 ** 12)
-    limit = _int(_q(data, "limit", DEFAULT_LIMIT), DEFAULT_LIMIT, 1, MAX_LIMIT)
-    conn, lock = ctx["conn"], ctx["lock"]
-    with lock:
-        rows = conn.execute(_select(conn) + " WHERE id > ? ORDER BY id ASC LIMIT ?",
-                            (after, limit + 1)).fetchall()
-        if rows:
-            base = _position_of(conn, rows[0][0])
-            prev_hash = _hash_before(conn, rows[0][0])
-        else:
-            base, prev_hash = None, None
-        ckeys = _customer_keys(conn)
-    has_more = len(rows) > limit
-    rows = rows[:limit]
-    out_blocks = []
-    for i, row in enumerate(rows):
-        blk, _, _ = _block(row, base + i, ckeys)
-        out_blocks.append(blk)
-    out = {
-        "after": after,
-        "count": len(out_blocks),
-        "previous_audit_hash": prev_hash,
-        "blocks": out_blocks,
-        "has_more": has_more,
-    }
-    if out_blocks:
-        last = out_blocks[-1]["block_index"]
-        out["next_after"] = last
-        if has_more:
-            out["next"] = BASE + "blocks?after=" + str(last) + "&limit=" + str(limit)
-    return out, 200
-
-
-def _one(data, ctx):
-    idx = _int(_q(data, "index"), None, 0, 10 ** 12)
-    if idx is None:
-        return {"error": "index_required", "example": BASE + "block?index=1"}, 400
-    conn, lock = ctx["conn"], ctx["lock"]
-    with lock:
-        row = conn.execute(_select(conn) + " WHERE id = ?", (idx,)).fetchone()
-        if not row:
-            return {"error": "not_on_this_chain", "block_index": idx,
-                    "reset": RESET_NOTE}, 404
-        pos = _position_of(conn, idx)
-        prev_hash = _hash_before(conn, idx)
-        ckeys = _customer_keys(conn)
-    blk, _, _ = _block(row, pos, ckeys)
-    return {
-        "block": blk,
-        "previous_audit_hash": prev_hash,
-        "link_ok": blk["prev_hash"] == prev_hash,
-        "reset": RESET_NOTE,
-    }, 200
-
-
-def _verify(ctx):
-    w = _full_walk(ctx)
-    out = dict(w)
-    out["valid"] = bool(w["blocks"]) and w["links_ok"] and w["recompute_ok"] \
-        and bool(w["genesis_prev_is_GENESIS"])
-    out["note"] = ("This is our server checking itself. It is a convenience, "
-                   "not evidence. Walk " + BASE + "blocks?after=0 and do the "
-                   "arithmetic yourself.")
-    return out
-
-
-# ---------------------------------------------------------------- entry
-
-def handle(method, action, data, api_key, ctx):
-    try:
-        if method == "GET":
-            if action == "spec":
-                return _spec(), 200
-            if action == "status":
-                return _status(ctx), 200
-            if action == "genesis":
-                return _genesis(ctx)
-            if action == "blocks":
-                return _blocks(data, ctx)
-            if action == "block":
-                return _one(data, ctx)
-            if action == "verify":
-                return _verify(ctx), 200
-        return {
-            "error": "unknown_action",
-            "get": sorted(a for m, a in PUBLIC if m == "GET"),
-            "post": [],
-            "spec": BASE + "spec",
-        }, 404
-    except Exception as e:
-        return {"error": "walk_failed", "detail": str(e)[:300]}, 500
+        pass
+    return {"module": "studio", "version": VERSION, "armed": armed,
+            "serves": ["/create", "/v/<id>", "/v/api/*"],
+            "storage": {"folder": d, "survives_redeploys": persistent, "free_gb": free_gb},
+            "payments_ready": stripe, "packs_pence": PACKS,
+            "viewer_pays": {str(p): _charge(p) for p in PACKS}, "prices_pence": list(PRICES),
+            "max_upload_mb": MAX_BYTES // 1048576, "monthly_fee_pence": MONTHLY_FEE,
+            "creator_share": SHARE, "counts": counts,
+            "create": SITE + "/create", "wing": SITE + "/cinema?wing=ten"}, 200
 
 ```
