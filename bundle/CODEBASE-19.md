@@ -3,8 +3,8 @@
 Contains:
 - `modules/prove.py`
 - `modules/publish.py`
-- `modules/pwa.py`
 - `modules/ratchet.py`
+- `modules/reconcile.py`
 
 
 ## `modules/prove.py`
@@ -866,257 +866,6 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
-## `modules/pwa.py`
-
-243 lines, 20540 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/pwa.py  v1.0.1
-Makes sebbi.pro installable: an app on the home screen, full-screen, its own
-icon. No app store, no fees, payments unchanged. Arm after each deploy:
-    https://sebbi.pro/x/pwa/status
-Serves /manifest.webmanifest, /sw.js and the app icons at clean URLs. The
-install button and the manifest link live in the pages themselves.
-"""
-
-import base64
-import sys
-
-VERSION = "1.0.1"
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-MANIFEST = '{"name":"sebbi.pro \\u2014 10p Wing","short_name":"10p Wing","description":"Watch free, then 10p for the rest. 7p goes to the creator.","start_url":"/cinema?src=pwa","scope":"/","display":"standalone","background_color":"#0a0f1e","theme_color":"#0a0f1e","orientation":"portrait-primary","categories":["entertainment","video"],"icons":[{"src":"/app-icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"/app-icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},{"src":"/app-icon-maskable.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]}'
-SW = "const C='sebbi-shell-v1';\nself.addEventListener('install',function(e){self.skipWaiting()});\nself.addEventListener('activate',function(e){e.waitUntil(self.clients.claim())});\nself.addEventListener('fetch',function(e){\n  if(e.request.method!=='GET')return;\n  e.respondWith(fetch(e.request).catch(function(){return caches.match(e.request)}));\n});\n"
-_I192 = (
-    "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"
-)
-_I512 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIABAMAAAAGVsnJAAAAMFBMVEXJqEzJqEvIqEvGpUu3mUenjUOYgUCCbzpmWTRWTDBCPCsoJyQRFR8LDx"
-    "0KDx4KDx0uKk37AAAPY0lEQVR42u3dS3Bb1RkH8P+9kmxKIVh0QrvpVISSdLqpqIF4posKQpOUbkwoEEoXZgLBQJmGJATbCTNMIbFDYiYzpY0D"
-    "SepFM43Lo+rOEEK16Ext54G6KyEx6kxn2gKJxdB2sC1ddSE/JFl+3PP4zrnX31lA4vhK9/z0fec75z50nStY3s0FAzAAAzAAAzAAAzAAAzAAAz"
-    "AAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAA"
-    "AzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzAAAzCApS1q6o3Pjo2N5ceufPrnO26MO/F4fJ2h/X"
-    "BMPGrLO3f+7Js1P7ttXfNNiWUBcO1b50Yy9aNxS/PN3wk7wLVHBzILZeQzd90SZoDL7y7YfRMElACXX38ns4RfoyWgA1hi96kJyABGejI+fjva"
-    "vSVcAN7Akz63ePCZRIgALg70+t5m7a47QgMwvD8jsBVNGhAAeEd2C265eZf+NNC/GPL6RPuPk1254AMUu/eIbzz4RDboAMWeXpnNhzqzwQaQ7D"
-    "8wrFtA7yBY2NUv/RoNJ1OBjYBPt8r3HxMP/CmoAMV9aRUvM/lgNpgAXk+/mhea6MwFEaB0slfVSw3vzgdwEPzLjxS+2EO/DFwEfPCkylf73ctB"
-    "A/hEbd56PX8IVgoUtqYVv2Ls7WSAIkBRAawqho/nAgQwckjDoNIbHIDJ3Tpe9WQ6KABet5apW1FLEugAGD6kJVgx3hsMgKt3Q1PTkQTqAbx2bW"
-    "sXHUmgHmCwH9ra+HP2A1x9UOfqffCPtgN4HToX7yi25ywHuHAIWtv4cbsBvJeguR3JWQ0wnNYNMNlrM0DxALS3gazFAMMZ/QCFXnsBCntA0AYz"
-    "1gK8naUAKB60FWDiOZC0obSlAH05GgDvCTsBJp4HUfui30qAkyBru20EKPTTAUykLQSgKQFTheCofQDFYyBsI1nrACgmgTqmg6oAigdB2t7JWg"
-    "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"
-    "xAAAAAAElFTkSuQmCC"
-)
-_IMASK = (
-    "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"
-    "SUVORK5CYII="
-)
-
-
-def _d(b):
-    return base64.b64decode("".join(b.split()))
-
-
-_FILES = {
-    "/manifest.webmanifest": (MANIFEST.encode("utf-8"), "application/manifest+json; charset=utf-8"),
-    "/sw.js": (SW.encode("utf-8"), "text/javascript; charset=utf-8"),
-    "/app-icon-192.png": (_d(_I192), "image/png"),
-    "/app-icon-512.png": (_d(_I512), "image/png"),
-    "/app-icon-maskable.png": (_d(_IMASK), "image/png"),
-}
-_patched = False
-
-
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
-
-
-def _install_page(ctx):
-    global _patched
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_pwa_patched", False):
-        _patched = True
-        return True
-    original_do_GET = cls.do_GET
-
-    def do_GET(self):
-        path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
-        hit = _FILES.get(path)
-        if hit:
-            body, ctype = hit
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Service-Worker-Allowed", "/")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return original_do_GET(self)
-
-    cls.do_GET = do_GET
-    cls._pwa_patched = True
-    _patched = True
-    return True
-
-
-def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    return ({"module": "pwa", "version": VERSION, "armed": armed,
-             "serves": sorted(_FILES.keys())}, 200)
-
-```
-
-
 ## `modules/ratchet.py`
 
 615 lines, 25928 bytes
@@ -1736,5 +1485,453 @@ def _spec():
             "GET /x/ratchet/status": "counts and current round",
         },
     }
+
+```
+
+
+## `modules/reconcile.py`
+
+440 lines, 20123 bytes
+
+```python
+"""
+Reconciliation notary - /x/reconcile/<action>
+
+THE PROBLEM THIS ATTACKS
+------------------------
+A sealed chain proves records were not altered after the fact. It does not
+prove they were true when written. An operator who seals fiction on time has
+a tamper-evident chain of fiction. Every honest person in this market knows
+that, and almost nobody says it.
+
+You cannot prove truth from outside a system. What you CAN do is what real
+auditors do: substantive testing. Take the sealed claim, go to the operator's
+own live system, and check whether the two agree - then seal the result of
+that check, including the failures.
+
+WHY THIS ONE IS DIFFERENT
+-------------------------
+The sample is fixed before the operator sees it.
+
+/plan derives a selection seed from the current chain tip - a value the
+operator cannot predict in advance and cannot change afterwards without
+breaking the chain - picks the records to be tested, and seals that selection
+BEFORE any data is requested. Only then are the record identifiers returned.
+
+So the operator cannot choose which records get examined, cannot prepare only
+the flattering ones, and cannot quietly drop a test that came back badly:
+every planned run is sealed at the moment it is planned, and a plan with no
+submitted result is visible forever as an abandoned test.
+
+Mismatches are sealed with the same permanence as matches. That is the whole
+design. A reconciliation system that can bury its own failures is decoration.
+
+WHAT A PASS ACTUALLY MEANS
+--------------------------
+That two systems the operator controls agree with each other, on records the
+operator could not choose, at a time the operator could not pick.
+
+That is not proof of truth. An operator who fabricates consistently across
+every system, in real time, without knowing what will be sampled, will pass.
+What it does is raise the cost of lying from "edit one database" to
+"maintain a coherent parallel reality across independent systems indefinitely,
+under unpredictable sampling, with every failure sealed permanently."
+
+That is the honest claim. It is also, as far as I know, more than anyone else
+in this market is doing.
+
+HONEST LIMITS
+-------------
+- Consistency is not truth. Two agreeing systems can both be wrong.
+- The operator supplies the comparison data. This tests their systems against
+  each other, not against the world.
+- Sampling only covers what has been sealed. It cannot find a decision that
+  was never recorded at all - gapless receipts are what cover that.
+- A high match rate on a badly chosen field proves nothing. Reconcile the
+  fields that would hurt to get wrong.
+
+    POST /x/reconcile/plan     sample_size, field  - seals the selection first
+    POST /x/reconcile/submit   run_id, results     - seals the comparison
+    GET  /x/reconcile/run?id=RUN-XXXXXXXX
+    GET  /x/reconcile/score
+    GET  /x/reconcile/list
+"""
+
+import hashlib, json, time
+from datetime import datetime, timezone
+
+VERSION = "1.1"
+MAX_SAMPLE = 200
+
+# Planning and submitting stay keyed - they touch an operator's own records.
+# What is public is the part that decides whether any of it means anything:
+# that the sample was fixed before the data was asked for, and that failures
+# were sealed as permanently as passes.
+PUBLIC = {("GET", "public"), ("GET", "proof")}
+
+_ready = False
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS reconcile_runs(run_id TEXT PRIMARY KEY,api_key TEXT,field TEXT,seed TEXT,planned REAL,submitted REAL,sample_size INTEGER,matched INTEGER,mismatched INTEGER,missing INTEGER,status TEXT DEFAULT 'planned',block_ids TEXT,detail TEXT)")
+        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_rec_key ON reconcile_runs(api_key)")
+        ctx["conn"].commit()
+    _ready = True
+
+
+def _iso(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _seal_event(ctx, api_key, rid, action, detail):
+    ts = time.time()
+    ev = {"user_id": "rec:" + rid, "action": "reconcile_" + action, "amount": 0,
+          "country": "UK", "device_id": "reconcile", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "RECONCILE_SEALED", "score": 0, "reconcile_action": action,
+           "reconcile_version": VERSION, "timestamp": ts, "detail": detail}
+    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
+    return h, idx, seq, ts
+
+
+def _plan(ctx, api_key, data):
+    try:
+        n = int(data.get("sample_size", 25))
+    except Exception:
+        return {"error": "invalid_sample_size"}, 400
+    if n < 1 or n > MAX_SAMPLE:
+        return {"error": "sample_size_out_of_range", "max": MAX_SAMPLE}, 400
+    field = str(data.get("field", "decision")).strip()[:60] or "decision"
+
+    with ctx["lock"]:
+        tiprow = ctx["conn"].execute("SELECT audit_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        rows = ctx["conn"].execute("SELECT id,user_id,result_json,ts FROM audit_log WHERE api_key=? ORDER BY id ASC", (api_key,)).fetchall()
+
+    if not rows:
+        return {"error": "nothing_to_reconcile",
+                "message": "No sealed records under this key yet."}, 400
+
+    tip = tiprow[0] if tiprow else "GENESIS"
+    ts = time.time()
+    # Seed is bound to the chain tip. The operator cannot know it before the
+    # records exist, and cannot alter it afterwards without breaking the chain.
+    seed = _sha(tip + ":" + str(int(ts)) + ":" + field + ":" + str(n))
+
+    # Deterministic selection from the seed - reproducible by anyone holding it.
+    scored = sorted(rows, key=lambda r: _sha(seed + ":" + str(r[0])))
+    picked = scored[:min(n, len(scored))]
+
+    rid = "RUN-" + seed[:8].upper()
+    block_ids = [p[0] for p in picked]
+
+    sample = []
+    for bid, uid, res_json, bts in picked:
+        try:
+            r = json.loads(res_json)
+            sealed_val = r.get(field)
+        except Exception:
+            sealed_val = None
+        sample.append({"block_index": bid, "record_id": uid,
+                       "sealed_at": _iso(bts),
+                       "sealed_value_sha256": _sha(str(sealed_val))})
+
+    detail = ("field=" + field + ";sample_size=" + str(len(picked)) +
+              ";seed=" + seed + ";from_tip=" + tip +
+              ";blocks=" + ",".join(str(b) for b in block_ids[:60]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "planned", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT OR REPLACE INTO reconcile_runs(run_id,api_key,field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,block_ids,detail) VALUES(?,?,?,?,?,NULL,?,NULL,NULL,NULL,'planned',?,NULL)",
+                            (rid, api_key, field, seed, ts, len(picked), json.dumps(block_ids)))
+        ctx["conn"].commit()
+
+    return {"run_id": rid, "field": field, "sample_size": len(picked),
+            "seed": seed, "derived_from_tip": tip, "planned_at": _iso(ts),
+            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
+            "sample": sample,
+            "next": "Fetch these record_ids from your own live system and POST them to /x/reconcile/submit",
+            "note": "This selection is now sealed. It cannot be changed, and an unsubmitted plan stays visible as an abandoned test."}, 200
+
+
+def _submit(ctx, api_key, data):
+    rid = str(data.get("run_id", "")).strip().upper()
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT field,seed,status,block_ids FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid, api_key)).fetchone()
+    if not row:
+        return {"error": "unknown_run_id"}, 404
+    if row[2] != "planned":
+        return {"error": "already_submitted",
+                "message": "A run is reconciled once. Re-running until it passes is not reconciliation."}, 400
+
+    results = data.get("results")
+    if not isinstance(results, dict) or not results:
+        return {"error": "results_required",
+                "message": "Send {block_index: live_value} from your own system."}, 400
+
+    field = row[0]
+    block_ids = json.loads(row[3])
+
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT id,user_id,result_json FROM audit_log WHERE id IN (" + ",".join("?" * len(block_ids)) + ")", block_ids).fetchall()
+
+    sealed = {}
+    for bid, uid, res_json in rows:
+        try:
+            sealed[bid] = json.loads(res_json).get(field)
+        except Exception:
+            sealed[bid] = None
+
+    matched, mismatched, missing = [], [], []
+    for bid in block_ids:
+        key = str(bid)
+        if key not in results:
+            missing.append({"block_index": bid})
+            continue
+        live = results[key]
+        want = sealed.get(bid)
+        if str(live).strip().lower() == str(want).strip().lower():
+            matched.append(bid)
+        else:
+            mismatched.append({"block_index": bid,
+                               "sealed_value": want,
+                               "live_value": live})
+
+    ts = time.time()
+    rate = round(100 * len(matched) / len(block_ids), 2) if block_ids else 0
+    detail = ("field=" + field + ";matched=" + str(len(matched)) +
+              ";mismatched=" + str(len(mismatched)) + ";missing=" + str(len(missing)) +
+              ";match_rate=" + str(rate) +
+              ";mismatch_blocks=" + ",".join(str(m["block_index"]) for m in mismatched[:40]))
+    h, idx, seq, _x = _seal_event(ctx, api_key, rid, "reconciled", detail)
+
+    with ctx["lock"]:
+        ctx["conn"].execute("UPDATE reconcile_runs SET submitted=?,matched=?,mismatched=?,missing=?,status='reconciled',detail=? WHERE run_id=? AND api_key=?",
+                            (ts, len(matched), len(mismatched), len(missing), json.dumps({"mismatched": mismatched[:100], "missing": missing[:100]}), rid, api_key))
+        ctx["conn"].commit()
+
+    out = {"run_id": rid, "field": field, "sample_size": len(block_ids),
+           "matched": len(matched), "mismatched": len(mismatched),
+           "missing": len(missing), "match_rate_pct": rate,
+           "reconciled_at": _iso(ts), "audit_hash": h, "block_index": idx,
+           "receipt_seq": seq,
+           "note": "This result is sealed whichever way it went. It cannot be withdrawn."}
+    if mismatched:
+        out["mismatches"] = mismatched[:20]
+        out["flag"] = "sealed records and live system disagree on " + str(len(mismatched)) + " of " + str(len(block_ids))
+    if missing:
+        out["missing_detail"] = "records the live system did not return - a gap, not a match"
+    return out, 200
+
+
+def _run(ctx, api_key, rid):
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status,detail FROM reconcile_runs WHERE run_id=? AND api_key=?", (rid.upper(), api_key)).fetchone()
+        if not row:
+            return {"error": "unknown_run_id"}, 404
+        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("rec:" + rid.upper(),)).fetchall()
+    events = []
+    for bts, res, ah in blocks:
+        try:
+            r = json.loads(res)
+            events.append({"at": _iso(bts), "event": r.get("reconcile_action"),
+                           "detail": r.get("detail"), "sealed": ah})
+        except Exception:
+            pass
+    total = row[4] or 0
+    out = {"run_id": rid.upper(), "field": row[0], "seed": row[1],
+           "planned": _iso(row[2]), "submitted": _iso(row[3]),
+           "sample_size": total, "matched": row[5], "mismatched": row[6],
+           "missing": row[7], "status": row[8], "events": events,
+           "ordering_proof": "The plan block precedes the result block. The sample was fixed before any data was requested."}
+    if row[9]:
+        try:
+            out["detail"] = json.loads(row[9])
+        except Exception:
+            pass
+    if row[8] == "planned":
+        out["flag"] = "planned but never submitted - an abandoned test, visible permanently"
+    return out, 200
+
+
+def _score(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT sample_size,matched,mismatched,missing,status,planned FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 500", (api_key,)).fetchall()
+    if not rows:
+        return {"runs": 0, "note": "No reconciliation runs on record."}, 200
+    done = [r for r in rows if r[4] == "reconciled"]
+    abandoned = len(rows) - len(done)
+    tested = sum(r[0] or 0 for r in done)
+    ok = sum(r[1] or 0 for r in done)
+    bad = sum(r[2] or 0 for r in done)
+    gone = sum(r[3] or 0 for r in done)
+    out = {"runs": len(rows), "reconciled": len(done), "abandoned": abandoned,
+           "records_tested": tested, "matched": ok, "mismatched": bad,
+           "missing": gone,
+           "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
+           "last_run": _iso(rows[0][5])}
+    if abandoned:
+        out["flag"] = str(abandoned) + " planned run(s) never submitted"
+    return out, 200
+
+
+def _list(ctx, api_key):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute("SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,missing,status FROM reconcile_runs WHERE api_key=? ORDER BY planned DESC LIMIT 200", (api_key,)).fetchall()
+    return {"count": len(rows),
+            "runs": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
+                      "submitted": _iso(r[3]), "sample_size": r[4],
+                      "matched": r[5], "mismatched": r[6], "missing": r[7],
+                      "status": r[8]} for r in rows]}, 200
+
+
+def _public(ctx):
+    """The reconciliation record, readable without a key.
+
+    Counts only. No record identifiers, no field values, no operator
+    identity. What a stranger gets is the three numbers that cannot be
+    flattered: how many runs were reconciled, how many disagreed, and how
+    many were planned and then quietly abandoned.
+
+    Abandoned runs are the important one. A planned run is sealed at the
+    moment it is planned, so a test that came back badly and was dropped
+    cannot be deleted - it sits here forever as a plan with no result.
+    """
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT run_id,field,planned,submitted,sample_size,matched,mismatched,"
+            "missing,status FROM reconcile_runs ORDER BY planned DESC LIMIT 200").fetchall()
+
+    done = [r for r in rows if r[8] == "reconciled"]
+    abandoned = [r for r in rows if r[8] != "reconciled"]
+    tested = sum(r[4] or 0 for r in done)
+    ok = sum(r[5] or 0 for r in done)
+    bad = sum(r[6] or 0 for r in done)
+    gone = sum(r[7] or 0 for r in done)
+
+    out = {
+        "runs": len(rows),
+        "reconciled": len(done),
+        "abandoned": len(abandoned),
+        "records_tested": tested,
+        "matched": ok,
+        "mismatched": bad,
+        "missing": gone,
+        "match_rate_pct": (round(100 * ok / tested, 2) if tested else None),
+        "recent": [{"run_id": r[0], "field": r[1], "planned": _iso(r[2]),
+                    "submitted": _iso(r[3]), "sample_size": r[4],
+                    "matched": r[5], "mismatched": r[6], "missing": r[7],
+                    "status": r[8]} for r in rows[:50]],
+        "check_any_of_them": "/x/reconcile/proof?id=RUN-XXXXXXXX",
+        "what_is_being_shown": "Not that the records are true. That the sample was fixed "
+                               "before the data was requested, and that what came back was "
+                               "sealed either way.",
+        "what_a_mismatch_means": "The sealed record and the operator's own live system "
+                                 "disagreed. It is published because a reconciliation system "
+                                 "that can bury its own failures is decoration.",
+    }
+    if abandoned:
+        out["flag"] = (str(len(abandoned)) + " run(s) planned and never submitted. A sample was "
+                       "fixed, and no result was ever sealed against it.")
+    return out, 200
+
+
+def _proof(ctx, rid):
+    """The ordering, straight out of the chain, without a key.
+
+    Both events are already sealed under a public identifier, so this route
+    reveals nothing the chain does not already carry. It just makes the one
+    claim that matters legible: the plan block comes before the result block.
+    """
+    rid = (rid or "").strip().upper()
+    if not rid:
+        return {"error": "id_required"}, 400
+
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT field,seed,planned,submitted,sample_size,matched,mismatched,missing,status "
+            "FROM reconcile_runs WHERE run_id=?", (rid,)).fetchone()
+        blocks = ctx["conn"].execute(
+            "SELECT id,ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC",
+            ("rec:" + rid,)).fetchall()
+    if not row:
+        return {"error": "unknown_run_id", "list": "/x/reconcile/public"}, 404
+
+    events = []
+    plan_block = result_block = None
+    for bid, bts, res, ah in blocks:
+        try:
+            r = json.loads(res)
+        except Exception:
+            continue
+        what = r.get("reconcile_action")
+        events.append({"event": what, "at": _iso(bts), "block_index": bid,
+                       "sealed_in_chain": ah, "sealed_detail": r.get("detail")})
+        if what == "planned" and plan_block is None:
+            plan_block = bid
+        if what == "reconciled" and result_block is None:
+            result_block = bid
+
+    ordered = (plan_block is not None and result_block is not None
+               and plan_block < result_block)
+
+    out = {"run_id": rid, "field": row[0], "status": row[8],
+           "seed": row[1], "planned_at": _iso(row[2]), "submitted_at": _iso(row[3]),
+           "sample_size": row[4], "matched": row[5], "mismatched": row[6],
+           "missing": row[7],
+           "plan_block_index": plan_block, "result_block_index": result_block,
+           "selection_precedes_result": ordered,
+           "events": events,
+           "how_to_check_this_yourself": [
+               "The seed is derived from the chain tip at planning time, which the operator "
+               "cannot predict in advance or change afterwards without breaking the chain.",
+               "The plan block seals which records were selected, and its detail is above.",
+               "The result block seals what came back. Compare the two block indices.",
+               "A lower plan index than result index means the sample was fixed before any "
+               "data was requested. That is the whole claim, and it is the only one made."],
+           "what_this_does_not_prove": "That the records are true. Two systems the operator "
+                                       "controls agreeing with each other is consistency, not "
+                                       "truth."}
+    if row[8] != "reconciled":
+        out["flag"] = ("planned and never submitted. The selection is sealed and no result "
+                       "was ever put against it.")
+    elif not ordered:
+        out["flag"] = ("the plan block does not precede the result block. That should be "
+                       "impossible and it is the finding.")
+    return out, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    if method == "POST":
+        if action == "plan":
+            return _plan(ctx, api_key, data)
+        if action == "submit":
+            return _submit(ctx, api_key, data)
+    else:
+        if action == "public":
+            return _public(ctx)
+        if action == "proof":
+            return _proof(ctx, str((data or {}).get("id", "")))
+        if action == "score":
+            return _score(ctx, api_key)
+        if action == "list":
+            return _list(ctx, api_key)
+        if action == "run":
+            rid = str(data.get("id", "")).strip()
+            if not rid:
+                return {"error": "id_required"}, 400
+            return _run(ctx, api_key, rid)
+    return {"error": "unknown_action", "action": action,
+            "GET": ["public", "proof", "score", "list", "run"],
+            "POST": ["plan", "submit"]}, 404
 
 ```
