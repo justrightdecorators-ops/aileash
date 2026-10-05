@@ -56,6 +56,9 @@ PAGES = [
     "/tokensaver",
     "/scan",
     "/verify-authority.py",
+    "/dossier",
+    "/x/dossier/status",
+    "/x/dossier/spec",
 ]
 
 

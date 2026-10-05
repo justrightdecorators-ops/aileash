@@ -54,3 +54,7 @@ jobs:
       - name: Boot the site with no outside network and check every page
         run: |
           sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/boot_check.py
+
+      - name: Machine-proof report end to end (no outside network)
+        run: |
+          sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/dossier_check.py
