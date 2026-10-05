@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-164 files across 45 parts.
+162 files across 44 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -8,13 +8,12 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-02.md](CODEBASE-02.md)
 
-- `modules/_ _ i n i t _ _ . p y`
+- `modules/__init__.py`
 - `modules/agentroom.py`
 - `modules/archive.py`
 - `modules/arm.py`
 - `modules/armall.py`
 - `modules/auditbridge.py`
-- `modules/backups.py`
 
 ## [CODEBASE-03.md](CODEBASE-03.md)
 
@@ -52,18 +51,19 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-08.md](CODEBASE-08.md)
 
+- `modules/dossier.py`
 - `modules/dsr.py`
 - `modules/earnpage.py`
-- `modules/fingerprint.py`
 
 ## [CODEBASE-09.md](CODEBASE-09.md)
 
+- `modules/fingerprint.py`
 - `modules/game.py`
 - `modules/genesis.py`
-- `modules/grade.py`
 
 ## [CODEBASE-10.md](CODEBASE-10.md)
 
+- `modules/grade.py`
 - `modules/heartbeat.py`
 - `modules/held.py`
 - `modules/homelink.py`
@@ -178,15 +178,14 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/witnessed.py`
 - `ai_act_ranker.py`
-- `aigrade_insert.py`
 - `aileash_reporter.py`
 - `aileash_signed_client.py`
 - `aileash_verify.py`
 - `anchor.py`
+- `brain.py`
 
 ## [CODEBASE-30.md](CODEBASE-30.md)
 
-- `brain.py`
 - `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_agent.py`
@@ -254,33 +253,29 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-38.md](CODEBASE-38.md)
 
 - `integration-docs.html`
-- `intergration-docs html`
 - `investor-prospectus.html`
 - `legal.txt`
 - `liability.txt`
 - `llms.txt`
+- `map.html`
 
 ## [CODEBASE-39.md](CODEBASE-39.md)
 
-- `map.html`
 - `notary.html`
 - `pack.html`
-
-## [CODEBASE-40.md](CODEBASE-40.md)
-
 - `pay-check.html`
 - `railway.json`
 - `registry.html`
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-41.md](CODEBASE-41.md)
+## [CODEBASE-40.md](CODEBASE-40.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-42.md](CODEBASE-42.md)
+## [CODEBASE-41.md](CODEBASE-41.md)
 
 - `scan.html`
 - `seal.html`
@@ -288,16 +283,16 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-43.md](CODEBASE-43.md)
+## [CODEBASE-42.md](CODEBASE-42.md)
 
 - `sonicboom.html`
 
-## [CODEBASE-44.md](CODEBASE-44.md)
+## [CODEBASE-43.md](CODEBASE-43.md)
 
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-45.md](CODEBASE-45.md)
+## [CODEBASE-44.md](CODEBASE-44.md)
 
 - `whitepaper.html`
 
