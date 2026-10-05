@@ -92,7 +92,7 @@ ABOUT = {
     "wallet": ("Billing", "Metering gate: quotes, charges, ledger and device counts."),
     "meter": ("Billing", "The 50p per device per month meter."),
     # operations
-    "arm": ("Operations", "Arms every module after a deploy. Railway's healthcheck calls it, so deploys arm themselves."),
+    "arm": ("Operations", "Arms every module after a deploy, in one request."),
     "armall": ("Operations", "Arms every page module in one request."),
     "warmup": ("Operations", "Arms every page module and reports what is armed."),
     "spec": ("Operations", "Live API specification built from the running modules."),
