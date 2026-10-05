@@ -5,9 +5,13 @@
 ## Products
 
 - [AILeash](https://sebbi.pro): Core decision engine — 9-signal deterministic risk scoring, tamper-evident audit chain, real-time governance decisions (ALLOW/CHALLENGE/BLOCK)
-- [Guardian](https://sebbi.pro/guardian-app): Free grooming-pattern message checker for families — no account, no card
+- [Guardian](https://sebbi.pro/guardian-parent): Child-safety engine for platforms — grooming-pattern flagging and a sealed duty-of-care record
 - SonicBoom: One-line compliance layer for AWS, Azure, GCP, OpenAI, and Anthropic API calls
 - Sentinel: Real-time fraud and anomaly detection
+- [Sebdog](https://sebbi.pro/#onprem): The same engine on your own hardware — no phone home, still externally witnessed
+- [Token Saver](https://sebbi.pro/tokensaver): Stops paying for the same model answer twice and stops runaway agents
+- [Agent Passport](https://sebbi.pro/passport): Signed, single-use permission for one AI agent action, checkable offline
+- [Machine-proof report](https://sebbi.pro/dossier): One sealed decision, every detail — the decision, who sent it, the IP it came from, and every integrity and time proof
 
 ## Documentation
 
@@ -16,6 +20,11 @@
 - [Free Scanner](https://sebbi.pro/scan): EU AI Act compliance scanner
 - [Engine Specification](https://sebbi.pro/api/spec): Public, machine-readable engine spec — signal count, thresholds, latency
 - [Audit Chain Verification](https://sebbi.pro/api/verify-chain): Public, independently verifiable proof of audit chain integrity
+- [Route index](https://sebbi.pro/developers#routes): Every module and route on the platform, generated from the running code
+- [Machine-proof report spec](https://sebbi.pro/x/dossier/spec): How a decision report is built, as data
+- [Every proof route](https://sebbi.pro/prove.json): Machine-readable index of every public proof
+- [Self check](https://sebbi.pro/self-check): Runs every published conformance check in your browser
+- [Ordering Test](https://sebbi.pro/.well-known/ordering-test.json): The conformance discovery document
 
 ## Standards
 

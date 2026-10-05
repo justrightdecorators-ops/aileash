@@ -369,6 +369,35 @@ It checks four things, each able to fail alone: the **signature**, every recompu
 
 ---
 
+## One decision. Every detail.
+
+The **machine-proof report** turns any sealed block into the document you hand an auditor, an insurer or a court. Everything about it, in one place:
+
+| | |
+|---|---|
+| **The decision** | the event and result exactly as sealed — verdict, score, reasons, pack |
+| **Who did it** | the account that sent it, the end user it was about, their device, their history, any authority they acted under, any human who reviewed it |
+| **Where it came from** | the IP address, the full forwarded chain, user agent, origin, referer, request id — and your end user's context if you attach it |
+| **Has it changed** | block rehashed and linked both ways, whole chain re-verified from genesis to it, Merkle inclusion proof, receipt sequence checked for gaps |
+| **When** | public beacons sealed either side (a floor and a ceiling) and the Bitcoin anchor that covers it |
+
+```bash
+# the full report for a block your key sealed
+curl -s "https://sebbi.pro/x/dossier/report?block=8123" -H "Authorization: Bearer $SEBBI_API_KEY"
+
+# seal it — the report's own digest goes into the chain
+curl -s -X POST https://sebbi.pro/x/dossier/issue -H "Authorization: Bearer $SEBBI_API_KEY" -d '{"block":8123}'
+
+# anyone can check an issued report, without seeing what is in it
+curl -s "https://sebbi.pro/x/dossier/check?digest=<digest>"
+```
+
+Or open **[sebbi.pro/dossier](https://sebbi.pro/dossier)**, type a block number, and print it.
+
+Personal data never touches the chain. Request details sit in their own table and only their fingerprints are sealed, rolled into a Merkle root every five minutes — tamper-evident without being permanent.
+
+---
+
 ## Architecture
 
 Pure Python standard library. No FastAPI. No framework. No build step.
@@ -466,6 +495,14 @@ The whitepaper carries a dedicated investor section — market timing, the meter
 ---
 
 <div align="center">
+
+## Every release checks itself
+
+Every change is booted as a full copy of the platform on a throwaway database, sealed off from the internet so a test copy can never reach a real peer. Every module has to come up, every key page has to answer, the attack suites have to pass and the machine-proof report is exercised end to end — before it ships. On deploy, the platform arms every module itself before it takes traffic.
+
+The complete, generated list of every module and route is at **[sebbi.pro/developers#routes](https://sebbi.pro/developers#routes)**.
+
+---
 
 ## Check us. Don't trust us.
 

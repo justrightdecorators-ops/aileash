@@ -65,6 +65,7 @@
       <tr><td>Account data</td><td>E-mail address, hashed API key, plan status, device counts</td><td>Account operation, alerts, billing · performance of contract</td></tr>
       <tr><td>Billing data</td><td>Handled by Stripe; we hold no card numbers</td><td>Payment collection · performance of contract</td></tr>
       <tr><td>Notary seals</td><td>SHA-256 fingerprints; for identity seals marked public, the limited display fields the user chooses to include; masked payment display fields</td><td>The public notarisation service · consent (the user submits the seal)</td></tr>
+      <tr><td>Request records</td><td>For each request that seals a record: the calling IP address and forwarded chain, user agent, origin, referer, language and request id. Optionally, end-user context the customer attaches (IP, user agent, session id, actor). Held <b>off the chain</b>; only a SHA-256 fingerprint of each is sealed</td><td>Security, fraud prevention and the machine-proof decision report customers request for their own records · legitimate interest; customers' legitimate interest in complete evidence</td></tr>
       <tr><td>Contact messages</td><td>What the sender chooses to write</td><td>Responding · legitimate interest</td></tr>
     </tbody>
   </table>
@@ -86,6 +87,7 @@
 
   <h2><span class="n">5.</span>Retention — and the honest tension with an append-only chain</h2>
   <p>Account and billing data are retained for the life of the account plus the period required by tax and accounting law. Contact messages are retained only as long as needed to respond.</p>
+  <p>Request records (§2) are kept for two years, then the raw details — IP address, user agent and headers — are deleted automatically. The sealed fingerprint remains, so the chain stays intact and a report for that block states plainly that the details have expired. Because these details were never written into the chain, an erasure request can be honoured for them in full.</p>
   <p>Chain records require an honest explanation rather than a boilerplate one. The chain is append-only by design — its evidential value exists precisely because records cannot be deleted or altered. This is why the platform is architected so that chain records should contain <b>no directly identifying personal data</b>: fingerprints, pseudonymous identifiers and hashes are sealed; content and identities are not. Where a valid erasure request nonetheless touches sealed data (for example, display fields a user chose to make public on an identity seal), we honour it by erasing the stored display data while the cryptographic fingerprint — which identifies no one — remains in the chain. This preserves both the data subject's rights and the integrity of the record for everyone else.</p>
 
   <h2><span class="n">6.</span>Data subject rights</h2>

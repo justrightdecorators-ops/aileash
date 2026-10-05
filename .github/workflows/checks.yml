@@ -41,6 +41,11 @@ jobs:
           done
           exit $bad
 
+      - name: Developers page route index matches the modules (warning only)
+        continue-on-error: true
+        run: |
+          python3 .github/scripts/route_index.py --check || echo "::warning file=developers.html::Route index is out of date - run python3 .github/scripts/route_index.py"
+
       - name: Attack tests
         run: |
           failed=0

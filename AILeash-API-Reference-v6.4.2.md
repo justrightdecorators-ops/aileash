@@ -1,4 +1,6 @@
-# AILeash v6.4.2 — Complete API Reference
+# AILeash v6.5.0 — API Reference
+
+> Core endpoints below. The complete, generated list of every module and route is at https://sebbi.pro/developers#routes
 
 ## Core Decision Endpoint
 
@@ -131,6 +133,25 @@ No auth required.
 
 ---
 
+## Machine-proof Report
+
+### GET /x/dossier/report?block=N
+API key. The full report for a block your key sealed (`receipt=<audit hash>` also works): the decision as sealed, the account and end user behind it, the IP address and request it came from, the chain re-verified from genesis to that block, a Merkle inclusion proof, the receipt sequence checked for gaps, the heartbeat window and the Bitcoin anchor.
+
+### POST /x/dossier/issue
+API key. `{"block": N}`. Builds the report and seals its digest into the chain. Returns the report, `digest`, `issued_block` and a public check link.
+
+### POST /x/dossier/attach
+API key. Attach your end user's context to a block you sealed, within 15 minutes: `ip`, `user_agent`, `session_id`, `actor`, `actor_role`, `location`, `channel`, `note`. Stored off the chain; its fingerprint is sealed.
+
+### GET /x/dossier/verify?block=N
+Public. Integrity and time proofs only — no personal data.
+
+### GET /x/dossier/check?digest=D
+Public. Whether a report with this exact digest was issued, and the block its digest was sealed in.
+
+Browser: https://sebbi.pro/dossier
+
 ## Real-time Dashboards
 
 ### GET /api/pulse
@@ -251,5 +272,5 @@ No machine learning. No drift. No retraining. Weights are written in code and ca
 - **Whitepaper:** https://sebbi.pro/whitepaper
 - **Developers:** https://sebbi.pro/developers
 - **Scanner (free):** https://sebbi.pro/scan
-- **Guardian:** https://sebbi.pro/guardian-app
+- **Guardian:** https://sebbi.pro/guardian-parent
 - **Contact:** justrightdecorators@gmail.com

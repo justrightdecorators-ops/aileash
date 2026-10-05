@@ -1050,6 +1050,99 @@ const N = [
  to:["chain","sonicboom","verify-all"]
 },
 {
+ id:"dossier", c:"proof", label:"Machine-proof report", size:1.35, core:true,
+ lede:"One sealed decision, every detail: what was decided, who did it, where it came from, and every proof that it has not changed.",
+ body:[
+  "Point it at any block and it compiles one report. <b>The decision</b> exactly as sealed — event, verdict, score, reasons, pack. <b>Who did it</b> — the account that sent it, the end user it was about, their device, their history before it, any authority they acted under and any human who reviewed it. <b>Where it came from</b> — the IP address, the full forwarded chain, the user agent, origin, referer and request id.",
+  "Then the proofs, recomputed while you wait rather than quoted. The block is rehashed and linked both ways. The whole chain is re-verified from genesis to that block. A Merkle inclusion proof places it in the tree. The account's receipt sequence is checked for gaps. The public beacons sealed either side of it give a floor and a ceiling on when it was made, and the Bitcoin anchor that covers it is shown confirmed or pending.",
+  "<b>Personal data stays off the chain.</b> An append-only chain cannot forget, so an IP address written into it could never be erased. Request details live in their own table; only their fingerprints are sealed, rolled into a Merkle root every five minutes. Each report carries the inclusion proof, so the details are tamper-evident without being permanent, and they are deleted after two years while the fingerprint remains.",
+  "Issue the report and its own digest is sealed. The document handed to an auditor, an insurer or a court is then itself on the record, and anyone can confirm a digest was issued without seeing a word of what is in it."
+ ],
+ limit:"The IP recorded is the machine that called the API, usually the operator's own server; the end user's address appears only when the operator attaches it, and the report shows how soon after sealing that happened. Request details can be forged by whoever controls the calling machine — they record what arrived, not who was really behind it.",
+ routes:[["/x/dossier/spec","how the report is built"],["/x/dossier/status","capture status"]],
+ to:["chain","receipts","anchor","heartbeat","evidence-pack","oversight"]
+},
+{
+ id:"passport", c:"engine", label:"Agent Passport", size:1.25, core:true,
+ lede:"A signed, single-use permission for one AI agent action — checkable by the site being acted on, without trusting the agent.",
+ body:[
+  "An agent that wants to pay, book, send or change a record asks first. Its authority is derived from a human grant, every link checked for revocation and expiry, and it receives a passport: a short signed token naming exactly what may be done, where, and until when.",
+  "The site on the other end does not have to trust the agent, the model or the company that built it. It verifies the Ed25519 signature offline in milliseconds, asks whether the authority behind it still stands at this instant, and redeems it once against the exact parameters it was issued for. Redemption and refusal are both sealed.",
+  "The forcing comes from the receiving side, not from controlling the AI. A site publishes one small file listing the actions that need a passport, and an agent without one is simply not served. That works for every model from every vendor. Agents can request and check passports as tools over MCP."
+ ],
+ routes:[["/x/passport/spec","token format and rules"],["/x/passport/demo","the whole story in one tap"]],
+ to:["authority-cont","authority","chain"]
+},
+{
+ id:"heartbeat", c:"proof", label:"The two-sided clock", size:1.1,
+ lede:"Anchoring proves a record existed before a time. Beacons prove it was not made before one.",
+ body:[
+  "Every timestamp an operator writes is a number the operator chose. External anchors are ceilings: they prove a record existed before a later public event. Nothing on its own proved a floor — nothing stopped a record being made earlier than it claims, or a whole chain being pre-computed and released slowly to look live.",
+  "A public random beacon fixes that. drand publishes a value every thirty seconds that nobody can know before it is published. A beat sealed into the chain every few minutes means every record after it cannot have been created before that value existed, and the next beat caps it. Every decision gets a two-sided window, with no change to the decision path and no added latency."
+ ],
+ routes:[["/x/heartbeat/latest","the latest beat"]],
+ to:["anchor","chain","sortition"]
+},
+{
+ id:"sortition", c:"proof", label:"Audit by lot", size:1.0,
+ lede:"The operator stops choosing which decisions get reviewed.",
+ body:[
+  "Every oversight claim reviews a sample, and in almost every system the operator picks it — so the sample proves nothing. Here the pool of eligible records is listed, hashed and sealed first. The draw may only use a beacon value sealed after that commit, so the pool was fixed before the dice existed. The beacon then ranks the pool and the lowest ranks are selected, recomputable by anyone from public values.",
+  "A selected record with no review against it is a permanent, visible gap with a name on it. Refusals are allowed and sealed with a reason, because an honest refusal on the record is worth more than a silent skip."
+ ],
+ routes:[["/x/sortition/spec","the selection function"]],
+ to:["oversight","heartbeat","probes"]
+},
+{
+ id:"ratchet", c:"proof", label:"One-way time for agents", size:0.95,
+ lede:"An agent's actions form a rising ladder. It cannot step backwards.",
+ body:[
+  "Each action is bound to the beacon round current when it was taken, and rounds only increase. An action carrying a round at or below the actor's last recorded one is refused. That single rule stops backdating, replay, pre-computing a batch of actions in advance, and rewinding an agent from an old snapshot — the ladder sits in a chain the agent does not control.",
+  "Refusals are sealed rather than dropped, and published. An agent trying to rewind is the most interesting event this system can observe."
+ ],
+ routes:[["/x/ratchet/spec","the rule"],["/x/ratchet/refusals","every refusal"]],
+ to:["heartbeat","passport"]
+},
+{
+ id:"archive", c:"proof", label:"Self-proving archive", size:1.05,
+ lede:"One file a day that proves itself, wherever a copy ends up — counted across independent holders.",
+ body:[
+  "Once a day a single file is written holding every public block with the exact text it was sealed from, an independent witness's record of our tips, a Bitcoin proof, the previous day's fingerprint, and the checking program itself. The file's name is its fingerprint, and that fingerprint is sealed and anchored.",
+  "Any copy — ours, a peer's, a customer's, the Internet Archive's — verifies itself with nothing from sebbi.pro. Separately, the copies actually held by other parties are fetched, checked against sealed fingerprints, and the count of independent holders is itself sealed. It can be checked, and it cannot be inflated."
+ ],
+ routes:[["/x/archive/status","today's file"],["/x/custody/status","independent holders"]],
+ to:["chain","anchor","verify-all"]
+},
+{
+ id:"integrity", c:"open", label:"AI Integrity Declaration", size:1.05,
+ lede:"An open L0 to L4 rating for any AI deployment, and a checker that never takes a declaration's word.",
+ body:[
+  "A deployment publishes a declaration at a well-known address. The checker walks the declared chain, recomputes every public block, asks each declared witness for its tip and opens each anchor proof. A level is awarded only when every check it needs has passed; claiming more is reported as overclaimed. No declaration at all is L0: a diary.",
+  "The checker holds itself to the same rule it applies. The request is sealed before the check runs and the verdict after, so an inconvenient result cannot quietly go unsealed. Every verdict sits in a public register with the block that holds it."
+ ],
+ routes:[["/x/integrity/declaration","the standard"],["/x/integrity/register","every sealed verdict"]],
+ to:["register","standard","aitxt"]
+},
+{
+ id:"plugin", c:"open", label:"Proof log for legacy systems", size:0.95,
+ lede:"Send a hash of any state change, get back a receipt anyone can check with standard tools.",
+ body:[
+  "An existing system that cannot be rebuilt around a decision engine can still prove what it did. It sends the SHA-256 of a state change and gets a receipt straight away: leaf index, tree size, root and inclusion path, in the Certificate Transparency construction, so any RFC 6962 verifier can check it without trusting us.",
+  "Tree heads are sealed into the chain every minute and anchored with it. Hash only — no payloads, labels or customer data are sent or stored."
+ ],
+ routes:[["/p/","what the log is"],["/p/sth","the latest tree head"]],
+ to:["chain","completeness"]
+},
+{
+ id:"releases", c:"business", label:"Releases that check themselves", size:0.95,
+ lede:"Every change is booted, armed and tested before it ships. Every deploy arms itself before it takes traffic.",
+ body:[
+  "Each change is booted as a full copy of the platform on a throwaway database, with outside network cut off so a test copy can never contact a real peer. Every module must come up, every key page must answer, the attack suites must pass, and the machine-proof report is exercised end to end. A failure stops the line and alerts the owner.",
+  "On deploy, the platform's own healthcheck arms every module before traffic is switched over, so a release never leaves a route answering 404 while it waits for someone to wake it."
+ ],
+ to:["verify-all","limits"]
+},
+{
  id:"game", c:"open", label:"Play the game", size:0.8,
  lede:"Not part of the engine — just a bit of fun. Tap through.",
  body:[
