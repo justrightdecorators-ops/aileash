@@ -1,0 +1,52 @@
+name: Live site check
+
+# Checks the real https://sebbi.pro from the outside. Runs every morning and
+# whenever you press "Run workflow" on GitHub. If anything is down, the run
+# goes red and GitHub emails you. Reads only - it never changes anything.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the live site
+        run: |
+          fail=0
+          check() {
+            code=$(curl -s -m 30 -o /tmp/body -w "%{http_code}" "$1")
+            if [ "$code" = "$2" ]; then
+              echo "ok   $code $1"
+            else
+              echo "FAIL $code $1 (expected $2)"; head -c 600 /tmp/body; echo; fail=1
+            fi
+          }
+          check https://sebbi.pro/ 200
+          check https://sebbi.pro/api/health 200
+          check https://sebbi.pro/api/verify-chain 200
+          check https://sebbi.pro/developers 200
+          check https://sebbi.pro/whitepaper 200
+          check https://sebbi.pro/dossier 200
+          check https://sebbi.pro/x/dossier/status 200
+          check https://sebbi.pro/x/dossier/spec 200
+          check "https://sebbi.pro/x/dossier/verify?block=100" 200
+          check https://sebbi.pro/x/consistency/root 200
+          check https://sebbi.pro/x/ots/status 200
+          check https://sebbi.pro/x/heartbeat/status 200
+          check https://sebbi.pro/x/roster/list 200
+          check https://sebbi.pro/self-check 200
+          check https://sebbi.pro/passport 200
+          # a route that does not exist must answer 404 quickly - a timeout
+          # here means the server has stopped loading modules
+          check https://sebbi.pro/x/no-such-module/status 404
+          echo
+          curl -s -m 30 https://sebbi.pro/api/verify-chain | head -c 300; echo
+          curl -s -m 30 https://sebbi.pro/x/dossier/status | head -c 800; echo
+          exit $fail
