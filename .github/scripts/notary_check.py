@@ -338,6 +338,24 @@ console.log(JSON.stringify({ok:r.ok,height:r.height,bad:r2.ok,steps}))})().catch
     except FileNotFoundError:
         print("  note node not installed - browser verifier not run")
 
+    # AI connector tools
+    st, tl, _ = rpc("tools/list")
+    names = [t["name"] for t in tl["result"]["tools"]]
+    chk("AI connector lists the three notary tools", {"sebbi_notarize", "sebbi_notary_receipt", "sebbi_forever_proof"} <= set(names)
+        and len(names) == 16, names)
+    st, ini, _ = rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t2", "version": "1"}})
+    chk("connector instructions mention the notary once", ini["result"]["instructions"].count("sebbi_notarize") == 1, ini)
+    r, e = tool("sebbi_notarize", {"digests": [hashlib.sha256(b"via ai").hexdigest()], "label": "From an AI"})
+    chk("AI notarises", not e and r.get("received") == 1 and r["receipts"][0]["code"].startswith("NT-"), r)
+    r2, e = tool("sebbi_notary_receipt", {"code": r["receipts"][0]["code"]})
+    chk("AI reads the receipt", not e and r2.get("state") == "queued", r2)
+    r3, e = tool("sebbi_forever_proof", {"block": blocks[1]})
+    chk("AI gets a chain Forever Proof", not e and FV.check(r3, explorers=EXPL)["ok"], r3.get("error"))
+    r4, e = tool("sebbi_notarize", {"digests": ["bad"]})
+    chk("AI refused a bad fingerprint", e and r4.get("error") == "bad_digest", r4)
+    r5, e = tool("sebbi_overview", {})
+    chk("existing connector tools still work", not e and r5.get("products"), r5)
+
     # daily limit
     st, d, _ = http_("POST", "/x/notary/stamp", {"digests": [hashlib.sha256(str(i).encode()).hexdigest() for i in range(400)]},
                      {"X-Forwarded-For": "10.250.250.250"})

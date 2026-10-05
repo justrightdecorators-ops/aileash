@@ -706,7 +706,7 @@ def status():
             "next_batch_utc": _iso(nb) if nb else None,
             "next_batch_in_seconds": max(0, int(nb - time.time())) if nb else None,
             "batch_every_minutes": BATCH_INTERVAL // 60, "checkpoint_every_minutes": CHAIN_INTERVAL // 60,
-            "worker": _state["worker"], "last_batch": _state["last_batch"], "last_checkpoint": _state["last_chain"],
+            "worker": _state["worker"], "ai_connector_tools": bool(_state.get("mcp")), "last_batch": _state["last_batch"], "last_checkpoint": _state["last_chain"],
             "last_upgrade": _state["last_upgrade"], "price": "Free",
             "writes_to_chain": False, "last_error": _state["last_error"]}, 200
 
@@ -745,6 +745,79 @@ def _discovery():
             "proof_format": "sebbi-forever-proof/1", "hash": "sha256",
             "verifier": SITE + "/forever-verify.py", "verify_page": SITE + "/forever",
             "mcp": SITE + "/mcp", "price": "free", "spec": SITE + "/x/notary/spec"}
+
+
+# ---------------------------------------------------------------------------
+# AI assistants - three tools added to the /mcp connector at runtime.
+# modules/mcp.py itself is not edited; if this module fails to arm, the
+# connector carries on with its own tools exactly as before.
+# ---------------------------------------------------------------------------
+
+MCP_TOOLS = [
+    {"name": "sebbi_notarize",
+     "description": "Timestamp fingerprints (SHA-256, 64 hex) in Bitcoin through sebbi.pro's free notary. Hash the file or "
+                    "text yourself and send only the fingerprint. Returns a receipt code and link for each.",
+     "inputSchema": {"type": "object", "required": ["digests"],
+                     "properties": {"digests": {"type": "array", "items": {"type": "string"}},
+                                    "label": {"type": "string", "description": "Optional public label, up to 80 characters"},
+                                    "api_key": {"type": "string"}}}},
+    {"name": "sebbi_notary_receipt",
+     "description": "Where a notary receipt (NT-XXXX-XXXX) or Human Keys code (HK-XXXX-XXXX) stands: queued, sent to "
+                    "Bitcoin, or confirmed in a Bitcoin block - and the link to its Forever Proof.",
+     "inputSchema": {"type": "object", "required": ["code"], "properties": {"code": {"type": "string"}}}},
+    {"name": "sebbi_forever_proof",
+     "description": "A Forever Proof anyone can check against Bitcoin without sebbi.pro: for a notary receipt, a Human "
+                    "Keys code, or any block on the sebbi.pro chain. Give code or block.",
+     "inputSchema": {"type": "object",
+                     "properties": {"code": {"type": "string"}, "block": {"type": "integer"}, "api_key": {"type": "string"}}}},
+]
+MCP_NOTE = (" To prove a file, text or decision existed at a point in time, hash it and call sebbi_notarize (free, "
+            "timestamped in Bitcoin); sebbi_forever_proof gives a proof anyone can check against Bitcoin at "
+            "https://sebbi.pro/forever.")
+
+
+def _install_mcp():
+    if _state.get("mcp"):
+        return True
+    try:
+        try:
+            from modules import mcp as M
+        except Exception:
+            import mcp as M
+    except Exception as e:
+        _state["last_error"] = "mcp: %s" % e
+        return False
+    if getattr(M, "_notary_tools", False):
+        _state["mcp"] = True
+        return True
+    names = {t["name"] for t in M.TOOLS}
+    for t in MCP_TOOLS:
+        if t["name"] not in names:
+            M.TOOLS.append(t)
+    original = M._call
+
+    def _call(name, a, ip, agent):
+        if name not in ("sebbi_notarize", "sebbi_notary_receipt", "sebbi_forever_proof"):
+            return original(name, a, ip, agent)
+        a = a or {}
+        key = str(a.get("api_key") or "").strip() or None
+        if key and not _srv().get_key(key):
+            key = None
+        if name == "sebbi_notarize":
+            d = a.get("digests") if a.get("digests") is not None else a.get("digest")
+            return stamp(d, a.get("label"), key, ip)
+        if name == "sebbi_notary_receipt":
+            return receipt(a.get("code"))
+        if a.get("block") not in (None, ""):
+            return chain_proof(a.get("block"), key)
+        return receipt(a.get("code"), with_bundle=True)
+
+    M._call = _call
+    if isinstance(getattr(M, "INSTRUCTIONS", None), str) and MCP_NOTE not in M.INSTRUCTIONS:
+        M.INSTRUCTIONS = M.INSTRUCTIONS + MCP_NOTE
+    M._notary_tools = True
+    _state["mcp"] = True
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +1054,7 @@ NOTARY_PAGE = _HEAD + r"""<title>Bitcoin Notary — sebbi.pro</title>
 <pre>curl -X POST https://sebbi.pro/x/notary/stamp \
   -H "Content-Type: application/json" \
   -d '{"digests": ["'$(sha256sum report.pdf | cut -c1-64)'"], "label": "Q3 model card"}'</pre>
-<p class="sub" style="margin-top:12px">AI agents find everything they need in one discovery file and call it directly. Show you are anchored with a live badge:</p>
+<p class="sub" style="margin-top:12px">Or let an AI assistant do it: connect <a href="/connect">https://sebbi.pro/mcp</a> and ask it to notarise a file — agents can also read the discovery file below. Show you are anchored with a live badge:</p>
 <pre>&lt;img src="https://sebbi.pro/n/NT-XXXX-XXXX.svg" alt="Anchored in Bitcoin via sebbi.pro"&gt;</pre>
 <p class="sub" style="margin-top:12px">Machine-readable: <a href="/.well-known/sebbi-notary.json">/.well-known/sebbi-notary.json</a> · <a href="/x/notary/spec">full spec</a></p>
 </section>
@@ -1370,6 +1443,10 @@ def arm(ctx=None):
             _state["ready"] = True
         _install_pages()
         _install_inject()
+        try:
+            _install_mcp()
+        except Exception as e:
+            _state["last_error"] = "mcp: %s" % str(e)[:200]
         _start_worker()
 
 

@@ -66,7 +66,8 @@ try:
     chk("notification accepted", st == 202, st)
     st, d, _ = rpc("tools/list")
     names = [t["name"] for t in d["result"]["tools"]]
-    chk("13 tools listed", len(names) == 13, names)
+    base13 = len([n for n in names if n not in ("sebbi_notarize", "sebbi_notary_receipt", "sebbi_forever_proof")])
+    chk("13 tools listed (+3 notary tools when modules/notary.py is armed)", base13 == 13 and len(names) in (13, 16), names)
     o, e = tool("sebbi_overview")
     chk("overview lists products and price", not e and len(o["products"]) >= 8 and "50p" in o["price"], o)
     t, e = tool("sebbi_terms")
