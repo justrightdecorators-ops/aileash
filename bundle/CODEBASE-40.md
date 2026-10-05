@@ -4,7 +4,6 @@ Contains:
 - `notary.html`
 - `pack.html`
 - `pay-check.html`
-- `railway.json`
 - `registry.html`
 - `report-threat.html`
 - `requirements.txt`
@@ -1095,22 +1094,6 @@ async function checkPay(){
 </script>
 </body>
 </html>
-
-```
-
-
-## `railway.json`
-
-8 lines, 148 bytes
-
-```json
-{
-  "$schema": "https://railway.com/railway.schema.json",
-  "deploy": {
-    "healthcheckPath": "/x/arm/status",
-    "healthcheckTimeout": 120
-  }
-}
 
 ```
 

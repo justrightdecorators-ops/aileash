@@ -6,7 +6,7 @@ Contains:
 
 ## `whitepaper.html`
 
-1569 lines, 135549 bytes
+1568 lines, 135314 bytes
 
 ```html
 <!DOCTYPE html>
@@ -1146,10 +1146,9 @@ const N = [
 },
 {
  id:"releases", c:"business", label:"Releases that check themselves", size:0.95,
- lede:"Every change is booted, armed and tested before it ships. Every deploy arms itself before it takes traffic.",
+ lede:"Every change is booted, armed and tested before it ships.",
  body:[
-  "Each change is booted as a full copy of the platform on a throwaway database, with outside network cut off so a test copy can never contact a real peer. Every module must come up, every key page must answer, the attack suites must pass, and the machine-proof report is exercised end to end. A failure stops the line and alerts the owner.",
-  "On deploy, the platform's own healthcheck arms every module before traffic is switched over, so a release never leaves a route answering 404 while it waits for someone to wake it."
+  "Each change is booted as a full copy of the platform on a throwaway database, with outside network cut off so a test copy can never contact a real peer. Every module must come up, every key page must answer, the attack suites must pass, and the machine-proof report is exercised end to end. A failure stops the line and alerts the owner."
  ],
  to:["verify-all","limits"]
 },

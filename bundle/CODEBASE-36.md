@@ -7,7 +7,7 @@ Contains:
 
 ## `developers.html`
 
-810 lines, 98163 bytes
+810 lines, 97945 bytes
 
 ```html
 <!DOCTYPE html>
@@ -578,7 +578,7 @@ reconciliation</pre>
     </tbody>
   </table>
   <p>Payloads are capped at 200KB. Public routes carry per-IP limits; keyed routes are metered per key.</p>
-  <p>Deploys arm themselves: the platform brings every module up and checks it before it takes traffic, so a route never answers 404 because a release has just gone out. Every change is also booted and checked end to end before it ships.</p>
+  <p>Every change is booted and checked end to end before it ships.</p>
 
 <!-- ROUTE-INDEX:START -->
 <h2 id="routes">Route index <span class="badge b-open">generated from the code</span></h2>
@@ -663,7 +663,7 @@ reconciliation</pre>
 </tbody></table>
 <h3>Operations</h3>
 <table class="routes"><thead><tr><th>Module</th><th>What it does</th><th>Routes</th></tr></thead><tbody>
-<tr><td><code>arm</code><br><small>v1.0.0</small></td><td>Arms every module after a deploy. Railway&#x27;s healthcheck calls it, so deploys arm themselves.</td><td><a href="https://sebbi.pro/x/arm/spec">/x/arm/spec</a><br><a href="https://sebbi.pro/x/arm/status">/x/arm/status</a></td></tr>
+<tr><td><code>arm</code><br><small>v1.0.0</small></td><td>Arms every module after a deploy, in one request.</td><td><a href="https://sebbi.pro/x/arm/spec">/x/arm/spec</a><br><a href="https://sebbi.pro/x/arm/status">/x/arm/status</a></td></tr>
 <tr><td><code>armall</code><br><small>v1.0.0</small></td><td>Arms every page module in one request.</td><td><a href="https://sebbi.pro/x/armall/spec">/x/armall/spec</a><br><a href="https://sebbi.pro/x/armall/status">/x/armall/status</a></td></tr>
 <tr><td><code>selfcheck</code><br><small>v2.0</small></td><td>The conformance runner page at /self-check.</td><td><a href="https://sebbi.pro/x/selfcheck/status">/x/selfcheck/status</a></td></tr>
 <tr><td><code>spec</code><br><small>v1.0</small></td><td>Live API specification built from the running modules.</td><td><span class="kd">/x/spec/modules</span></td></tr>

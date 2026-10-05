@@ -10,7 +10,7 @@ Contains:
 
 ## `README.md`
 
-535 lines, 27038 bytes
+535 lines, 26964 bytes
 
 ```markdown
 <div align="center">
@@ -513,7 +513,7 @@ The whitepaper carries a dedicated investor section — market timing, the meter
 
 ## Every release checks itself
 
-Every change is booted as a full copy of the platform on a throwaway database, sealed off from the internet so a test copy can never reach a real peer. Every module has to come up, every key page has to answer, the attack suites have to pass and the machine-proof report is exercised end to end — before it ships. On deploy, the platform arms every module itself before it takes traffic.
+Every change is booted as a full copy of the platform on a throwaway database, sealed off from the internet so a test copy can never reach a real peer. Every module has to come up, every key page has to answer, the attack suites have to pass and the machine-proof report is exercised end to end — before it ships.
 
 The complete, generated list of every module and route is at **[sebbi.pro/developers#routes](https://sebbi.pro/developers#routes)**.
 
