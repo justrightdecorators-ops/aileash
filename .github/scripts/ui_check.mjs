@@ -13,7 +13,8 @@ const work = mkdtempSync(join(tmpdir(), "ui-"));
 const env = { ...process.env, PORT: "8855", DB_PATH: join(work, "a.db"), ANCHOR_DIR: join(work, "anc"), OTS_AUTO_UPGRADE: "0" };
 const server = spawn("python3", ["server.py"], { cwd: ROOT, env, stdio: "ignore" });
 const pass = [], fail = [];
-const chk = (n, c, d = "") => { (c ? pass : fail).push(n); console.log((c ? "  ok   " : "  FAIL ") + n + (c ? "" : "  -> " + String(d).slice(0, 300))); if (!c) console.log(`::error title=UI check failed::${n} ${String(d).slice(0, 200)}`); };
+const chk = (n, c, d = "") => { (c ? pass : fail).push(n); console.log((c ? "  ok   " : "  FAIL ") + n + (c ? "" : "  -> " + String(d).slice(0, 300))); console.log(c ? `::notice title=ok::${n}` : `::error title=UI check failed::${n} ${String(d).slice(0, 300).replace(/\n/g, " ")}`); };
+const tap = (page, sel) => page.$eval(sel, el => { el.scrollIntoView({ block: "center" }); el.click(); });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function up() { for (let i = 0; i < 60; i++) { try { const r = await fetch(BASE + "/api/health"); if (r.ok) return; } catch (e) {} await sleep(500); } throw new Error("server did not start"); }
@@ -44,11 +45,11 @@ try {
     await sleep(1500);
     const v1 = await page.$eval("#vtext", e => e.textContent);
     chk("build: engine says the pack is ready", /Ready to publish/.test(v1), v1);
-    await page.click('.tpl button[data-t="budget"]');
+    await tap(page, '.tpl button[data-t="budget"]');
     await sleep(300);
     const s2 = await page.$eval("#sentence", e => e.textContent);
     chk("build: template changes the sentence", s2 !== s1 && /budget/.test(s2), s2);
-    await page.click("#addrule");
+    await tap(page, "#addrule");
     await sleep(300);
     const n = await page.$$eval(".rule", e => e.length);
     chk("build: add a rule", n === 3, n);
@@ -61,7 +62,7 @@ try {
     await sleep(1500);
     const v3 = await page.$eval("#vtext", e => e.textContent);
     chk("build: fixed pack is ready again", /Ready to publish/.test(v3), v3);
-    await page.click("#pub");
+    await tap(page, "#pub");
     await sleep(1500);
     const pm = await page.$eval("#pmsg", e => e.textContent);
     chk("build: publishes", /Published/.test(pm), pm);
@@ -73,18 +74,18 @@ try {
     const r = await fetch(BASE + "/signup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "UI", email: "ui@example.org", org: "UI Ltd", product: "aileash", devices: 1 }) });
     const key = (await r.json()).api_key;
     const { page, errors } = await open("/connect");
-    await page.click('.tab[data-t="have"]');
+    await tap(page, '.tab[data-t="have"]');
     await page.type("#pk", key);
-    await page.click("#usekey");
+    await tap(page, "#usekey");
     const code = await page.$eval("#code", e => e.textContent);
     chk("connect: key written into the snippet", code.includes(key), code.slice(0, 120));
-    await page.click('.stack button[data-s="zapier"]');
+    await tap(page, '.stack button[data-s="zapier"]');
     const z = await page.$eval("#code", e => e.textContent);
     chk("connect: Zapier settings shown", /Webhooks|POST/.test(z) && z.includes(key), z.slice(0, 120));
-    await page.click('.stack button[data-s="lovable"]');
+    await tap(page, '.stack button[data-s="lovable"]');
     const l = await page.$eval("#code", e => e.textContent);
     chk("connect: Lovable prompt shown", /SEBBI_API_KEY/.test(l), l.slice(0, 120));
-    await page.click("#fire");
+    await tap(page, "#fire");
     await sleep(2500);
     const m = await page.$eval("#fmsg", e => e.textContent);
     const b = await page.$eval("#n3t", e => e.textContent);
