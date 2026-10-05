@@ -59,6 +59,12 @@ PAGES = [
     "/dossier",
     "/x/dossier/status",
     "/x/dossier/spec",
+    "/keys",
+    "/k/",
+    "/x/humankeys/status",
+    "/x/humankeys/spec",
+    "/x/humankeys/challenge",
+    "/x/brand/status",
 ]
 
 

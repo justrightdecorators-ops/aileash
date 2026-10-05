@@ -63,3 +63,7 @@ jobs:
       - name: Machine-proof report end to end (no outside network)
         run: |
           sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/dossier_check.py
+
+      - name: Human Keys end to end (no outside network)
+        run: |
+          sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/humankeys_check.py
