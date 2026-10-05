@@ -6,7 +6,7 @@ Contains:
 
 ## `modules/notary.py`
 
-1513 lines, 91966 bytes
+1663 lines, 101827 bytes
 
 ```python
 """
@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover - the file sits next to server.py
 VERSION = "1.0.0"
 
 PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "receipt"), ("GET", "lookup"), ("GET", "bundle"),
-          ("GET", "hk"), ("GET", "checkpoints"), ("GET", "ots"), ("POST", "stamp"), ("POST", "verify"),
+          ("GET", "hk"), ("GET", "checkpoints"), ("GET", "codebase"), ("GET", "ots"), ("POST", "stamp"), ("POST", "verify"),
           ("GET", "")}
 
 
@@ -190,6 +190,10 @@ def _setup():
                   "btc_checked TEXT, confirmed_at REAL)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_notary_batch_kind ON notary_batch(kind, chain_size)")
         c.execute("CREATE TABLE IF NOT EXISTS notary_usage(who TEXT, day TEXT, n INTEGER, PRIMARY KEY(who, day))")
+        c.execute("CREATE TABLE IF NOT EXISTS notary_code(path TEXT, digest TEXT, code TEXT, first_seen REAL,"
+                  "PRIMARY KEY(path, digest))")
+        c.execute("CREATE TABLE IF NOT EXISTS notary_snapshot(id INTEGER PRIMARY KEY AUTOINCREMENT, created REAL,"
+                  "digest TEXT UNIQUE, code TEXT, files INTEGER, manifest TEXT)")
         c.commit()
 
 
@@ -475,6 +479,112 @@ def _upgrade(bid):
     return "pending"
 
 
+# ---------------------------------------------------------------------------
+# sebbi.pro's own code: every file sealed into Bitcoin
+# ---------------------------------------------------------------------------
+
+CODE_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+CODE_INTERVAL = int(os.environ.get("NOTARY_CODE_INTERVAL", "21600"))
+CODE_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".cache", ".pytest_cache"}
+CODE_SKIP_SUFFIX = (".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3", ".pem", ".key", ".pyc", ".log", ".tmp", ".ots")
+CODE_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _code_files():
+    """Every file of the running codebase, as (relative path, sha256). Secrets and data are never read."""
+    skip_roots = set()
+    for v in (os.environ.get("DB_PATH"), os.environ.get("ANCHOR_DIR")):
+        if v:
+            d = os.path.abspath(v if os.path.isdir(v) else os.path.dirname(v))
+            if d != CODE_ROOT:
+                skip_roots.add(d)
+    out = []
+    for dirpath, dirnames, filenames in os.walk(CODE_ROOT):
+        a = os.path.abspath(dirpath)
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in CODE_SKIP_DIRS and os.path.join(a, d) not in skip_roots)
+        for fn in sorted(filenames):
+            low = fn.lower()
+            if low.startswith(".env") or low.endswith(CODE_SKIP_SUFFIX):
+                continue
+            full = os.path.join(a, fn)
+            try:
+                if os.path.islink(full) or os.path.getsize(full) > CODE_MAX_BYTES:
+                    continue
+                h = hashlib.sha256()
+                with open(full, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+            except Exception:
+                continue
+            out.append((os.path.relpath(full, CODE_ROOT).replace(os.sep, "/"), h.hexdigest()))
+    out.sort()
+    return out
+
+
+def seal_codebase():
+    """Fingerprint every file of sebbi.pro's code and send any new or changed file to the next Bitcoin batch,
+    plus one snapshot of the whole codebase in sha256sum format. Returns a summary."""
+    files = _code_files()
+    if not files:
+        return {"files": 0}
+    known = {(r[0], r[1]) for r in _db("SELECT path, digest FROM notary_code")}
+    now = time.time()
+    leaves, codes = [], []
+    for path, d in files:
+        if (path, d) in known:
+            continue
+        code = _new_code()
+        leaves.append((code, "hash", d, FV.notary_leaf(d), _clean_label("sebbi.pro code: " + path), now, "codebase"))
+        codes.append((path, d, code, now))
+    manifest = "".join("%s  %s\n" % (d, path) for path, d in files)
+    mdig = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    snap = None
+    if not _db("SELECT 1 FROM notary_snapshot WHERE digest=?", (mdig,), one=True):
+        snap = _new_code()
+        leaves.append((snap, "hash", mdig, FV.notary_leaf(mdig),
+                       _clean_label("sebbi.pro codebase snapshot: %d files" % len(files)), now, "codebase"))
+    s = _srv()
+    with s._db_lock:
+        if leaves:
+            s._conn.executemany("INSERT INTO notary_leaf(code,kind,digest,leaf,label,submitted,who) VALUES(?,?,?,?,?,?,?)", leaves)
+        if codes:
+            s._conn.executemany("INSERT OR IGNORE INTO notary_code(path,digest,code,first_seen) VALUES(?,?,?,?)", codes)
+        if snap:
+            s._conn.execute("INSERT OR IGNORE INTO notary_snapshot(created,digest,code,files,manifest) VALUES(?,?,?,?,?)",
+                            (now, mdig, snap, len(files), manifest))
+        s._conn.commit()
+    res = {"files": len(files), "new_or_changed": len(codes), "snapshot": snap or "unchanged", "utc": _iso(now)}
+    _state["last_code"] = res
+    return res
+
+
+def codebase(limit=1000):
+    snap = _db("SELECT id,created,digest,code,files FROM notary_snapshot ORDER BY id DESC LIMIT 1", one=True)
+    rows = _db("SELECT c.path, c.digest, c.code, c.first_seen, b.state, b.btc_height FROM notary_code c "
+               "JOIN notary_leaf l ON l.code=c.code LEFT JOIN notary_batch b ON b.id=l.batch_id "
+               "ORDER BY c.path, c.first_seen DESC LIMIT ?", (limit,))
+    seen, files = set(), []
+    for path, d, code, first, st, h in rows:
+        latest = path not in seen
+        seen.add(path)
+        files.append({"path": path, "digest": d, "code": code, "first_sealed_utc": _iso(first), "latest": latest,
+                      "state": {"new": "sending", "pending": "pending", "confirmed": "confirmed"}.get(st, "queued"),
+                      "bitcoin_block": h, "receipt": "%s/n/%s" % (SITE, code)})
+    out = {"what": "Every file of sebbi.pro's own code, fingerprinted and timestamped in Bitcoin. Any change is sealed "
+                   "again, so the history of every file is provable.",
+           "files_sealed": len(seen), "versions_sealed": len(files), "files": files,
+           "check_a_file": SITE + "/bitcoin (Check a file)", "last_run": _state.get("last_code")}
+    if snap:
+        r, _ = receipt(snap[3])
+        out["snapshot"] = {"code": snap[3], "created_utc": _iso(snap[1]), "files": snap[4], "digest": snap[2],
+                           "state": r.get("state"), "bitcoin_block": ((r.get("batch") or {}).get("bitcoin") or {}).get("height"),
+                           "manifest": SITE + "/bitcoin/code/manifest.txt", "receipt": "%s/n/%s" % (SITE, snap[3]),
+                           "recreate": "In a copy of the code: find . -type f ... | sort | xargs sha256sum - the manifest "
+                                       "is one line per file, '<sha256>  <path>', sorted by path."}
+    return out, 200
+
+
 def run_once(force=False):
     """One pass of the worker: batch, checkpoint, send, upgrade. Never raises."""
     out = {"batched": None, "checkpoint": None, "sent": 0, "upgraded": {}}
@@ -483,6 +593,12 @@ def run_once(force=False):
     try:
         now = time.time()
         _sweep_humankeys()
+        if force or not _state.get("_next_code") or now >= _state["_next_code"]:
+            try:
+                out["codebase"] = seal_codebase()
+            except Exception as e:
+                _state["last_error"] = "codebase: %s" % str(e)[:200]
+            _state["_next_code"] = now + CODE_INTERVAL
         if force or not _state.get("next_batch_at") or now >= _state["next_batch_at"]:
             out["batched"] = _make_batch()
             _state["next_batch_at"] = now + BATCH_INTERVAL
@@ -717,6 +833,7 @@ def status():
             "next_batch_utc": _iso(nb) if nb else None,
             "next_batch_in_seconds": max(0, int(nb - time.time())) if nb else None,
             "batch_every_minutes": BATCH_INTERVAL // 60, "checkpoint_every_minutes": CHAIN_INTERVAL // 60,
+            "code_files_sealed": cnt("SELECT COUNT(DISTINCT path) FROM notary_code"), "code_page": SITE + "/bitcoin/code",
             "worker": _state["worker"], "ai_connector_tools": bool(_state.get("mcp")), "last_batch": _state["last_batch"], "last_checkpoint": _state["last_chain"],
             "last_upgrade": _state["last_upgrade"], "price": "Free",
             "writes_to_chain": False, "last_error": _state["last_error"]}, 200
@@ -943,7 +1060,7 @@ footer{border-top:1px solid var(--line);margin-top:34px;padding:22px 0 30px;font
 _TOP = r"""<header class="top"><div class="wrap"><a class="brand" href="/">sebbi<b>.pro</b></a>
 <nav><a href="/bitcoin">Notary</a><a href="/forever">Forever Proof</a><a href="/keys">Human Keys</a><a href="/connect">Connect</a></nav></div></header>"""
 
-_FOOT = r"""<footer><div class="wrap"><a href="/bitcoin">Bitcoin Notary</a><a href="/forever">Forever Proof</a><a href="/forever-verify.py">Verifier</a><a href="/x/notary/spec">Spec</a><a href="/terms">Terms</a>
+_FOOT = r"""<footer><div class="wrap"><a href="/bitcoin">Bitcoin Notary</a><a href="/forever">Forever Proof</a><a href="/forever-verify.py">Verifier</a><a href="/bitcoin/code">Our code in Bitcoin</a><a href="/x/notary/spec">Spec</a><a href="/terms">Terms</a>
 <p style="margin-top:12px">&copy; 2026 Monop Content &middot; sebbi.pro</p></div></footer>"""
 
 # The browser verifier. It is the same algorithm as forever_verify.py, written
@@ -1230,6 +1347,32 @@ async function side(){try{const s=await (await fetch('/x/notary/status')).json()
 side();const P=new URLSearchParams(location.search);if(P.get('block')||P.get('code')){$('#q').value=P.get('block')||P.get('code');fetchProof($('#q').value)}
 </script></body></html>"""
 
+CODE_PAGE = _HEAD + r"""<title>Our code, in Bitcoin — sebbi.pro</title>
+<meta name="description" content="Every file of sebbi.pro's code is fingerprinted and timestamped in Bitcoin. Every change is sealed again.">
+</head><body>""" + _TOP + r"""
+<main class="wrap">
+<section class="hero"><div class="kick"><i></i>OUR CODE · IN BITCOIN</div>
+<h1>Every file. <em>Every change.</em> In Bitcoin.</h1>
+<p>Every file that runs sebbi.pro is fingerprinted and written into Bitcoin, and every change is sealed again. Anyone can prove which version of our code existed, and when. Drop any copy of a file on <a href="/bitcoin">the notary</a> to see the day it was first sealed.</p>
+<div class="live"><div><b id="lf">—</b><span>Files sealed</span></div><div><b id="lv">—</b><span>Versions sealed</span></div><div><b class="btc" id="lb">—</b><span>Latest snapshot block</span></div><div><b id="ls">—</b><span>Snapshot</span></div></div>
+</section>
+<section class="card"><h2>Whole-codebase snapshot</h2><p class="sub" id="sn">Loading…</p>
+<div class="row"><a class="btn g" href="/bitcoin/code/manifest.txt">Manifest (sha256sum format)</a><a class="btn g" id="sr" href="#">Snapshot receipt</a></div></section>
+<section class="card"><h2>Files</h2><p class="sub">Tap a receipt for its Bitcoin proof.</p>
+<input type="text" id="q" placeholder="Filter, e.g. modules/" autocomplete="off">
+<table><thead><tr><th>File</th><th>Bitcoin</th></tr></thead><tbody id="tb"><tr><td colspan="2">Loading…</td></tr></tbody></table></section>
+</main>""" + _FOOT + r"""
+<script>
+const $=s=>document.querySelector(s);let F=[];
+function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function draw(){const q=$('#q').value.toLowerCase();$('#tb').innerHTML=F.filter(f=>f.latest&&f.path.toLowerCase().includes(q)).map(f=>'<tr><td style="word-break:break-all">'+esc(f.path)+'<br><span style="color:var(--mut);font-size:11px">'+f.digest.slice(0,16)+'… · '+new Date(f.first_sealed_utc).toLocaleDateString('en-GB')+'</span></td><td><a href="/n/'+f.code+'">'+(f.bitcoin_block&&f.state==='confirmed'?'block '+f.bitcoin_block:f.state)+'</a></td></tr>').join('')||'<tr><td colspan="2">The first seal runs a minute after arming.</td></tr>'}
+fetch('/x/notary/codebase').then(r=>r.json()).then(j=>{F=j.files||[];$('#lf').textContent=j.files_sealed;$('#lv').textContent=j.versions_sealed;const s=j.snapshot;
+ if(s){$('#ls').textContent=s.files+' files';$('#lb').textContent=s.bitcoin_block?'#'+s.bitcoin_block.toLocaleString('en-GB'):s.state;$('#sr').href='/n/'+s.code;
+  $('#sn').textContent='One fingerprint of the whole codebase — '+s.files+' files — sealed '+new Date(s.created_utc).toLocaleString('en-GB')+'. Fingerprint '+s.digest+'.'}else $('#sn').textContent='The first snapshot is sealed a minute after arming.';draw()});
+$('#q').oninput=draw;
+</script></body></html>"""
+
+
 # shown on the homepage, above the existing feature strip
 HOME_STRIP = r"""<section class="ntx" aria-label="Bitcoin Notary">
 <style>
@@ -1294,6 +1437,11 @@ def _install_pages():
     def do_GET(self):
         p = self.path.split("?")[0].rstrip("/") or "/"
         try:
+            if p == "/bitcoin/code":
+                return _send(self, _page(CODE_PAGE), "text/html; charset=utf-8")
+            if p == "/bitcoin/code/manifest.txt":
+                r = _db("SELECT manifest FROM notary_snapshot ORDER BY id DESC LIMIT 1", one=True)
+                return _send(self, (r[0] if r else ""), "text/plain; charset=utf-8")
             if p == "/bitcoin":
                 return _send(self, _page(NOTARY_PAGE), "text/html; charset=utf-8")
             if p == "/forever":
@@ -1502,6 +1650,8 @@ def handle(method, action, data, api_key, ctx):
         return receipt(data.get("code"), with_bundle=True)
     if action == "hk":
         return hk_status(data.get("code"))
+    if action == "codebase":
+        return codebase()
     if action == "checkpoints":
         return {"checkpoints": _checkpoints()}, 200
     if action == "ots":
