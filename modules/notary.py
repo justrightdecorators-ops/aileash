@@ -1049,7 +1049,7 @@ footer{border-top:1px solid var(--line);margin-top:34px;padding:22px 0 30px;font
 _TOP = r"""<header class="top"><div class="wrap"><a class="brand" href="/">sebbi<b>.pro</b></a>
 <nav><a href="/bitcoin">Notary</a><a href="/forever">Forever Proof</a><a href="/keys">Human Keys</a><a href="/connect">Connect</a></nav></div></header>"""
 
-_FOOT = r"""<footer><div class="wrap"><a href="/bitcoin">Bitcoin Notary</a><a href="/forever">Forever Proof</a><a href="/forever-verify.py">Verifier</a><a href="/bitcoin/code">Our code in Bitcoin</a><a href="/x/notary/spec">Spec</a><a href="/terms">Terms</a>
+_FOOT = r"""<footer><div class="wrap"><a href="/bitcoin">Bitcoin Notary</a><a href="/forever">Forever Proof</a><a href="/forever-verify.py">Verifier</a><a href="/bitcoin/code">Our code in Bitcoin</a><a href="/answers">Answers</a><a href="/standard/forever-proof">Standard</a><a href="/x/notary/spec">Spec</a><a href="/terms">Terms</a>
 <p style="margin-top:12px">&copy; 2026 Monop Content &middot; sebbi.pro</p></div></footer>"""
 
 # The browser verifier. It is the same algorithm as forever_verify.py, written

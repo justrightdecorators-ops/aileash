@@ -1,4 +1,4 @@
-name: Bitcoin Notary checks
+name: Bitcoin Notary and answers checks
 
 # Runs on every push and every morning. The push job boots a throwaway copy of
 # the site with no outside network and a stand-in Bitcoin calendar, then
@@ -32,6 +32,8 @@ jobs:
       - run: python3 -m py_compile modules/notary.py forever_verify.py
       - name: Notary end to end (no outside network)
         run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/notary_check.py
+      - name: Answer pages, standard, sitemap and llms.txt (no outside network)
+        run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/answers_check.py
 
   live:
     if: github.event_name != 'push'
@@ -43,7 +45,8 @@ jobs:
           fail=0
           for u in https://sebbi.pro/bitcoin https://sebbi.pro/notary https://sebbi.pro/forever https://sebbi.pro/forever-verify.py \
                    https://sebbi.pro/x/notary/status https://sebbi.pro/x/notary/spec https://sebbi.pro/x/notary/checkpoints \
-                   https://sebbi.pro/.well-known/sebbi-notary.json; do
+                   https://sebbi.pro/.well-known/sebbi-notary.json \
+                   https://sebbi.pro/answers https://sebbi.pro/standard/forever-proof https://sebbi.pro/llms.txt https://sebbi.pro/sitemap-answers.xml; do
             code=$(curl -s -m 30 -o /dev/null -w "%{http_code}" "$u")
             if [ "$code" = "200" ]; then echo "ok   $u"; else echo "FAIL $code $u"; echo "::error title=$code $u::arm the site at https://sebbi.pro/x/arm/status"; fail=1; fi
           done

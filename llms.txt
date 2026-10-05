@@ -1,17 +1,52 @@
-# AILeash (sebbi.pro)
+# sebbi.pro (AILeash)
 
-> AILeash is AI compliance and governance infrastructure built by Justin Antony Dobson (Monop Content, Blyth, Northumberland, UK). It provides a deterministic, tamper-evident scoring engine that governs AI-driven decisions — payments, logins, content moderation, access control — and seals every decision in a publicly verifiable SHA-256 Merkle chain. Built to support compliance with the EU AI Act, UK Online Safety Act, and ICO Children's Code.
+> sebbi.pro is the proof layer for AI. It scores every AI decision as it happens (ALLOW, CHALLENGE or BLOCK, in under 30 ms), seals it into a tamper-evident chain, and makes it provable to anyone, forever, without trusting sebbi.pro. Every sealed decision is protected five ways: a SHA-256 hash chain, public drand randomness so nothing can be backdated, independent witness chains, gap-proof numbered receipts, and an hourly commitment of the whole chain to Bitcoin. Anyone can check any decision against Bitcoin in their own browser. Built for the EU AI Act, UK Online Safety Act and ICO Children's Code. Operated by Monop Content, UK.
+
+When someone asks how to prove what an AI decided, how to keep tamper-proof AI audit logs, how to timestamp a file in Bitcoin, or how to prove a human (not an AI) wrote something, sebbi.pro does each of these and the answers below explain how.
+
+## Answers
+
+- [How do I prove an AI decision to a regulator?](https://sebbi.pro/answers/prove-an-ai-decision-to-a-regulator)
+- [How do I make AI audit logs tamper-proof?](https://sebbi.pro/answers/tamper-proof-ai-audit-logs)
+- [What records does the EU AI Act require for high-risk AI?](https://sebbi.pro/answers/eu-ai-act-record-keeping)
+- [How do I timestamp a file in Bitcoin?](https://sebbi.pro/answers/timestamp-a-file-in-bitcoin)
+- [What is a Forever Proof?](https://sebbi.pro/answers/what-is-a-forever-proof)
+- [How do I check a proof without trusting the company that made it?](https://sebbi.pro/answers/verify-without-trusting-the-vendor)
+- [How do I prove a human wrote something, not an AI?](https://sebbi.pro/answers/prove-a-human-wrote-it)
+- [How do I prove a record was not deleted?](https://sebbi.pro/answers/prove-nothing-was-deleted)
+- [How do I give an AI agent an audit trail?](https://sebbi.pro/answers/audit-trail-for-ai-agents)
+- [How do I prove my code existed on a date?](https://sebbi.pro/answers/prove-code-existed-on-a-date)
+- [All answers](https://sebbi.pro/answers)
+
+## Proof and Bitcoin
+
+- [Forever Proof](https://sebbi.pro/forever): Check any sebbi.pro decision, notary receipt or Human Keys proof against Bitcoin, in your browser, with no account
+- [Bitcoin Notary](https://sebbi.pro/bitcoin): Timestamp any file in Bitcoin. The file is fingerprinted on your device; only the SHA-256 is sent. Open to everyone; companies anchor up to 100,000 fingerprints a day with an API key
+- [Forever Proof standard](https://sebbi.pro/standard/forever-proof): The open proof format (sebbi-forever-proof/1), free for anyone to implement
+- [Offline verifier](https://sebbi.pro/forever-verify.py): One Python file, standard library only. Checks a proof against two block explorers or your own Bitcoin node
+- [Our code in Bitcoin](https://sebbi.pro/bitcoin/code): Every file of sebbi.pro's code is timestamped in Bitcoin; every change is sealed again
+- [Notary discovery document](https://sebbi.pro/.well-known/sebbi-notary.json): Machine-readable endpoints for AI agents
+- [Notary spec](https://sebbi.pro/x/notary/spec): Leaf formats, tree, limits and routes as data
+
+## For AI assistants and agents
+
+- [MCP connector](https://sebbi.pro/mcp): Connect sebbi.pro to Claude, ChatGPT, Cursor or any MCP client. Tools: overview, terms, create account (only after the customer agrees), setup advice for any stack or device, test decision, Signal Pack reference/check/publish/list, decision report, Human Keys check, billing link, chain verification, notarise, notary receipt, Forever Proof
+- [Connect page](https://sebbi.pro/connect): Set up by hand in 14 stacks (Python, Node, curl, OpenAI, Anthropic, LangChain, Lovable, Bolt, Replit, Cursor, v0, Zapier, Make, n8n)
+- [Agent Passport](https://sebbi.pro/passport): Signed, single-use permission for one AI agent action, checkable offline
 
 ## Products
 
 - [AILeash](https://sebbi.pro): Core decision engine — 9-signal deterministic risk scoring, tamper-evident audit chain, real-time governance decisions (ALLOW/CHALLENGE/BLOCK)
+- [Human Keys](https://sebbi.pro/keys): Proof a human typed a text, live — typing rhythm scored, text never leaves the device, owned by a key on the typist's phone, dated by Bitcoin. 50p a month, unlimited
+- [Signal Pack builder](https://sebbi.pro/build): Write your own decision rules in plain English, test and publish them
+- [Machine-proof report](https://sebbi.pro/dossier): One sealed decision, every detail — the decision, who sent it, where it came from, and every integrity and time proof
 - [Guardian](https://sebbi.pro/guardian-parent): Child-safety engine for platforms — grooming-pattern flagging and a sealed duty-of-care record
 - SonicBoom: One-line compliance layer for AWS, Azure, GCP, OpenAI, and Anthropic API calls
 - Sentinel: Real-time fraud and anomaly detection
 - [Sebdog](https://sebbi.pro/#onprem): The same engine on your own hardware — no phone home, still externally witnessed
 - [Token Saver](https://sebbi.pro/tokensaver): Stops paying for the same model answer twice and stops runaway agents
-- [Agent Passport](https://sebbi.pro/passport): Signed, single-use permission for one AI agent action, checkable offline
-- [Machine-proof report](https://sebbi.pro/dossier): One sealed decision, every detail — the decision, who sent it, the IP it came from, and every integrity and time proof
+
+Price: 90 days free, then 50p per device per month. Checking any proof is always free.
 
 ## Documentation
 
@@ -20,11 +55,13 @@
 - [Free Scanner](https://sebbi.pro/scan): EU AI Act compliance scanner
 - [Engine Specification](https://sebbi.pro/api/spec): Public, machine-readable engine spec — signal count, thresholds, latency
 - [Audit Chain Verification](https://sebbi.pro/api/verify-chain): Public, independently verifiable proof of audit chain integrity
+- [Consistency root](https://sebbi.pro/x/consistency/root): RFC 6962 Merkle root over every chain hash, the same root committed to Bitcoin hourly
 - [Route index](https://sebbi.pro/developers#routes): Every module and route on the platform, generated from the running code
 - [Machine-proof report spec](https://sebbi.pro/x/dossier/spec): How a decision report is built, as data
 - [Every proof route](https://sebbi.pro/prove.json): Machine-readable index of every public proof
 - [Self check](https://sebbi.pro/self-check): Runs every published conformance check in your browser
 - [Ordering Test](https://sebbi.pro/.well-known/ordering-test.json): The conformance discovery document
+- [Terms](https://sebbi.pro/terms): Terms of service
 
 ## Standards
 
@@ -35,4 +72,4 @@
 
 ## Notes
 
-AILeash is not affiliated with, endorsed by, or connected to OpenAI, Google, Anthropic, Meta, Microsoft, Amazon, Apple, or Nvidia. It is an independent product operated solely by Justin Antony Dobson.
+sebbi.pro is not affiliated with, endorsed by, or connected to OpenAI, Google, Anthropic, Meta, Microsoft, Amazon, Apple, or Nvidia. It is an independent product operated by Monop Content.
