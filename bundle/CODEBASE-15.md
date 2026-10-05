@@ -1,11 +1,902 @@
-# Codebase — part 15 of 47
+# Codebase — part 15 of 48
 
 Contains:
+- `modules/mcp.py`
+- `modules/meter.py`
 - `modules/mutual.py`
 - `modules/network.py`
 - `modules/noexec.py`
-- `modules/ots.py`
-- `modules/oversight.py`
+
+
+## `modules/mcp.py`
+
+594 lines, 35400 bytes
+
+```python
+"""
+modules/mcp.py  v1.0.0  -  sebbi.pro as a connector for Claude, ChatGPT, Cursor and any AI
+
+    Connector URL:  https://sebbi.pro/mcp
+    Arm:            https://sebbi.pro/x/arm/status
+
+WHAT IT IS
+----------
+A Model Context Protocol (MCP) server. Someone adds https://sebbi.pro/mcp to
+their AI assistant once, and from then on the assistant can do everything on
+sebbi.pro for them, in conversation:
+
+  read what sebbi.pro offers and what it costs
+  open an account - after showing the customer the terms and getting a yes,
+      which is sealed into the chain as a receipt nobody can argue with
+  advise on the right setup for their stack and device, with working code
+  fire a test decision and show the sealed block
+  write, check and publish Signal Packs
+  pull a machine-proof report for any decision
+  check a Human Keys proof
+  set up billing with a Stripe link
+
+Their AI does the thinking on their account. sebbi.pro only answers the
+requests, through the same routes the website uses: /signup, /api/govern,
+/x/packs/*, /x/dossier/*, /x/humankeys/*, /create-checkout. Nothing here
+bypasses any of them, and no existing file is changed.
+
+THE AGREEMENT
+-------------
+create_account refuses unless the assistant passes the exact terms_version
+it showed the customer and confirms the customer said yes. The agreement is
+then sealed: terms version, a fingerprint of the email, the company, which
+AI arranged it, and when. The email itself is not written into the chain.
+
+TRANSPORT
+---------
+Streamable HTTP, JSON responses. POST /mcp with JSON-RPC 2.0: initialize,
+tools/list, tools/call, ping. GET /mcp returns a short description.
+"""
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+import urllib.request
+
+VERSION = "1.0.0"
+PROTOCOL = "2025-06-18"
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "terms")}
+
+_state = {"installed": False, "calls": 0, "accounts": 0, "last_error": None}
+_sessions = {}
+_lock = threading.Lock()
+
+TERMS_TEXT = """sebbi.pro (AILeash) by Monop Content - service terms for accounts opened through an AI assistant
+
+1. Free trial. Every product is free for 90 days from the day the account is opened. No card is needed to start.
+2. Price after the trial. 50p per unique device per month, billed monthly through Stripe, counted on the real devices that used the API key. There are no tiers and no minimum term.
+3. Human Keys. 50p a month for unlimited proofs for individuals; included for businesses within the per-device price.
+4. Cancelling. Stop using the key or cancel the Stripe subscription at any time. Nothing further is charged.
+5. Your records. Decisions you send are sealed into a tamper-evident chain that cannot be edited afterwards, by you or by us. Personal details should be sent as pseudonymous identifiers.
+6. Data protection. https://sebbi.pro/data-protection
+7. Full terms of service. https://sebbi.pro/terms - these points summarise them; the full terms apply.
+8. Agreement. Opening an account confirms you have read and accept these terms and the full terms of service. The agreement is sealed into the chain with the date, the version of these terms and the AI assistant that arranged it."""
+
+TERMS_VERSION = hashlib.sha256(TERMS_TEXT.encode("utf-8")).hexdigest()[:16]
+
+PRODUCTS = [
+    {"name": "AILeash", "what": "Scores every AI decision about a person (loans, payments, bans) in under 30ms - ALLOW, CHALLENGE or BLOCK - and seals it into a chain nobody can edit. Built for EU AI Act Articles 9, 12, 13 and 14.", "url": "https://sebbi.pro/#products"},
+    {"name": "Sentinel", "what": "Fraud and anomaly alerts with sealed evidence, emailed the moment something looks wrong.", "url": "https://sebbi.pro/sentinel"},
+    {"name": "Guardian", "what": "Child-safety engine for apps with young users: grooming-pattern flagging and a sealed duty-of-care record for the Online Safety Act.", "url": "https://sebbi.pro/guardian-parent"},
+    {"name": "SonicBoom", "what": "One line of code adds an audit record to every call to OpenAI, Anthropic, AWS, Azure or Google.", "url": "https://sebbi.pro/sonicboom"},
+    {"name": "Sebdog", "what": "The same engine on the customer's own hardware. No data leaves the building.", "url": "https://sebbi.pro/#onprem"},
+    {"name": "Token Saver", "what": "Cuts the AI model bill: never pays twice for the same answer and stops runaway agents.", "url": "https://sebbi.pro/tokensaver"},
+    {"name": "Signal Packs", "what": "Custom rules on top of the engine, written in plain English and published to an open library.", "url": "https://sebbi.pro/build"},
+    {"name": "Human Keys", "what": "Proof a human typed something, live - for review sign-offs and anything that must not be AI-written.", "url": "https://sebbi.pro/keys"},
+    {"name": "Machine-proof report", "what": "Everything about one decision - who, why, where from - proven unchanged, ready for an auditor.", "url": "https://sebbi.pro/dossier"},
+    {"name": "Agent Passport", "what": "Signed, single-use permission for one AI agent action, checkable offline by the site being acted on.", "url": "https://sebbi.pro/passport"},
+]
+
+GOALS = [
+    (("loan", "credit", "insur", "bank", "fintech", "payment", "refund", "approve", "decision", "hiring", "recruit", "ban"), ["AILeash", "Machine-proof report", "Human Keys"]),
+    (("fraud", "scam", "chargeback", "bot", "takeover"), ["Sentinel", "AILeash"]),
+    (("child", "kid", "teen", "school", "game", "chat app", "social"), ["Guardian"]),
+    (("cost", "bill", "token", "spend", "budget", "loop", "agent"), ["Token Saver", "Signal Packs"]),
+    (("hospital", "nhs", "council", "defence", "defense", "on-prem", "on prem", "air-gap", "sovereign"), ["Sebdog"]),
+    (("openai", "anthropic", "claude", "gpt", "aws", "azure", "gemini", "llm"), ["SonicBoom", "AILeash"]),
+    (("review", "sign-off", "sign off", "human", "oversight", "article 14"), ["Human Keys", "AILeash"]),
+    (("audit", "regulator", "evidence", "court", "insurer", "compliance"), ["Machine-proof report", "AILeash"]),
+    (("agent", "autonomous", "mcp"), ["Agent Passport", "Token Saver"]),
+]
+
+EV = {"user_id": "customer-42", "action": "refund", "amount": 120, "country": "UK",
+      "device_id": "web-7f3a", "anomaly": 0.1, "device_risk": 0.05}
+
+
+def _snippet(stack, key):
+    k = key or "YOUR_API_KEY"
+    ev = json.dumps(EV)
+    s = (stack or "").lower()
+    if any(w in s for w in ("lovable", "bolt", "replit", "cursor", "v0", "webflow", "framer", "no code app", "website", "site")):
+        return "prompt", ("Before any important action in this app happens (a payment, refund, account change, approval or anything an AI decides), "
+                          "send it to sebbi.pro to be scored and sealed.\n1. Store this secret as SEBBI_API_KEY: %s\n"
+                          "2. Create a server-side function that POSTs JSON to https://sebbi.pro/api/govern with the header "
+                          "\"Authorization: Bearer <SEBBI_API_KEY>\" and the fields user_id, action, amount, country (2-letter), "
+                          "device_id, anomaly (0-1, 0 if unknown), device_risk (0-1, 0 if unknown).\n"
+                          "3. ALLOW: carry on. CHALLENGE: ask the user to confirm or send it to a person. BLOCK: stop and show \"This action needs review\".\n"
+                          "4. Save audit_hash and block_index from the reply next to the record.\n"
+                          "5. Never put the key in browser code." % k)
+    if any(w in s for w in ("zapier", "make.com", "make ", "n8n", "no-code", "nocode", "automation")):
+        return "settings", ("Method: POST\nURL: https://sebbi.pro/api/govern\nHeaders: Authorization = Bearer %s ; Content-Type = application/json\n"
+                            "Body (JSON): %s\nThen add a filter/condition: continue only when decision equals ALLOW." % (k, ev))
+    if any(w in s for w in ("node", "javascript", "typescript", "js", "next", "deno", "bun", "edge")):
+        return "node", ("const res = await fetch(\"https://sebbi.pro/api/govern\", {\n  method: \"POST\",\n"
+                        "  headers: { Authorization: \"Bearer %s\", \"Content-Type\": \"application/json\" },\n"
+                        "  body: JSON.stringify(%s)\n});\nconst verdict = await res.json(); // ALLOW | CHALLENGE | BLOCK\n"
+                        "if (verdict.decision === \"BLOCK\") throw new Error(\"blocked for review\");" % (k, ev))
+    if any(w in s for w in ("curl", "shell", "bash", "any language", "other")):
+        return "curl", ("curl -s https://sebbi.pro/api/govern -H \"Authorization: Bearer %s\" "
+                        "-H \"Content-Type: application/json\" -d '%s'" % (k, ev))
+    return "python", ("import json, urllib.request\n\ndef sebbi(event):\n    req = urllib.request.Request(\"https://sebbi.pro/api/govern\",\n"
+                      "        data=json.dumps(event).encode(),\n        headers={\"Authorization\": \"Bearer %s\", \"Content-Type\": \"application/json\"})\n"
+                      "    return json.load(urllib.request.urlopen(req, timeout=5))\n\nverdict = sebbi(%s)\n"
+                      "if verdict[\"decision\"] == \"BLOCK\":\n    raise PermissionError(\"blocked for review\")" % (k, ev))
+
+
+# ---------------------------------------------------------------------
+# calling the site's own routes
+# ---------------------------------------------------------------------
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if not hasattr(m, "Handler"):
+        m = sys.modules.get("server")
+    return m
+
+
+def _local(method, path, body=None, key=None, ip=None):
+    port = getattr(_srv(), "PORT", None) or int(os.environ.get("PORT", 8080))
+    headers = {"Content-Type": "application/json", "User-Agent": "sebbi-mcp/" + VERSION}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    if ip:
+        headers["X-Forwarded-For"] = ip
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except Exception:
+            return e.code, {"error": "http_%d" % e.code}
+    except Exception as e:
+        return 502, {"error": "unreachable", "detail": str(e)[:160]}
+
+
+def _setup():
+    s = _srv()
+    with s._db_lock:
+        s._conn.execute("CREATE TABLE IF NOT EXISTS mcp_agreement(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        "email_fp TEXT, company TEXT, terms_version TEXT, agent TEXT, agreed_at REAL,"
+                        "block_index INTEGER, audit_hash TEXT, key_fp TEXT)")
+        s._conn.commit()
+
+
+# ---------------------------------------------------------------------
+# tools
+# ---------------------------------------------------------------------
+
+def _str(v, n=200):
+    return str(v or "").strip()[:n]
+
+
+TOOLS = [
+    {"name": "sebbi_overview",
+     "description": "What sebbi.pro offers: every product, what it does, its page, and the price. Start here.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "sebbi_terms",
+     "description": "The service terms and their version. Show these to the customer in full and get a clear yes before calling sebbi_create_account.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "sebbi_create_account",
+     "description": "Open a sebbi.pro account for the customer and return their API key. Only call after showing sebbi_terms and the customer saying yes. Seals the agreement into the chain.",
+     "inputSchema": {"type": "object", "required": ["email", "terms_version", "customer_agreed"],
+                     "properties": {"name": {"type": "string"}, "email": {"type": "string"},
+                                    "company": {"type": "string"},
+                                    "product": {"type": "string", "enum": ["aileash", "sentinel", "sonicboom", "guardian", "tokensaver"]},
+                                    "devices": {"type": "integer", "description": "Estimated devices; billing uses the real count"},
+                                    "terms_version": {"type": "string", "description": "terms_version from sebbi_terms"},
+                                    "customer_agreed": {"type": "boolean", "description": "true only if the customer read the terms and said yes"}}}},
+    {"name": "sebbi_setup_advice",
+     "description": "Recommend the right sebbi.pro products and give step-by-step setup with working code or a ready prompt, for how the customer builds (Python, Node, Lovable, Zapier, a website builder...) and what they want to achieve.",
+     "inputSchema": {"type": "object", "required": ["stack"],
+                     "properties": {"stack": {"type": "string", "description": "How they build or what they use, e.g. 'Lovable website', 'Python on AWS', 'Zapier'"},
+                                    "goal": {"type": "string", "description": "What they want, e.g. 'prove our loan AI is compliant', 'cut our OpenAI bill'"},
+                                    "device": {"type": "string", "description": "Where they are working from, e.g. 'Android phone', 'Mac'"},
+                                    "api_key": {"type": "string"}}}},
+    {"name": "sebbi_test_decision",
+     "description": "Send one real decision through the live engine with the customer's key and show the verdict and the sealed block.",
+     "inputSchema": {"type": "object", "required": ["api_key"],
+                     "properties": {"api_key": {"type": "string"}, "action": {"type": "string"}, "amount": {"type": "number"},
+                                    "country": {"type": "string"}, "user_id": {"type": "string"}}}},
+    {"name": "sebbi_pack_reference",
+     "description": "How Signal Packs are written: the signals, measurements, flags, operators and verdicts. Read before writing a pack.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "sebbi_check_pack",
+     "description": "Check a Signal Pack with the engine's own validator without publishing it.",
+     "inputSchema": {"type": "object", "required": ["pack"], "properties": {"pack": {"type": "object"}}}},
+    {"name": "sebbi_publish_pack",
+     "description": "Publish a Signal Pack to the open library. It is sealed into the chain, dated and credited to its author. Free.",
+     "inputSchema": {"type": "object", "required": ["pack"], "properties": {"pack": {"type": "object"}}}},
+    {"name": "sebbi_list_packs",
+     "description": "Browse the published Signal Pack library.",
+     "inputSchema": {"type": "object", "properties": {"vertical": {"type": "string"}}}},
+    {"name": "sebbi_decision_report",
+     "description": "The machine-proof report for one decision the customer's key sealed: the decision, who sent it, where it came from, and proof it has not changed.",
+     "inputSchema": {"type": "object", "required": ["api_key", "block"],
+                     "properties": {"api_key": {"type": "string"}, "block": {"type": "integer"}}}},
+    {"name": "sebbi_check_human_proof",
+     "description": "Look up a Human Keys code (HK-XXXX-XXXX): whether a human typed the text, live, and when.",
+     "inputSchema": {"type": "object", "required": ["code"], "properties": {"code": {"type": "string"}}}},
+    {"name": "sebbi_billing_link",
+     "description": "A secure Stripe link for the customer to add their card and set up the 50p per device subscription.",
+     "inputSchema": {"type": "object", "required": ["email"],
+                     "properties": {"email": {"type": "string"}, "devices": {"type": "integer"},
+                                    "product": {"type": "string"}}}},
+    {"name": "sebbi_verify_chain",
+     "description": "Re-verify sebbi.pro's whole chain and return its height and tip. Anyone can run this.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+INSTRUCTIONS = ("You are connected to sebbi.pro, which scores and seals AI decisions so they can be proven later. "
+                "To help someone get set up: call sebbi_overview, ask how they build and what they want, then call "
+                "sebbi_setup_advice. Before opening an account, show the full text from sebbi_terms and get a clear yes; "
+                "only then call sebbi_create_account with that terms_version. Give the customer their API key and tell "
+                "them to keep it secret. Offer sebbi_test_decision so they see their first sealed decision, and "
+                "sebbi_billing_link when they want to add a card. Pages you can point them to: https://sebbi.pro/connect, "
+                "https://sebbi.pro/build, https://sebbi.pro/keys, https://sebbi.pro/dossier.")
+
+
+def _call(name, a, ip, agent):
+    a = a or {}
+    if name == "sebbi_overview":
+        return {"products": PRODUCTS,
+                "price": "Free for 90 days, then 50p per device per month. No tiers, no sales calls.",
+                "start": "Call sebbi_setup_advice with how the customer builds, then sebbi_terms and sebbi_create_account.",
+                "pages": {"connect": "https://sebbi.pro/connect", "build_rules": "https://sebbi.pro/build",
+                          "human_keys": "https://sebbi.pro/keys", "report": "https://sebbi.pro/dossier",
+                          "developers": "https://sebbi.pro/developers"}}, 200
+    if name == "sebbi_terms":
+        return {"terms_version": TERMS_VERSION, "terms": TERMS_TEXT,
+                "how_to_agree": "Show the customer these terms in full. If they say yes, call sebbi_create_account "
+                                "with terms_version '%s' and customer_agreed true." % TERMS_VERSION}, 200
+    if name == "sebbi_create_account":
+        if a.get("customer_agreed") is not True:
+            return {"error": "agreement_needed", "message": "Show the customer sebbi_terms and get a clear yes first."}, 400
+        if _str(a.get("terms_version")) != TERMS_VERSION:
+            return {"error": "terms_changed", "message": "Those are not the current terms. Call sebbi_terms again and show the customer the current version.",
+                    "current_version": TERMS_VERSION}, 409
+        email = _str(a.get("email"), 190).lower()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$", email):
+            return {"error": "invalid_email"}, 400
+        product = _str(a.get("product"), 20).lower() or "aileash"
+        try:
+            devices = max(1, min(1000000, int(a.get("devices") or 1)))
+        except (TypeError, ValueError):
+            devices = 1
+        st, d = _local("POST", "/signup", {"name": _str(a.get("name"), 120), "email": email,
+                                           "org": _str(a.get("company"), 160), "product": product,
+                                           "devices": devices}, ip=ip)
+        if st != 200 or not d.get("api_key"):
+            err = str(d.get("error") or "")
+            if "exists" in err.lower():
+                return {"error": "email_exists",
+                        "message": "An account already exists for this email. The key is in the welcome email sent when it was opened."}, 409
+            return {"error": "signup_failed", "message": err or "The account could not be opened."}, st if st >= 400 else 400
+        key = d["api_key"]
+        s = _srv()
+        ts = time.time()
+        email_fp = hashlib.sha256(email.encode()).hexdigest()
+        key_fp = hashlib.sha256(key.encode()).hexdigest()[:16]
+        receipt = {}
+        try:
+            out = s.seal({"user_id": "agreement", "action": "terms_agreed", "amount": 0, "country": "UK",
+                          "device_id": "mcp", "anomaly": 0, "device_risk": 0},
+                         {"decision": "AGREED", "score": 0, "version": VERSION, "timestamp": ts,
+                          "terms_version": TERMS_VERSION, "email_fingerprint": email_fp,
+                          "company": _str(a.get("company"), 160), "product": product,
+                          "arranged_by": agent or "an AI assistant", "key_fingerprint": key_fp,
+                          "note": "The customer was shown the terms by their AI assistant and agreed."}, ts)
+            receipt = {"block_index": out[1], "audit_hash": out[0],
+                       "check": "https://sebbi.pro/x/walk/block?index=%s" % out[1]}
+            with s._db_lock:
+                s._conn.execute("INSERT INTO mcp_agreement(email_fp,company,terms_version,agent,agreed_at,block_index,audit_hash,key_fp) "
+                                "VALUES(?,?,?,?,?,?,?,?)", (email_fp, _str(a.get("company"), 160), TERMS_VERSION,
+                                                            agent, ts, out[1], out[0], key_fp))
+                s._conn.commit()
+        except Exception as e:
+            _state["last_error"] = "agreement seal: %s" % e
+        _state["accounts"] += 1
+        return {"api_key": key, "product": product, "trial_days": d.get("trial_days", 90),
+                "referral_code": d.get("ref_code"),
+                "agreement": dict(receipt, terms_version=TERMS_VERSION),
+                "tell_the_customer": "Your key is ready and also on its way to your inbox with the install guide. Keep it secret. "
+                                     "Everything is free for 90 days, then 50p per device per month.",
+                "next": "Call sebbi_setup_advice with this api_key for working code, then sebbi_test_decision."}, 200
+    if name == "sebbi_setup_advice":
+        text = " ".join(_str(a.get(k), 300).lower() for k in ("stack", "goal", "device"))
+        picks = []
+        for words, prods in GOALS:
+            if any(w in text for w in words):
+                for p in prods:
+                    if p not in picks:
+                        picks.append(p)
+        if not picks:
+            picks = ["AILeash", "Machine-proof report"]
+        kind, code = _snippet(a.get("stack"), _str(a.get("api_key"), 120) or None)
+        dev = _str(a.get("device"), 80).lower()
+        on_phone = any(w in dev for w in ("phone", "android", "iphone", "ios", "mobile", "tablet"))
+        steps = []
+        if not a.get("api_key"):
+            steps.append("Open an account: show the customer sebbi_terms, get a yes, then call sebbi_create_account.")
+        if kind == "prompt":
+            steps.append("Paste the prompt below into their app builder's chat. It builds a server function that calls sebbi.pro before every important action.")
+        elif kind == "settings":
+            steps.append("Add an HTTP step in their automation tool with the settings below, then a filter so it only continues on ALLOW.")
+        else:
+            steps.append("Add the code below where their app makes a decision about a person, before it acts.")
+        steps.append("Keep the key in a secret or environment variable, never in browser code.")
+        steps.append("Fire sebbi_test_decision to see the first sealed decision.")
+        if "Human Keys" in picks:
+            steps.append("For human sign-offs, reviewers type their reason at https://sebbi.pro/keys and attach the code to the decision.")
+        if "Signal Packs" in picks or "Token Saver" in picks:
+            steps.append("Write custom rules with sebbi_pack_reference and sebbi_publish_pack, or at https://sebbi.pro/build.")
+        if on_phone:
+            steps.append("Everything here works from a phone: the setup page https://sebbi.pro/connect copies each snippet in one tap.")
+        return {"recommended": [p for p in PRODUCTS if p["name"] in picks], "steps": steps,
+                "format": kind, "code_or_prompt": code,
+                "fields": {"user_id": "the person the decision is about (a pseudonymous id)",
+                           "action": "what is happening, e.g. refund, loan_approval, account_ban",
+                           "amount": "money involved, 0 if none", "country": "2-letter country code",
+                           "device_id": "a stable id for the device or session",
+                           "anomaly": "0 to 1, the customer's own anomaly signal, 0 if none",
+                           "device_risk": "0 to 1, the customer's own device risk, 0 if none"},
+                "reply": "decision (ALLOW, CHALLENGE or BLOCK), score, reasons, audit_hash, block_index, receipt_seq"}, 200
+    if name == "sebbi_test_decision":
+        key = _str(a.get("api_key"), 120)
+        if not key:
+            return {"error": "api_key_needed"}, 400
+        ev = dict(EV)
+        ev.update({"action": _str(a.get("action"), 60) or "refund", "user_id": _str(a.get("user_id"), 80) or "customer-42",
+                   "country": (_str(a.get("country"), 2) or "UK").upper(), "device_id": "sebbi-mcp-test"})
+        try:
+            ev["amount"] = float(a.get("amount")) if a.get("amount") is not None else 120
+        except (TypeError, ValueError):
+            pass
+        st, d = _local("POST", "/api/govern", ev, key=key, ip=ip)
+        if st == 200 and d.get("block_index"):
+            d["check_the_block"] = "https://sebbi.pro/x/walk/block?index=%s" % d["block_index"]
+            d["full_report"] = "https://sebbi.pro/dossier?block=%s" % d["block_index"]
+        return d, st
+    if name == "sebbi_pack_reference":
+        st, d = _local("GET", "/x/packs/spec", ip=ip)
+        return {"builder_page": "https://sebbi.pro/build", "example": {
+            "name": "Stop runaway agents", "author": "Your company", "version": "1.0.0", "vertical": "general",
+            "summary": "Catches AI agents stuck in loops before they run up the bill.",
+            "rules": [{"when": "loop_count >= 3 and unattended", "then": "block",
+                       "why": "An unattended agent sending the same request three times is stuck."},
+                      {"when": "burst >= 0.8", "then": "challenge", "why": "A sudden burst looks like a script out of control."}],
+            "default": "allow"}, "spec": d}, 200
+    if name in ("sebbi_check_pack", "sebbi_publish_pack"):
+        if not isinstance(a.get("pack"), dict):
+            return {"error": "pack_needed", "message": "Send the pack as an object. See sebbi_pack_reference."}, 400
+        path = "/x/packs/validate" if name == "sebbi_check_pack" else "/x/packs/publish"
+        st, d = _local("POST", path, {"pack": a["pack"]}, ip=ip)
+        if name == "sebbi_publish_pack" and st == 200:
+            d["library"] = "https://sebbi.pro/packs.html"
+        return d, st
+    if name == "sebbi_list_packs":
+        v = _str(a.get("vertical"), 30)
+        st, d = _local("GET", "/x/packs/list" + ("?vertical=" + v if v else ""), ip=ip)
+        return d, st
+    if name == "sebbi_decision_report":
+        key = _str(a.get("api_key"), 120)
+        try:
+            b = int(a.get("block"))
+        except (TypeError, ValueError):
+            return {"error": "block_number_needed"}, 400
+        st, d = _local("GET", "/x/dossier/report?block=%d" % b, key=key, ip=ip)
+        if st == 200:
+            d["printable"] = "https://sebbi.pro/dossier?block=%d" % b
+        return d, st
+    if name == "sebbi_check_human_proof":
+        code = _str(a.get("code"), 20).upper()
+        st, d = _local("GET", "/x/humankeys/check?code=" + code, ip=ip)
+        return d, st
+    if name == "sebbi_billing_link":
+        email = _str(a.get("email"), 190).lower()
+        try:
+            devices = max(1, int(a.get("devices") or 1))
+        except (TypeError, ValueError):
+            devices = 1
+        st, d = _local("POST", "/create-checkout", {"email": email, "devices": devices,
+                                                    "product": _str(a.get("product"), 20) or "aileash"}, ip=ip)
+        if st == 200:
+            d["tell_the_customer"] = "This secure Stripe page sets up the 50p per device per month subscription. Billing follows the real device count."
+        elif d.get("error") == "stripe_not_configured":
+            d["message"] = "Card payments are not switched on yet; the 90-day free trial carries on as normal."
+        return d, st
+    if name == "sebbi_verify_chain":
+        st, d = _local("GET", "/api/verify-chain", ip=ip)
+        return d, st
+    return {"error": "unknown_tool"}, 404
+
+
+# ---------------------------------------------------------------------
+# JSON-RPC over HTTP
+# ---------------------------------------------------------------------
+
+def _rpc(msg, ip, session):
+    if not isinstance(msg, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+    rid = msg.get("id")
+    method = msg.get("method", "")
+    p = msg.get("params") or {}
+    if method.startswith("notifications/"):
+        return None
+    if method == "initialize":
+        info = p.get("clientInfo") or {}
+        agent = ("%s %s" % (_str(info.get("name"), 60), _str(info.get("version"), 30))).strip() or None
+        with _lock:
+            _sessions[session] = {"agent": agent, "at": time.time()}
+            if len(_sessions) > 5000:
+                for k in sorted(_sessions, key=lambda k: _sessions[k]["at"])[:1000]:
+                    _sessions.pop(k, None)
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": p.get("protocolVersion") or PROTOCOL,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "sebbi.pro", "title": "sebbi.pro - seal every AI decision", "version": VERSION},
+            "instructions": INSTRUCTIONS}}
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": rid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        agent = (_sessions.get(session) or {}).get("agent")
+        try:
+            res, st = _call(p.get("name"), p.get("arguments"), ip, agent)
+        except Exception as e:
+            res, st = {"error": "tool_failed", "detail": str(e)[:200]}, 500
+        _state["calls"] += 1
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "content": [{"type": "text", "text": json.dumps(res, indent=1, default=str)}],
+            "structuredContent": res if isinstance(res, dict) else {"result": res},
+            "isError": st >= 400}}
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found: %s" % method}}
+
+
+def _client_ip(h):
+    xff = h.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()[:64]
+    try:
+        return str(h.client_address[0])
+    except Exception:
+        return None
+
+
+def _cors(h):
+    h.send_header("Access-Control-Allow-Origin", "*")
+    h.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version")
+    h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
+    h.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+
+
+def _reply(h, status, obj, session=None):
+    body = json.dumps(obj).encode() if obj is not None else b""
+    h.send_response(status)
+    if obj is not None:
+        h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(body)))
+    if session:
+        h.send_header("Mcp-Session-Id", session)
+    _cors(h)
+    h.end_headers()
+    if body:
+        h.wfile.write(body)
+
+
+INFO = {"name": "sebbi.pro MCP connector", "version": VERSION, "connector_url": "https://sebbi.pro/mcp",
+        "transport": "streamable-http (POST JSON-RPC 2.0)",
+        "add_it": {"Claude": "Settings > Connectors > Add custom connector > paste https://sebbi.pro/mcp",
+                   "Claude Code": "claude mcp add --transport http sebbi https://sebbi.pro/mcp",
+                   "Cursor or VS Code": "one-click from https://sebbi.pro/connect"},
+        "tools": [t["name"] for t in TOOLS]}
+
+
+def _install():
+    s = _srv()
+    H = getattr(s, "Handler", None)
+    if H is None:
+        return False
+    if getattr(H, "_mcp_patched", False):
+        return True
+    orig_post, orig_get = H.do_POST, H.do_GET
+    orig_opt = getattr(H, "do_OPTIONS", None)
+    orig_del = getattr(H, "do_DELETE", None)
+
+    def is_mcp(h):
+        return h.path.split("?")[0].rstrip("/") in ("/mcp", "/mcp/sse")
+
+    def do_POST(self):
+        if not is_mcp(self):
+            return orig_post(self)
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n > 1024 * 1024:
+                return _reply(self, 413, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "request too large"}})
+            raw = self.rfile.read(n) if n else b""
+            msg = json.loads(raw or b"null")
+        except Exception:
+            return _reply(self, 400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+        session = self.headers.get("Mcp-Session-Id") or ""
+        new_session = None
+        if isinstance(msg, dict) and msg.get("method") == "initialize":
+            session = new_session = secrets.token_hex(16)
+        ip = _client_ip(self)
+        if isinstance(msg, list):
+            out = [r for r in (_rpc(m, ip, session) for m in msg) if r is not None]
+            return _reply(self, 200 if out else 202, out or None, new_session)
+        r = _rpc(msg, ip, session)
+        return _reply(self, 200 if r is not None else 202, r, new_session)
+
+    def do_GET(self):
+        if not is_mcp(self):
+            return orig_get(self)
+        accept = self.headers.get("Accept", "")
+        if "text/event-stream" in accept:
+            return _reply(self, 405, {"error": "this server answers each request directly; open no stream"})
+        return _reply(self, 200, INFO)
+
+    def do_OPTIONS(self):
+        if is_mcp(self):
+            self.send_response(204)
+            _cors(self)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if orig_opt:
+            return orig_opt(self)
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_DELETE(self):
+        if is_mcp(self):
+            with _lock:
+                _sessions.pop(self.headers.get("Mcp-Session-Id") or "", None)
+            return _reply(self, 200, {})
+        if orig_del:
+            return orig_del(self)
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    H.do_POST, H.do_GET, H.do_OPTIONS, H.do_DELETE = do_POST, do_GET, do_OPTIONS, do_DELETE
+    H._mcp_patched = True
+    return True
+
+
+def handle(method, action, data, api_key, ctx):
+    try:
+        _setup()
+        _state["installed"] = _install()
+    except Exception as e:
+        _state["last_error"] = "arm: %s" % e
+    if action == "terms":
+        return {"terms_version": TERMS_VERSION, "terms": TERMS_TEXT}, 200
+    if action == "spec":
+        return INFO, 200
+    s = _srv()
+    with s._db_lock:
+        n = s._conn.execute("SELECT COUNT(*) FROM mcp_agreement").fetchone()[0]
+    return {"module": "mcp", "version": VERSION, "armed": _state["installed"],
+            "connector_url": "https://sebbi.pro/mcp", "terms_version": TERMS_VERSION,
+            "accounts_opened_by_ai": n, "tool_calls_since_start": _state["calls"],
+            "tools": [t["name"] for t in TOOLS], "last_error": _state["last_error"]}, 200
+
+```
+
+
+## `modules/meter.py`
+
+281 lines, 10630 bytes
+
+```python
+"""
+modules/meter.py  v1.0.0
+The 50p device meter, done per device per month - without touching server.py.
+
+Armed by https://sebbi.pro/x/meter/status after each deploy, it swaps these
+functions inside the running server for new versions (same names, same
+callers, nothing in server.py edited):
+
+  record_device(api_key, device_id)
+      Counts each distinct device a key sends in a calendar month (UTC), once,
+      however many decisions it makes. Resets every month. Reading the count
+      is a single-row lookup, so it holds at millions of devices per key.
+      The engine (/api/govern) and the plug-in log (public_proof_adapter.py)
+      both call this, so one central server acting for 20 million phones is
+      billed for 20 million devices.
+
+  device_count(api_key)
+      What the key is billed for: the larger of last month's full count and
+      this month so far. Growth is billed straight away; a customer who
+      shrinks pays less the month after. Used by the trial-end checkout,
+      /api/usage and the trial-expired answers.
+
+  sync_stripe_quantities()
+      The existing 6-hourly Stripe job now sets each paying subscription to
+      device_count() - up or down - so every renewal charges 50p for each
+      device actually used.
+
+On first arming, each key's existing all-time device count is carried into
+last month, so nobody's bill drops while the monthly count builds up.
+
+Watch for keys stamping one device id on a whole network:
+    https://sebbi.pro/admin/meter      (your admin login)
+Public summary (no keys shown):
+    https://sebbi.pro/x/meter/status
+"""
+
+import json
+import sys
+import threading
+import time
+from collections import defaultdict
+
+VERSION = "1.0.0"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
+RATE_GBP = 0.50
+FLAG_EVENTS_PER_DEVICE = 10000
+CACHE_MAX = 500000
+
+_srv = None
+_armed = False
+_patched_http = False
+_cache = {}
+_lock = threading.Lock()
+_events = defaultdict(int)
+_orig = {}
+
+
+def _month(ts=None):
+    return time.strftime("%Y-%m", time.gmtime(ts if ts is not None else time.time()))
+
+
+def _prev_month(ts=None):
+    t = time.gmtime(ts if ts is not None else time.time())
+    y, m = t.tm_year, t.tm_mon - 1
+    if m == 0:
+        y, m = y - 1, 12
+    return "%04d-%02d" % (y, m)
+
+
+def _find_server():
+    for name in ("__main__", "server"):
+        m = sys.modules.get(name)
+        if m is not None and hasattr(m, "record_device") and hasattr(m, "_conn") and hasattr(m, "_db_lock"):
+            return m
+    return None
+
+
+# ---------------------------------------------------------------- the meter
+
+def _setup(s):
+    with s._db_lock:
+        c = s._conn
+        c.execute("CREATE TABLE IF NOT EXISTS device_month(api_key TEXT,month TEXT,device_id TEXT,first_seen REAL,"
+                  "PRIMARY KEY(api_key,month,device_id)) WITHOUT ROWID")
+        c.execute("CREATE TABLE IF NOT EXISTS device_month_count(api_key TEXT,month TEXT,n INTEGER DEFAULT 0,"
+                  "PRIMARY KEY(api_key,month)) WITHOUT ROWID")
+        c.execute("CREATE TABLE IF NOT EXISTS config(k TEXT PRIMARY KEY,v TEXT)")
+        if not c.execute("SELECT 1 FROM config WHERE k='meter_v2_seeded'").fetchone():
+            c.execute("INSERT OR IGNORE INTO device_month_count(api_key,month,n) "
+                      "SELECT api_key,?,COUNT(*) FROM device_seen GROUP BY api_key", (_prev_month(),))
+            c.execute("INSERT OR REPLACE INTO config(k,v) VALUES('meter_v2_seeded',?)", (str(time.time()),))
+        c.commit()
+
+
+def month_count(api_key, month=None):
+    s = _srv
+    with s._db_lock:
+        try:
+            r = s._conn.execute("SELECT n FROM device_month_count WHERE api_key=? AND month=?",
+                                (api_key, month or _month())).fetchone()
+            return r[0] if r else 0
+        except Exception:
+            return 0
+
+
+def device_count(api_key):
+    """Billable devices: the larger of last month's full count and this month so far."""
+    return max(month_count(api_key, _prev_month()), month_count(api_key))
+
+
+def record_device(api_key, device_id):
+    """Count device_id on api_key for this calendar month. Returns the billable count."""
+    if not api_key or not device_id:
+        return None
+    s = _srv
+    device_id = str(device_id)[:200]
+    mon = _month()
+    ck = (api_key, mon, device_id)
+    with _lock:
+        _events[(api_key, mon)] += 1
+        hit = ck in _cache
+    if not hit:
+        with s._db_lock:
+            try:
+                c = s._conn
+                cur = c.execute("INSERT OR IGNORE INTO device_month(api_key,month,device_id,first_seen) VALUES(?,?,?,?)",
+                                (api_key, mon, device_id, time.time()))
+                if cur.rowcount == 1:
+                    c.execute("INSERT OR IGNORE INTO device_month_count(api_key,month,n) VALUES(?,?,0)", (api_key, mon))
+                    c.execute("UPDATE device_month_count SET n=n+1 WHERE api_key=? AND month=?", (api_key, mon))
+                    c.execute("INSERT OR IGNORE INTO device_seen(api_key,device_id,first_seen) VALUES(?,?,?)",
+                              (api_key, device_id, time.time()))
+                c.commit()
+            except Exception as e:
+                try:
+                    s._conn.rollback()
+                except Exception:
+                    pass
+                print("meter record_device err:" + str(e), flush=True)
+                return None
+        with _lock:
+            if len(_cache) >= CACHE_MAX:
+                _cache.clear()
+            _cache[ck] = 1
+    return device_count(api_key)
+
+
+def sync_stripe_quantities():
+    """Set each paying subscription's quantity to the billable device count, up or down."""
+    s = _srv
+    if not getattr(s, "STRIPE_SECRET", ""):
+        print("QSYNC skip: no STRIPE_SECRET", flush=True)
+        return
+    with s._db_lock:
+        rows = s._conn.execute("SELECT key,email,stripe_sub FROM api_keys WHERE is_paid=1 AND active=1 "
+                               "AND stripe_sub!=''").fetchall()
+    for key, email, sub_id in rows:
+        try:
+            n = device_count(key)
+            if not n:
+                continue
+            sub = s.stripe_call("GET", "/subscriptions/" + sub_id)
+            if not sub or "items" not in sub:
+                print("QSYNC no sub for " + email, flush=True)
+                continue
+            items = sub["items"].get("data", [])
+            if not items:
+                continue
+            item = items[0]
+            current = int(item.get("quantity", 0) or 0)
+            if n != current:
+                r = s.stripe_call("POST", "/subscription_items/" + item["id"],
+                                  {"quantity": str(n), "proration_behavior": "none"})
+                if r and "id" in r:
+                    print("QSYNC " + email + ": " + str(current) + " -> " + str(n) + " devices", flush=True)
+                else:
+                    print("QSYNC FAIL " + email, flush=True)
+        except Exception as e:
+            print("QSYNC ERR " + email + ": " + str(e), flush=True)
+
+
+def watch(limit=200):
+    mon = _month()
+    with _lock:
+        ev = [(k, n) for (k, m), n in _events.items() if m == mon]
+    out = []
+    for k, n in ev:
+        d = month_count(k) or 1
+        out.append({"key_prefix": k[:12], "events_this_month": n, "devices_this_month": d,
+                    "events_per_device": round(n / float(d), 1), "flag": n / float(d) >= FLAG_EVENTS_PER_DEVICE})
+    out.sort(key=lambda x: -x["events_per_device"])
+    return out[:limit]
+
+
+# ---------------------------------------------------------------- arming
+
+def _arm():
+    global _srv, _armed
+    s = _find_server()
+    if s is None:
+        return False
+    _srv = s
+    _setup(s)
+    if not _armed:
+        for name in ("record_device", "device_count", "sync_stripe_quantities"):
+            _orig.setdefault(name, getattr(s, name, None))
+        s.record_device = record_device
+        s.device_count = device_count
+        s.sync_stripe_quantities = sync_stripe_quantities
+        _armed = True
+    return True
+
+
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        o = f.f_locals.get("self")
+        if o is not None and hasattr(type(o), "do_GET") and hasattr(o, "wfile"):
+            return type(o)
+        f = f.f_back
+    return None
+
+
+def _install_http(ctx):
+    """Serve /admin/meter behind the server's own admin login."""
+    global _patched_http
+    if _patched_http:
+        return True
+    cls = _find_handler_class(ctx)
+    if cls is None:
+        return False
+    if getattr(cls, "_meter_patched", False):
+        _patched_http = True
+        return True
+    og = cls.do_GET
+
+    def do_GET(self):
+        if self.path.split("?")[0].rstrip("/") == "/admin/meter":
+            ok = False
+            try:
+                ok = bool(_srv and _srv.check_admin(self))
+            except Exception:
+                ok = False
+            body = json.dumps({"error": "unauthorized"} if not ok else
+                              {"month": _month(), "rate_per_device_gbp": RATE_GBP, "keys": watch(),
+                               "flag_rule": "%d or more events per device this month - check the key is sending "
+                                            "real device ids" % FLAG_EVENTS_PER_DEVICE}).encode("utf-8")
+            self.send_response(200 if ok else 401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return og(self)
+
+    cls.do_GET = do_GET
+    cls._meter_patched = True
+    _patched_http = True
+    return True
+
+
+def handle(method, action, data, api_key, ctx):
+    armed = _arm()
+    http = _install_http(ctx)
+    flags = [w for w in watch() if w["flag"]] if armed else []
+    return ({"module": "meter", "version": VERSION, "armed": armed and http,
+             "month": _month(), "rate_per_device_gbp": RATE_GBP,
+             "rule": "50p per distinct device per calendar month; billed on the larger of last month and this month so far",
+             "keys_metered_this_month": len(watch()) if armed else 0,
+             "keys_flagged": len(flags),
+             "stripe_sync": "every 6 hours, follows the meter up and down"}, 200)
+
+```
 
 
 ## `modules/mutual.py`
@@ -1548,1023 +2439,5 @@ def handle(method, action, data, api_key, ctx):
     if action == "reveal":
         return _reveal(ctx, data)
     return {"error": "unknown_action", "GET": ["status", "build", "bundle", "reveal"]}, 404
-
-```
-
-
-## `modules/ots.py`
-
-753 lines, 30216 bytes
-
-```python
-"""
-modules/ots.py  v1.2  -  serve the OpenTimestamps proofs, and upgrade them
-
-anchor.py stamps the chain tip hourly and writes the .ots proof to the
-anchor volume. Nothing served those files, so "anchored to Bitcoin" was a
-claim a third party had to take on trust.
-
-PENDING IS NOT CONFIRMED. A proof written at stamping time holds a PENDING
-attestation - a calendar's promise to commit the digest to Bitcoin. It is
-not evidence of anything on chain until it is UPGRADED, after the
-calendar's transaction lands. anchor.py never upgraded, so every proof
-written before this module is pending. Said plainly because an auditor's
-own verifier says it first.
-
-v1.1: the automatic upgrade now skips proofs that are already confirmed.
-v1.0 took the oldest 20 every run whether or not they were finished, so
-once those 20 confirmed it kept re-checking them forever and never reached
-the pending ones behind them. Confirmed counts now only count proofs that
-became confirmed in that run, not ones that already were.
-
-v1.2: the newest proofs matter most. Every run now upgrades half its batch
-from the newest end as well as half from the oldest, so tips of the chain
-running today confirm within hours instead of waiting behind the backlog.
-A new public route, latest_confirmed, serves the newest proof that is
-confirmed in Bitcoin AND whose tip is a block in the chain running now -
-the one address a verifier needs. Two more calendars are asked (bob and
-finney), because proofs name whichever calendars accepted them.
-
-Routes: spec, status, list, proof, latest_confirmed public. upgrade keyed.
-Proofs live at ANCHOR_DIR (default /data/anchors) - only durable on Railway
-if a volume is mounted there. /x/ots/status reports what is really present.
-"""
-
-import base64
-import hashlib
-import json
-import os
-import threading
-import time
-
-VERSION = "1.2"
-
-PUBLIC = {("GET", "spec"), ("GET", "status"), ("GET", "list"),
-          ("GET", "proof"), ("GET", "latest_confirmed")}
-
-ANCHOR_DIR = os.environ.get("ANCHOR_DIR", "/data/anchors")
-MAX_PROOF_BYTES = 262144
-
-CALENDARS = [
-    "https://a.pool.opentimestamps.org",
-    "https://b.pool.opentimestamps.org",
-    "https://alice.btc.calendar.opentimestamps.org",
-    "https://bob.btc.calendar.opentimestamps.org",
-    "https://finney.calendar.eternitywall.com",
-]
-
-# ---- automatic upgrading
-#
-# anchor.py stamps and walks away, which is how 767 proofs ended up pending.
-# This finishes the job on a timer so nobody has to remember to.
-#
-# The calendars are free public infrastructure run by volunteers. Firing 767
-# requests at them in one go would be rude and would probably get us rate
-# limited, so this works in small batches, oldest first, and skips anything
-# too young to have confirmed yet, and anything already confirmed. A backlog
-# clears over days rather than minutes, which is fine - nothing is lost by a
-# proof staying pending a little longer, and the stamp time is already fixed.
-AUTO_UPGRADE_ENABLED = os.environ.get("OTS_AUTO_UPGRADE", "1") == "1"
-AUTO_UPGRADE_INTERVAL = int(os.environ.get("OTS_UPGRADE_INTERVAL", "3600"))
-AUTO_UPGRADE_BATCH = int(os.environ.get("OTS_UPGRADE_BATCH", "20"))
-
-# A Bitcoin confirmation takes an hour or more, and the calendars aggregate
-# before they commit. Asking about a proof stamped ten minutes ago wastes a
-# request and gets a "not ready" every time.
-MIN_AGE_SECONDS = int(os.environ.get("OTS_MIN_AGE", "10800"))
-
-# Breathing room between calendar calls.
-CALENDAR_PAUSE = 0.5
-
-_auto = {"started": False, "runs": 0, "last_run": None, "last_result": None,
-         "upgraded_total": 0, "confirmed_total": 0}
-
-# Stamp ids already seen confirmed. A confirmed proof never goes back to
-# pending, so once seen it is never read or asked about again.
-_confirmed_seen = set()
-_file_lock = threading.Lock()
-
-
-def _read_index():
-    path = os.path.join(ANCHOR_DIR, "anchors.jsonl")
-    rows = []
-    if not os.path.exists(path):
-        return rows
-    try:
-        with open(path, "r") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except ValueError:
-                        continue
-    except Exception:
-        pass
-    return rows
-
-
-def _iso(ts):
-    try:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
-    except Exception:
-        return None
-
-
-def _stamp_id(path):
-    if not path:
-        return None
-    name = os.path.basename(path)
-    if name.startswith("tip_") and name.endswith(".ots"):
-        return name[4:-4]
-    return None
-
-
-def _describe(raw):
-    """What is actually inside this proof. Never guesses."""
-    out = {"pending_calendars": [], "bitcoin_block_heights": [],
-           "state": "unknown", "read_error": None}
-    try:
-        from opentimestamps.core.serialize import BytesDeserializationContext
-        from opentimestamps.core.timestamp import DetachedTimestampFile
-        from opentimestamps.core.notary import (PendingAttestation,
-                                                BitcoinBlockHeaderAttestation)
-    except Exception as exc:
-        out["read_error"] = "opentimestamps library not available: %s" % exc
-        return out
-
-    try:
-        detached = DetachedTimestampFile.deserialize(
-            BytesDeserializationContext(raw))
-    except Exception as exc:
-        out["read_error"] = "could not parse proof: %s" % exc
-        out["state"] = "unreadable"
-        return out
-
-    def walk(timestamp):
-        for att in timestamp.attestations:
-            if isinstance(att, PendingAttestation):
-                uri = att.uri
-                if isinstance(uri, bytes):
-                    uri = uri.decode("utf-8", "replace")
-                if uri not in out["pending_calendars"]:
-                    out["pending_calendars"].append(uri)
-            elif isinstance(att, BitcoinBlockHeaderAttestation):
-                h = getattr(att, "height", None)
-                if h is not None and h not in out["bitcoin_block_heights"]:
-                    out["bitcoin_block_heights"].append(h)
-        for _, sub in timestamp.ops.items():
-            walk(sub)
-
-    try:
-        walk(detached.timestamp)
-    except Exception as exc:
-        out["read_error"] = "could not walk proof: %s" % exc
-        return out
-
-    if out["bitcoin_block_heights"]:
-        out["state"] = "confirmed"
-        out["means"] = ("Committed in Bitcoin block %s. Verifiable against "
-                        "the blockchain by anyone, with nothing from us."
-                        % ", ".join(str(h) for h in out["bitcoin_block_heights"]))
-    elif out["pending_calendars"]:
-        out["state"] = "pending"
-        out["means"] = ("A calendar has accepted this digest and promised to "
-                        "commit it to Bitcoin. NOT yet evidence of anything "
-                        "on chain. Upgrade it once the transaction confirms.")
-    else:
-        out["state"] = "empty"
-        out["means"] = "No attestations found in this proof."
-    return out
-
-
-def _proof_bytes(stamp_id):
-    path = os.path.join(ANCHOR_DIR, "tip_%s.ots" % stamp_id)
-    if not os.path.exists(path):
-        return None, path, "no proof file at %s" % path
-    try:
-        if os.path.getsize(path) > MAX_PROOF_BYTES:
-            return None, path, "proof unexpectedly large"
-        with open(path, "rb") as handle:
-            return handle.read(), path, None
-    except Exception as exc:
-        return None, path, "could not read proof: %s" % exc
-
-
-def _tip_for(stamp_id):
-    try:
-        with open(os.path.join(ANCHOR_DIR, "tip_%s.txt" % stamp_id)) as h:
-            return h.read().strip()
-    except Exception:
-        return None
-
-
-def _is_confirmed(sid):
-    """True if this proof already carries a Bitcoin attestation."""
-    if sid in _confirmed_seen:
-        return True
-    raw, _p, _e = _proof_bytes(sid)
-    if raw is None:
-        return False
-    if _describe(raw)["state"] == "confirmed":
-        _confirmed_seen.add(sid)
-        return True
-    return False
-
-
-def _pending_candidates(limit=None):
-    """Stamps old enough to be worth asking about and not yet confirmed,
-    oldest first.
-
-    Oldest first on purpose: the oldest pending proofs are the ones most
-    likely to have confirmed, so a backlog clears from the far end rather
-    than the recent end. Already-confirmed proofs are skipped, otherwise
-    they would fill every batch forever.
-    """
-    now = time.time()
-    out = []
-    for row in _read_index():
-        if not row.get("ots"):
-            continue
-        sid = _stamp_id(row.get("ots_file"))
-        if not sid or not sid.isdigit():
-            continue
-        if now - float(sid) < MIN_AGE_SECONDS:
-            continue
-        if not os.path.exists(os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid)):
-            continue
-        if _is_confirmed(sid):
-            continue
-        out.append(sid)
-        if limit is not None and len(out) >= limit:
-            break
-    return out
-
-
-def _pending_count():
-    return len(_pending_candidates())
-
-
-def _newest_pending(limit):
-    """Pending proofs old enough to have confirmed, NEWEST first. These are
-    the tips of the chain running today, the ones a verifier asks about."""
-    now = time.time()
-    out = []
-    for row in reversed(_read_index()):
-        if not row.get("ots"):
-            continue
-        sid = _stamp_id(row.get("ots_file"))
-        if not sid or not sid.isdigit():
-            continue
-        if now - float(sid) < MIN_AGE_SECONDS:
-            continue
-        if not os.path.exists(os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid)):
-            continue
-        if _is_confirmed(sid):
-            continue
-        out.append(sid)
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _tip_in_chain(tip, ctx):
-    conn, lock = (ctx or {}).get("conn"), (ctx or {}).get("lock")
-    if conn is None or lock is None or not tip:
-        return None
-    try:
-        with lock:
-            r = conn.execute("SELECT id FROM audit_log WHERE audit_hash = ?",
-                             (tip,)).fetchone()
-        return r[0] if r else False
-    except Exception:
-        return None
-
-
-LATEST_SCAN = 500
-
-
-def _latest_confirmed(ctx):
-    """The newest proof that is confirmed in Bitcoin and whose tip is a
-    block in the chain running now. Checked in that order, newest first."""
-    rows = [r for r in reversed(_read_index()) if r.get("ots")]
-    looked = 0
-    for row in rows[:LATEST_SCAN]:
-        sid = _stamp_id(row.get("ots_file"))
-        if not sid or not sid.isdigit():
-            continue
-        looked += 1
-        raw, _p, _e = _proof_bytes(sid)
-        if raw is None:
-            continue
-        d = _describe(raw)
-        if d["state"] != "confirmed":
-            continue
-        _confirmed_seen.add(sid)
-        tip = (_tip_for(sid) or row.get("tip") or "").strip().lower()
-        block = _tip_in_chain(tip, ctx)
-        if block is False:
-            continue
-        out, status = _proof({"ts": sid})
-        if status != 200:
-            continue
-        out["tip_is_block"] = block
-        out["check_block"] = ("https://sebbi.pro/x/walk/block?index=%s" % block
-                              if block else None)
-        out["why_this_one"] = ("The newest proof that is confirmed in Bitcoin "
-                               "and whose tip is a block in the chain running "
-                               "now. Older confirmations of earlier chains are "
-                               "skipped, not hidden - they stay at /x/ots/list.")
-        return out, 200
-    return {"ok": False, "error": "no_confirmed_current_proof_yet",
-            "looked_at": looked,
-            "detail": "No proof of a current-chain tip has confirmed in Bitcoin "
-                      "yet. The upgrader works the newest end every hour, and "
-                      "a confirmation takes a few hours. Nothing is wrong; it "
-                      "is simply not there yet.",
-            "status": "https://sebbi.pro/x/ots/status"}, 404
-
-
-def _status():
-    rows = _read_index()
-    exists = os.path.isdir(ANCHOR_DIR)
-    files = []
-    if exists:
-        try:
-            files = [f for f in os.listdir(ANCHOR_DIR) if f.endswith(".ots")]
-        except Exception:
-            files = []
-
-    stamped = [r for r in rows if r.get("ots")]
-    out = {
-        "ok": True, "module": "ots", "version": VERSION,
-        "anchor_dir": ANCHOR_DIR,
-        "storage_present": exists,
-        "proof_files_on_disk": len(files),
-        "anchor_attempts_recorded": len(rows),
-        "stamped": len(stamped),
-        "failed": len(rows) - len(stamped),
-        "first_attempt": _iso(rows[0].get("ts")) if rows else None,
-        "last_attempt": _iso(rows[-1].get("ts")) if rows else None,
-    }
-
-    if not exists:
-        out["warning"] = (
-            "The anchor directory does not exist on this container. Either "
-            "no anchor has run, or no persistent volume is mounted at %s - "
-            "in which case every proof is lost on redeploy and the history "
-            "restarts silently. Check before calling this durable."
-            % ANCHOR_DIR)
-    elif len(files) < len(stamped):
-        out["warning"] = (
-            "%d successful stamps recorded but only %d proof files on disk. "
-            "Files have been lost, most likely to a redeploy without a "
-            "persistent volume." % (len(stamped), len(files)))
-
-    if stamped:
-        sid = _stamp_id(stamped[-1].get("ots_file"))
-        if sid:
-            raw, _p, err = _proof_bytes(sid)
-            if raw:
-                d = _describe(raw)
-                out["latest_proof"] = {
-                    "stamp_id": sid, "tip": stamped[-1].get("tip"),
-                    "stamped_at": _iso(stamped[-1].get("ts")),
-                    "state": d["state"],
-                    "bitcoin_block_heights": d["bitcoin_block_heights"],
-                    "pending_calendars": d["pending_calendars"],
-                    "means": d.get("means"),
-                    "read_error": d.get("read_error"),
-                }
-            else:
-                out["latest_proof"] = {"stamp_id": sid, "error": err}
-
-    out["auto_upgrade"] = {
-        "enabled": AUTO_UPGRADE_ENABLED,
-        "running": _auto["started"],
-        "every_seconds": AUTO_UPGRADE_INTERVAL,
-        "batch_size": AUTO_UPGRADE_BATCH,
-        "skips_proofs_under_hours": MIN_AGE_SECONDS // 3600,
-        "runs": _auto["runs"],
-        "last_run": _auto["last_run"],
-        "last_result": _auto["last_result"],
-        "upgraded_since_start": _auto["upgraded_total"],
-        "newly_confirmed_since_start": _auto["confirmed_total"],
-        "confirmed_seen": len(_confirmed_seen),
-        "pending_eligible_now": _pending_count(),
-        "note": ("Each run takes half its batch from the newest proofs and half "
-                 "from the oldest, skipping proofs already confirmed. The calendars are free infrastructure run by "
-                 "volunteers, so a backlog clears over days rather than "
-                 "minutes. Nothing is lost by a proof staying pending longer "
-                 "- the stamp time is already fixed."),
-    }
-
-    out["honest_note"] = (
-        "A proof written at stamping time is PENDING - a promise to commit "
-        "the digest to Bitcoin, not evidence that it has been. It becomes "
-        "confirmed only after being upgraded. The auto-upgrade does that on "
-        "a timer; until a proof is upgraded, pending is what it is.")
-    return out, 200
-
-
-def _list(data):
-    rows = _read_index()
-    try:
-        limit = min(int(data.get("limit", 50)), 500)
-    except (TypeError, ValueError):
-        limit = 50
-
-    out = []
-    for row in list(reversed(rows))[:limit]:
-        sid = _stamp_id(row.get("ots_file"))
-        entry = {"stamp_id": sid, "tip": row.get("tip"),
-                 "stamped_at": _iso(row.get("ts")),
-                 "ots_written": bool(row.get("ots")),
-                 "note": row.get("note")}
-        if sid:
-            entry["proof_on_disk"] = os.path.exists(
-                os.path.join(ANCHOR_DIR, "tip_%s.ots" % sid))
-            entry["proof"] = "https://sebbi.pro/x/ots/proof?ts=%s" % sid
-        out.append(entry)
-
-    return {"ok": True, "count": len(out), "anchors": out,
-            "note": "Newest first. ots_written false is a recorded failure, "
-                    "kept rather than hidden - a gap in anchoring is exactly "
-                    "what an auditor needs to see."}, 200
-
-
-def _proof(data):
-    stamp_id = str(data.get("ts") or data.get("stamp_id") or "").strip()
-    tip = str(data.get("tip") or "").strip().lower()
-
-    if not stamp_id and tip:
-        for row in reversed(_read_index()):
-            if str(row.get("tip", "")).lower() == tip and row.get("ots_file"):
-                stamp_id = _stamp_id(row.get("ots_file"))
-                break
-        if not stamp_id:
-            return {"ok": False, "error": "no_proof_for_tip", "tip": tip,
-                    "detail": "No successful stamp recorded for that tip. "
-                              "https://sebbi.pro/x/ots/list shows every "
-                              "attempt."}, 404
-
-    if not stamp_id:
-        return {"ok": False, "error": "ts_or_tip_required",
-                "detail": "?ts=<stamp_id> or ?tip=<64 hex>. Ids at "
-                          "https://sebbi.pro/x/ots/list"}, 400
-    if not stamp_id.isdigit():
-        return {"ok": False, "error": "bad_stamp_id"}, 400
-
-    raw, _path, err = _proof_bytes(stamp_id)
-    if raw is None:
-        return {"ok": False, "error": "proof_unavailable",
-                "detail": err, "stamp_id": stamp_id}, 404
-
-    d = _describe(raw)
-    recorded_tip = _tip_for(stamp_id)
-    return {
-        "ok": True, "stamp_id": stamp_id, "stamped_at": _iso(stamp_id),
-        "tip": recorded_tip, "digest_sha256": recorded_tip,
-        "proof_bytes": len(raw),
-        "proof_sha256": hashlib.sha256(raw).hexdigest(),
-        "ots_base64": base64.b64encode(raw).decode("ascii"),
-        "state": d["state"],
-        "bitcoin_block_heights": d["bitcoin_block_heights"],
-        "pending_calendars": d["pending_calendars"],
-        "means": d.get("means"), "read_error": d.get("read_error"),
-        "how_to_verify": {
-            "1": "base64 -d the ots_base64 field into tip.ots",
-            "2": "printf '%s' <tip> | xxd -r -p > tip.bin",
-            "3": "ots verify -f tip.bin tip.ots",
-            "4": "if pending: ots upgrade tip.ots",
-            "needs": "pip install opentimestamps-client. Nothing of ours.",
-        },
-        "note": "These are the bytes as written at stamping time, plus any "
-                "Bitcoin path added by upgrading. Nothing regenerated or "
-                "normalised.",
-    }, 200
-
-
-def _upgrade(data):
-    """Ask the calendars to complete pending proofs.
-
-    Upgrading only ADDS the path from the digest to a Bitcoin block. It
-    cannot change what was committed or when, which is why the standard
-    client overwrites the file too.
-    """
-    try:
-        from opentimestamps.calendar import RemoteCalendar
-        from opentimestamps.core.serialize import (BytesDeserializationContext,
-                                                   BytesSerializationContext)
-        from opentimestamps.core.timestamp import DetachedTimestampFile
-        from opentimestamps.core.notary import PendingAttestation
-    except Exception as exc:
-        return {"ok": False, "error": "library_unavailable", "detail": str(exc),
-                "fix": "add opentimestamps-client to requirements.txt"}, 501
-
-    try:
-        limit = min(int(data.get("limit", 25)), 200)
-    except (TypeError, ValueError):
-        limit = 25
-    only = str(data.get("ts") or "").strip()
-
-    auto = bool(data.get("auto"))
-
-    if auto:
-        # Half from the newest end (today's chain, what verifiers ask about),
-        # half from the oldest (the backlog). Never the same proof twice.
-        newest = _newest_pending(max(1, limit // 2))
-        oldest = [c for c in _pending_candidates(limit) if c not in newest]
-        candidates = newest + oldest[:max(0, limit - len(newest))]
-    elif only:
-        candidates = [only]
-    else:
-        # Manual run: newest first, which is what someone checking by hand
-        # usually wants to see.
-        candidates = [_stamp_id(r.get("ots_file"))
-                      for r in reversed(_read_index()) if r.get("ots")]
-        candidates = [c for c in candidates if c][:limit]
-
-    results = []
-    upgraded = newly_confirmed = already_confirmed = still_pending = errors = 0
-
-    for sid in candidates:
-        if not sid:
-            continue
-        with _file_lock:
-            raw, path, err = _proof_bytes(sid)
-            if raw is None:
-                results.append({"stamp_id": sid, "ok": False, "detail": err})
-                errors += 1
-                continue
-
-            before = _describe(raw)
-            if before["state"] == "confirmed":
-                _confirmed_seen.add(sid)
-                already_confirmed += 1
-                results.append({"stamp_id": sid, "ok": True,
-                                "state": "confirmed",
-                                "bitcoin_block_heights":
-                                    before["bitcoin_block_heights"],
-                                "action": "already complete, left alone"})
-                continue
-
-            try:
-                detached = DetachedTimestampFile.deserialize(
-                    BytesDeserializationContext(raw))
-            except Exception as exc:
-                results.append({"stamp_id": sid, "ok": False,
-                                "detail": "could not parse: %s" % exc})
-                errors += 1
-                continue
-
-            merged = [0]
-
-            def attempt(timestamp):
-                for att in list(timestamp.attestations):
-                    if not isinstance(att, PendingAttestation):
-                        continue
-                    uri = att.uri
-                    if isinstance(uri, bytes):
-                        uri = uri.decode("utf-8", "replace")
-                    if uri not in CALENDARS:
-                        continue
-                    try:
-                        completed = RemoteCalendar(uri).get_timestamp(
-                            timestamp.msg)
-                        timestamp.merge(completed)
-                        merged[0] += 1
-                    except Exception:
-                        # Not ready yet is the normal case, not an error.
-                        pass
-                    # Free volunteer-run infrastructure. Do not hammer it.
-                    time.sleep(CALENDAR_PAUSE)
-                for _, sub in list(timestamp.ops.items()):
-                    attempt(sub)
-
-            try:
-                attempt(detached.timestamp)
-            except Exception as exc:
-                results.append({"stamp_id": sid, "ok": False,
-                                "detail": "upgrade walk failed: %s" % exc})
-                errors += 1
-                continue
-
-            if merged[0] == 0:
-                still_pending += 1
-                results.append({"stamp_id": sid, "ok": True,
-                                "state": "pending",
-                                "action": "no calendar had it ready yet",
-                                "detail": "Normal. A Bitcoin confirmation "
-                                          "takes hours. Run again later."})
-                continue
-
-            try:
-                ctx = BytesSerializationContext()
-                detached.serialize(ctx)
-                new_bytes = ctx.getbytes()
-                tmp = path + ".tmp"
-                with open(tmp, "wb") as handle:
-                    handle.write(new_bytes)
-                os.replace(tmp, path)
-            except Exception as exc:
-                results.append({"stamp_id": sid, "ok": False,
-                                "detail": "upgraded but could not write: %s"
-                                          % exc})
-                errors += 1
-                continue
-
-        after = _describe(new_bytes)
-        upgraded += 1
-        if after["state"] == "confirmed":
-            _confirmed_seen.add(sid)
-            newly_confirmed += 1
-        results.append({"stamp_id": sid, "ok": True, "state": after["state"],
-                        "bitcoin_block_heights": after["bitcoin_block_heights"],
-                        "action": "upgraded, %d calendar response(s) merged"
-                                  % merged[0],
-                        "proof_bytes": len(new_bytes)})
-
-    return {"ok": True, "examined": len(results), "upgraded": upgraded,
-            "newly_confirmed": newly_confirmed,
-            "already_confirmed": already_confirmed,
-            "still_pending": still_pending,
-            "errors": errors, "results": results,
-            "note": "Upgrading only adds the path from digest to Bitcoin "
-                    "block. It cannot alter what was committed or when. "
-                    "Proofs not yet ready stay pending; nothing is lost by "
-                    "trying early."}, 200
-
-
-def _upgrade_loop():
-    """Finish what anchor.py starts. Quiet, slow, and never fatal."""
-    time.sleep(90)          # let the server come up
-    while True:
-        try:
-            result, _status_code = _upgrade({"limit": AUTO_UPGRADE_BATCH,
-                                             "auto": True})
-            _auto["runs"] += 1
-            _auto["last_run"] = _iso(time.time())
-            _auto["last_result"] = {
-                "examined": result.get("examined"),
-                "upgraded": result.get("upgraded"),
-                "newly_confirmed": result.get("newly_confirmed"),
-                "still_pending": result.get("still_pending"),
-                "errors": result.get("errors"),
-            }
-            _auto["upgraded_total"] += int(result.get("upgraded") or 0)
-            _auto["confirmed_total"] += int(result.get("newly_confirmed") or 0)
-            if result.get("upgraded"):
-                print("OTS: upgraded %s proof(s), %s newly confirmed"
-                      % (result.get("upgraded"),
-                         result.get("newly_confirmed")), flush=True)
-        except Exception as exc:
-            print("OTS upgrade loop error: %s" % exc, flush=True)
-        time.sleep(AUTO_UPGRADE_INTERVAL)
-
-
-def _start_auto():
-    if _auto["started"] or not AUTO_UPGRADE_ENABLED:
-        return
-    _auto["started"] = True
-    threading.Thread(target=_upgrade_loop, name="ots-upgrade",
-                     daemon=True).start()
-    print("OTS: auto-upgrade every %ds, %d per batch, skipping proofs under "
-          "%dh old and proofs already confirmed"
-          % (AUTO_UPGRADE_INTERVAL, AUTO_UPGRADE_BATCH,
-             MIN_AGE_SECONDS // 3600), flush=True)
-
-
-def _spec():
-    return {
-        "module": "ots", "version": VERSION,
-        "what": "Serves the OpenTimestamps proofs for the chain tip, and "
-                "upgrades pending ones to confirmed.",
-        "why": "anchor.py has stamped the tip hourly since July and nothing "
-               "served the proofs, so external anchoring was a claim rather "
-               "than something a third party could check.",
-        "pending_vs_confirmed": {
-            "pending": "Written when a calendar accepts the digest. A promise "
-                       "to commit it to Bitcoin. NOT evidence of anything on "
-                       "chain yet.",
-            "confirmed": "Carries the full path from digest to a Bitcoin "
-                         "block header. Verifiable by anyone against the "
-                         "blockchain, with nothing from us.",
-            "the_gap": "A proof does not become confirmed on its own. It must "
-                       "be upgraded - fetched again from the calendar after "
-                       "its transaction lands. This module does that on a "
-                       "timer, newest and oldest together, skipping ones "
-                       "already done.",
-        },
-        "routes": {
-            "status": "https://sebbi.pro/x/ots/status",
-            "list": "https://sebbi.pro/x/ots/list",
-            "proof": "https://sebbi.pro/x/ots/proof?ts=<stamp_id>",
-            "latest_confirmed": "https://sebbi.pro/x/ots/latest_confirmed",
-            "spec": "https://sebbi.pro/x/ots/spec",
-            "upgrade": "POST, keyed. asks the calendars to complete pending "
-                       "proofs.",
-        },
-        "verifying_without_us": [
-            "base64 -d the ots_base64 field into tip.ots",
-            "printf '%s' <tip> | xxd -r -p > tip.bin",
-            "ots verify -f tip.bin tip.ots",
-            "pip install opentimestamps-client - no code of ours involved",
-        ],
-        "what_this_does_not_prove": [
-            "That the records under the tip are true. It fixes when a hash "
-            "existed, nothing else.",
-            "Anything about blocks sealed since the last anchor. Anchoring is "
-            "hourly, so the most recent hour rests on peer witnessing.",
-            "That a pending proof will confirm. Calendars are free public "
-            "infrastructure and can fail.",
-        ],
-        "storage_warning": "Proofs live at %s. On Railway that is only "
-                           "durable with a persistent volume mounted there. "
-                           "https://sebbi.pro/x/ots/status reports what is "
-                           "present." % ANCHOR_DIR,
-    }
-
-
-try:
-    _start_auto()
-except Exception as exc:
-    print("OTS: could not start auto-upgrade: %s" % exc, flush=True)
-
-
-def handle(method, action, data, api_key, ctx):
-    data = data or {}
-    if action == "spec":
-        return _spec(), 200
-    if action in ("status", ""):
-        return _status()
-    if action == "list":
-        return _list(data)
-    if action == "proof":
-        return _proof(data)
-    if action == "latest_confirmed":
-        return _latest_confirmed(ctx)
-    if action == "upgrade":
-        if not api_key:
-            return {"ok": False, "error": "api_key_required"}, 401
-        return _upgrade(data)
-    return {"ok": False, "error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/oversight.py`
-
-249 lines, 11339 bytes
-
-```python
-"""
-Human oversight notary - /x/oversight/<action>
-
-THE PROBLEM
------------
-Nobody can prove a person thought about a decision. That is an internal state
-and no amount of logging reaches it. Any vendor claiming to prove genuine
-human oversight is overselling.
-
-But rubber stamping is not an internal state. It is a pattern, and patterns
-leave marks - if you record the right things, in the right order, at the time.
-
-WHAT THIS DOES
---------------
-Three things, none of which claim to read minds.
-
-1. ORDER. The reviewer's own call is sealed BEFORE the machine's verdict is
-   revealed to them. Two blocks, in that order, in a chain that cannot be
-   reordered afterwards. So a reviewer cannot have simply agreed with an
-   answer they had already seen - the chain shows they committed while it was
-   still hidden.
-
-2. ATTENTION. The gap between opening the case and committing is recorded.
-   A 0.8 second approval sits in the record permanently, next to a two minute
-   one. Not proof of thought - but a 400-case history of sub-second calls is
-   not something anyone can explain away.
-
-3. INDEPENDENCE. Agreement rate over time. A reviewer who has never once
-   diverged from the machine is visible in the data. One who diverges
-   sometimes is demonstrably exercising judgement.
-
-WHAT IT DOES NOT DO
--------------------
-- It cannot prove the reviewer read the material. They can leave a screen open.
-- Dwell time is measurable but gameable by anyone deliberately gaming it.
-- It does not stop a reviewer being wrong. It records that they decided.
-- If the integrating system shows its user the machine verdict before calling
-  /open, this proves nothing. The ordering guarantee is only as good as the
-  integration honouring it. That is a documented limit, not a hidden one.
-
-WHAT IT IS FOR
---------------
-Turning "we have human oversight" from an assertion into a dataset that an
-auditor can test - and that a rubber stamper cannot hide inside.
-
-    POST /x/oversight/open      case_ref, material, machine_verdict, reviewer
-    POST /x/oversight/commit    case_id, reviewer_verdict, reasoning
-    GET  /x/oversight/case?id=OVS-XXXXXXXX
-    GET  /x/oversight/reviewer?id=<reviewer id>
-    GET  /x/oversight/list
-"""
-
-import hashlib, json, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-VERDICTS = {"allow", "block", "challenge", "escalate"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS oversight_cases(case_id TEXT PRIMARY KEY,api_key TEXT,case_ref TEXT,reviewer TEXT,material_hash TEXT,machine_verdict TEXT,opened REAL,committed REAL,reviewer_verdict TEXT,agreed INTEGER,dwell REAL,status TEXT DEFAULT 'open')")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_key ON oversight_cases(api_key)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_rev ON oversight_cases(api_key,reviewer)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _hash(x):
-    if not isinstance(x, str):
-        x = json.dumps(x, sort_keys=True)
-    return hashlib.sha256(x.encode()).hexdigest()
-
-
-def _seal_event(ctx, api_key, cid, action, detail):
-    ts = time.time()
-    ev = {"user_id": "ovs:" + cid, "action": "oversight_" + action, "amount": 0,
-          "country": "UK", "device_id": "oversight", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "OVERSIGHT_SEALED", "score": 0, "oversight_action": action,
-           "oversight_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
-
-
-def _open(ctx, api_key, data):
-    ref = str(data.get("case_ref", "")).strip()
-    if not ref:
-        return {"error": "case_ref_required"}, 400
-    reviewer = str(data.get("reviewer", "")).strip()
-    if not reviewer:
-        return {"error": "reviewer_required",
-                "message": "Oversight without a named reviewer is not oversight."}, 400
-    material = data.get("material")
-    if material is None:
-        return {"error": "material_required",
-                "message": "Send exactly what the reviewer will see. Only its hash is stored."}, 400
-    mv = str(data.get("machine_verdict", "")).strip().lower()
-    if mv and mv not in VERDICTS:
-        return {"error": "invalid_machine_verdict", "allowed": sorted(VERDICTS)}, 400
-
-    cid = "OVS-" + secrets.token_hex(4).upper()
-    mh = _hash(material)
-    detail = ("ref=" + ref[:80] + ";reviewer=" + reviewer[:60] +
-              ";material_sha256=" + mh + ";machine_verdict_sealed=" + (mv or "none"))
-    h, idx, seq, ts = _seal_event(ctx, api_key, cid, "opened", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO oversight_cases(case_id,api_key,case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,'open')",
-                            (cid, api_key, ref, reviewer, mh, mv or None, ts))
-        ctx["conn"].commit()
-
-    return {"case_id": cid, "opened": _iso(ts), "material_sha256": mh,
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "machine_verdict": "withheld until commit",
-            "message": "Clock running. Show the reviewer the material, not the verdict."}, 200
-
-
-def _commit(ctx, api_key, data):
-    cid = str(data.get("case_id", "")).strip()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT reviewer,material_hash,machine_verdict,opened,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-    if not row:
-        return {"error": "unknown_case_id"}, 404
-    if row[4] != "open":
-        return {"error": "already_committed",
-                "message": "A reviewer commits once. That is the point."}, 400
-
-    rv = str(data.get("reviewer_verdict", "")).strip().lower()
-    if rv not in VERDICTS:
-        return {"error": "invalid_reviewer_verdict", "allowed": sorted(VERDICTS)}, 400
-    reasoning = str(data.get("reasoning", "")).strip()
-    if not reasoning:
-        return {"error": "reasoning_required",
-                "message": "Sealed at commit, before the machine verdict is revealed. Blank is not permitted."}, 400
-
-    ts = time.time()
-    dwell = round(ts - row[3], 3)
-    agreed = None if not row[2] else (1 if rv == row[2] else 0)
-    detail = ("reviewer_verdict=" + rv + ";dwell_seconds=" + str(dwell) +
-              ";reasoning=" + reasoning[:600])
-    h, idx, seq, _x = _seal_event(ctx, api_key, cid, "committed", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE oversight_cases SET committed=?,reviewer_verdict=?,agreed=?,dwell=?,status='committed' WHERE case_id=? AND api_key=?",
-                            (ts, rv, agreed, dwell, cid, api_key))
-        ctx["conn"].commit()
-
-    out = {"case_id": cid, "reviewer_verdict": rv, "dwell_seconds": dwell,
-           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-           "machine_verdict": row[2],
-           "note": "Your call was sealed before this line was returned. The chain shows the order."}
-    if agreed is not None:
-        out["agreed"] = bool(agreed)
-    if dwell < 2:
-        out["flag"] = "committed in under 2 seconds - recorded permanently"
-    return out, 200
-
-
-def _case(ctx, api_key, cid):
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-        if not row:
-            return {"error": "unknown_case_id"}, 404
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("ovs:" + cid,)).fetchall()
-    events = []
-    for ts_, res, ah, seq in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(ts_), "event": r.get("oversight_action"),
-                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
-        except Exception:
-            pass
-    return {"case_id": cid, "case_ref": row[0], "reviewer": row[1],
-            "material_sha256": row[2], "machine_verdict": row[3],
-            "opened": _iso(row[4]), "committed": _iso(row[5]),
-            "reviewer_verdict": row[6],
-            "agreed": (None if row[7] is None else bool(row[7])),
-            "dwell_seconds": row[8], "status": row[9], "events": events,
-            "ordering_proof": "The opened block precedes the committed block in the chain. Neither can be reordered or altered without breaking every block after it."}, 200
-
-
-def _reviewer(ctx, api_key, rid):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT dwell,agreed FROM oversight_cases WHERE api_key=? AND reviewer=? AND status='committed'", (api_key, rid)).fetchall()
-    if not rows:
-        return {"reviewer": rid, "cases": 0,
-                "note": "No committed cases on record for this reviewer."}, 200
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    scored = [r[1] for r in rows if r[1] is not None]
-    n = len(dwells)
-    median = dwells[n // 2] if n else None
-    under2 = len([d for d in dwells if d < 2])
-    out = {"reviewer": rid, "cases": len(rows),
-           "median_dwell_seconds": median,
-           "fastest_seconds": (dwells[0] if dwells else None),
-           "under_2_seconds": under2,
-           "under_2_seconds_pct": (round(100 * under2 / n, 1) if n else None)}
-    if scored:
-        agree = sum(scored)
-        out["agreement_rate_pct"] = round(100 * agree / len(scored), 1)
-        out["diverged"] = len(scored) - agree
-        if len(scored) >= 20 and agree == len(scored):
-            out["pattern"] = "never diverged from the machine across " + str(len(scored)) + " cases"
-    return out, 200
-
-
-def _list(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT case_id,case_ref,reviewer,opened,status,reviewer_verdict,dwell,agreed FROM oversight_cases WHERE api_key=? ORDER BY opened DESC LIMIT 200", (api_key,)).fetchall()
-    return {"count": len(rows),
-            "cases": [{"case_id": r[0], "case_ref": r[1], "reviewer": r[2],
-                       "opened": _iso(r[3]), "status": r[4],
-                       "reviewer_verdict": r[5], "dwell_seconds": r[6],
-                       "agreed": (None if r[7] is None else bool(r[7]))} for r in rows]}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "open":
-            return _open(ctx, api_key, data)
-        if action == "commit":
-            return _commit(ctx, api_key, data)
-    else:
-        if action == "list":
-            return _list(ctx, api_key)
-        if action == "case":
-            cid = str(data.get("id", "")).strip()
-            if not cid:
-                return {"error": "id_required"}, 400
-            return _case(ctx, api_key, cid)
-        if action == "reviewer":
-            rid = str(data.get("id", "")).strip()
-            if not rid:
-                return {"error": "id_required"}, 400
-            return _reviewer(ctx, api_key, rid)
-    return {"error": "unknown_action", "action": action}, 404
 
 ```

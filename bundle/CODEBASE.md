@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-164 files across 47 parts.
+169 files across 48 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -10,6 +10,7 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/__init__.py`
 - `modules/agentroom.py`
+- `modules/ainews.py`
 - `modules/archive.py`
 - `modules/arm.py`
 - `modules/armall.py`
@@ -89,53 +90,58 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/machine.py`
 - `modules/map.py`
 - `modules/marquee.py`
-- `modules/meter.py`
 
 ## [CODEBASE-15.md](CODEBASE-15.md)
 
+- `modules/mcp.py`
+- `modules/meter.py`
 - `modules/mutual.py`
 - `modules/network.py`
 - `modules/noexec.py`
-- `modules/ots.py`
-- `modules/oversight.py`
 
 ## [CODEBASE-16.md](CODEBASE-16.md)
 
-- `modules/pack.py`
-- `modules/packconsole.py`
+- `modules/notary.py`
 
 ## [CODEBASE-17.md](CODEBASE-17.md)
 
-- `modules/packs.py`
+- `modules/ots.py`
+- `modules/oversight.py`
+- `modules/pack.py`
+- `modules/packconsole.py`
 
 ## [CODEBASE-18.md](CODEBASE-18.md)
+
+- `modules/packs.py`
+
+## [CODEBASE-19.md](CODEBASE-19.md)
 
 - `modules/passport.py`
 - `modules/passportpage.py`
 
-## [CODEBASE-19.md](CODEBASE-19.md)
+## [CODEBASE-20.md](CODEBASE-20.md)
 
 - `modules/peer.py`
 - `modules/peerconsole.py`
 
-## [CODEBASE-20.md](CODEBASE-20.md)
+## [CODEBASE-21.md](CODEBASE-21.md)
 
 - `modules/plugin.py`
 - `modules/praxis.py`
 
-## [CODEBASE-21.md](CODEBASE-21.md)
+## [CODEBASE-22.md](CODEBASE-22.md)
 
 - `modules/prove.py`
 - `modules/publish.py`
 - `modules/pwa.py`
 - `modules/ratchet.py`
 
-## [CODEBASE-22.md](CODEBASE-22.md)
+## [CODEBASE-23.md](CODEBASE-23.md)
 
 - `modules/reconcile.py`
 - `modules/register.py`
 
-## [CODEBASE-23.md](CODEBASE-23.md)
+## [CODEBASE-24.md](CODEBASE-24.md)
 
 - `modules/replay.py`
 - `modules/roster.py`
@@ -143,18 +149,18 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/router.py`
 - `modules/rulebind.py`
 
-## [CODEBASE-24.md](CODEBASE-24.md)
+## [CODEBASE-25.md](CODEBASE-25.md)
 
 - `modules/savings.py`
 - `modules/sebbi_engine.py`
 - `modules/selfcheck.py`
 
-## [CODEBASE-25.md](CODEBASE-25.md)
+## [CODEBASE-26.md](CODEBASE-26.md)
 
 - `modules/signed.py`
 - `modules/sortition.py`
 
-## [CODEBASE-26.md](CODEBASE-26.md)
+## [CODEBASE-27.md](CODEBASE-27.md)
 
 - `modules/sound.py`
 - `modules/spec.py`
@@ -163,27 +169,27 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/startpage.py`
 - `modules/stats.py`
 
-## [CODEBASE-27.md](CODEBASE-27.md)
+## [CODEBASE-28.md](CODEBASE-28.md)
 
 - `modules/studio.py`
 
-## [CODEBASE-28.md](CODEBASE-28.md)
+## [CODEBASE-29.md](CODEBASE-29.md)
 
 - `modules/tokensaver.py`
 
-## [CODEBASE-29.md](CODEBASE-29.md)
+## [CODEBASE-30.md](CODEBASE-30.md)
 
 - `modules/toolspage.py`
 - `modules/verifier.py`
 - `modules/walk.py`
 
-## [CODEBASE-30.md](CODEBASE-30.md)
+## [CODEBASE-31.md](CODEBASE-31.md)
 
 - `modules/wallet.py`
 - `modules/warmup.py`
 - `modules/witness.py`
 
-## [CODEBASE-31.md](CODEBASE-31.md)
+## [CODEBASE-32.md](CODEBASE-32.md)
 
 - `modules/witnessed.py`
 - `ai_act_ranker.py`
@@ -193,23 +199,24 @@ Generated automatically on every push. Do not edit by hand.
 - `anchor.py`
 - `brain.py`
 
-## [CODEBASE-32.md](CODEBASE-32.md)
+## [CODEBASE-33.md](CODEBASE-33.md)
 
+- `forever_verify.py`
 - `gateway_proxy.py`
 - `meshwitness.py`
 - `sebbi_agent.py`
 - `sebbi_benchmark.py`
 - `sebbi_sdk.py`
+
+## [CODEBASE-34.md](CODEBASE-34.md)
+
 - `sebbi_site.py`
-
-## [CODEBASE-33.md](CODEBASE-33.md)
-
 - `sebbi_tokensaver.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 
-## [CODEBASE-34.md](CODEBASE-34.md)
+## [CODEBASE-35.md](CODEBASE-35.md)
 
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
@@ -222,7 +229,7 @@ Generated automatically on every push. Do not edit by hand.
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 
-## [CODEBASE-35.md](CODEBASE-35.md)
+## [CODEBASE-36.md](CODEBASE-36.md)
 
 - `README.md`
 - `admin.html`
@@ -230,26 +237,26 @@ Generated automatically on every push. Do not edit by hand.
 - `ai-txt-kit.html`
 - `aileash-game.html`
 
-## [CODEBASE-36.md](CODEBASE-36.md)
+## [CODEBASE-37.md](CODEBASE-37.md)
 
 - `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
 - `compliance-assistant.html`
 
-## [CODEBASE-37.md](CODEBASE-37.md)
+## [CODEBASE-38.md](CODEBASE-38.md)
 
 - `console.html`
 - `contact.html`
 - `copyright.txt`
 - `data-protection.html`
 
-## [CODEBASE-38.md](CODEBASE-38.md)
+## [CODEBASE-39.md](CODEBASE-39.md)
 
 - `developers.html`
 - `dis.txt`
 
-## [CODEBASE-39.md](CODEBASE-39.md)
+## [CODEBASE-40.md](CODEBASE-40.md)
 
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
@@ -258,11 +265,11 @@ Generated automatically on every push. Do not edit by hand.
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-40.md](CODEBASE-40.md)
+## [CODEBASE-41.md](CODEBASE-41.md)
 
 - `index.html`
 
-## [CODEBASE-41.md](CODEBASE-41.md)
+## [CODEBASE-42.md](CODEBASE-42.md)
 
 - `integration-docs.html`
 - `investor-prospectus.html`
@@ -271,7 +278,7 @@ Generated automatically on every push. Do not edit by hand.
 - `llms.txt`
 - `map.html`
 
-## [CODEBASE-42.md](CODEBASE-42.md)
+## [CODEBASE-43.md](CODEBASE-43.md)
 
 - `notary.html`
 - `pack.html`
@@ -280,13 +287,13 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-43.md](CODEBASE-43.md)
+## [CODEBASE-44.md](CODEBASE-44.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-44.md](CODEBASE-44.md)
+## [CODEBASE-45.md](CODEBASE-45.md)
 
 - `scan.html`
 - `seal.html`
@@ -294,16 +301,17 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-45.md](CODEBASE-45.md)
+## [CODEBASE-46.md](CODEBASE-46.md)
 
 - `sonicboom.html`
+- `terms.html`
 
-## [CODEBASE-46.md](CODEBASE-46.md)
+## [CODEBASE-47.md](CODEBASE-47.md)
 
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-47.md](CODEBASE-47.md)
+## [CODEBASE-48.md](CODEBASE-48.md)
 
 - `whitepaper.html`
 

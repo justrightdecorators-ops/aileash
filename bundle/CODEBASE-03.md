@@ -1,4 +1,4 @@
-# Codebase — part 3 of 47
+# Codebase — part 3 of 48
 
 Contains:
 - `modules/bind.py`
@@ -1476,7 +1476,7 @@ def handle(method, action, data, api_key, ctx):
 
 ## `modules/brand.py`
 
-217 lines, 8057 bytes
+217 lines, 8075 bytes
 
 ```python
 """
@@ -1499,7 +1499,7 @@ unbuffered. HTML is rewritten and its Content-Length corrected.
 
 LEFT AS THEY ARE, ON PURPOSE
 ----------------------------
-  /data-protection, /risk-policy, /human-oversight   the law and auditors
+  /terms, /data-protection, /risk-policy, /human-oversight   the law and auditors
       expect the privacy notice and policies to name who is responsible
   /investor-prospectus                                investors expect the founder
   /admin, /console and other operator screens         your own tools
@@ -1543,7 +1543,7 @@ RULES = [
 ]
 RULES_B = [(a.encode("utf-8"), b.encode("utf-8")) for a, b in RULES]
 
-SKIP_PATHS = ("/data-protection", "/risk-policy", "/human-oversight", "/investor-prospectus",
+SKIP_PATHS = ("/terms", "/data-protection", "/risk-policy", "/human-oversight", "/investor-prospectus",
               "/admin", "/console", "/peers", "/pack", "/lineage-desk")
 
 _state = {"installed": False, "on": True, "rewritten": 0, "replacements": 0, "last_error": None}

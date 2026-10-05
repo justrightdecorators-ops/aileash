@@ -1,4 +1,4 @@
-# Codebase — part 5 of 47
+# Codebase — part 5 of 48
 
 Contains:
 - `modules/conformance.py`
@@ -354,18 +354,21 @@ def handle(method, action, data, api_key, ctx):
 
 ## `modules/connect.py`
 
-790 lines, 56954 bytes
+823 lines, 60047 bytes
 
 ```python
 """
-modules/connect.py  v1.0.0  -  plug your AI in, build your own rules
+modules/connect.py  v1.1.0  -  plug your AI in, build your own rules
 
     Pages:  https://sebbi.pro/connect   hook any AI up to sebbi.pro
             https://sebbi.pro/build     build a Signal Pack, rule by rule
     Arm:    https://sebbi.pro/x/arm/status
 
 /connect
-    Get a key (or paste one), pick how you build - Python, Node, cURL, an
+    Leads with the AI-assistant route: add https://sebbi.pro/mcp to Claude,
+    ChatGPT, Cursor, VS Code or Claude Code and the assistant does the setup
+    (served by modules/mcp.py). Then the manual route:
+    get a key (or paste one), pick how you build - Python, Node, cURL, an
     OpenAI or Anthropic app, LangChain, Lovable, Bolt, Replit, Cursor, v0,
     Zapier, Make, n8n - and get the exact snippet or prompt with your key
     in it. Then fire a real decision from the page and watch it land in the
@@ -390,7 +393,7 @@ exist: /signup, /api/govern, /x/packs/validate, /x/packs/publish.
 import sys
 import threading
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PUBLIC = {("GET", "status"), ("GET", "spec")}
 
 FEATURE_ARTICLE = "https://aibusiness.vc/startups/sebbi-aileash-justin-dobson-seal-every-ai-decision"
@@ -695,12 +698,24 @@ CONNECT_PAGE = HEAD + r"""
 .next a{display:block;padding:20px;text-decoration:none;color:var(--parch);border-right:1px solid var(--line);background:var(--deep)}
 .next a:last-child{border-right:0}.next a:hover{background:var(--raise)}
 .next b{display:block;font-family:var(--serif);font-weight:500;font-size:20px;color:#fff;margin-bottom:4px}.next span{font-size:14px;color:var(--mut)}
+
+.ai{padding:10px 0 46px}
+.mcp{margin-top:20px;border:1px solid var(--gold);border-radius:18px;padding:22px;background:linear-gradient(160deg,rgba(201,168,76,.10),rgba(13,20,38,1) 55%)}
+.mcp-url{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.mcp-url span{font-family:var(--mono);font-size:clamp(17px,2.6vw,24px);color:#fff;word-break:break-all}
+.mcp-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:20px;border-top:1px solid var(--line)}
+@media(max-width:760px){.mcp-grid{grid-template-columns:1fr}}
+.mcp-grid div{padding:14px 14px 14px 0;border-bottom:1px solid var(--line)}
+.mcp-grid b{display:block;font-family:var(--serif);font-weight:500;font-size:19px;color:#fff;margin-bottom:4px}
+.mcp-grid span{font-size:14px;color:var(--mut)}
+.mcp-grid code{font-family:var(--mono);font-size:12px;color:var(--live);word-break:break-all}
+.mcp-grid .btn{padding:9px 16px;font-size:14px;margin-top:2px}
 </style></head><body>
 """ + NAV.replace("__C", "on").replace("__B", "") + r"""
 <div class="wrap">
 <section class="hero">
 <h1>Plug your AI into<br>sebbi.pro.</h1>
-<p class="lede">Every decision your AI makes, scored in under 30 milliseconds and sealed into a chain nobody can quietly edit. Pick how you build, copy one snippet, and watch your first decision land.</p>
+<p class="lede">Every decision your AI makes, scored in under 30 milliseconds and sealed into a chain nobody can quietly edit. Pick how you build, copy one snippet, and watch your first decision land. Or <a href="#ai">let your AI assistant do the whole thing</a>.</p>
 <div class="wire" id="wire" aria-live="polite">
  <div class="wire-row">
   <div class="node" id="n1"><small>Your AI</small><strong id="n1t">Waiting for a decision</strong><div class="v" id="n1v">refund · £120 · customer-42</div></div>
@@ -711,6 +726,23 @@ CONNECT_PAGE = HEAD + r"""
  </div>
  <div class="btns"><button class="btn" id="fire">Fire a test decision</button><span class="msg" id="fmsg">Add your key in step one first.</span></div>
  <div class="btns" id="after" style="display:none"><a class="btn ghost" id="lblock" href="#">Open the block</a><a class="btn ghost" id="lrep" href="#">Machine-proof report</a></div>
+</div>
+</section>
+
+<section class="ai" id="ai">
+<h2>Or let your AI do all of it.</h2>
+<p class="hint">Add sebbi.pro to your AI assistant once. Then just ask it: "set me up on sebbi.pro". It reads the products, advises on the right setup for how you build, shows you the terms, opens your account, writes the code or the prompt, fires your first decision, builds your rules and sets up billing, all in the conversation.</p>
+<div class="mcp">
+ <div class="mcp-url"><span id="murl">https://sebbi.pro/mcp</span><button class="btn" id="mcopy">Copy connector link</button></div>
+ <div class="mcp-grid">
+  <div><b>Claude</b><span>Open <a href="https://claude.ai/settings/connectors" rel="noopener">Settings, then Connectors</a>, choose Add custom connector and paste the link.</span></div>
+  <div><b>ChatGPT</b><span>Add a custom connector in Settings and paste the link.</span></div>
+  <div><b>Cursor</b><span><a class="btn ghost" href="cursor://anysphere.cursor-deeplink/mcp/install?name=sebbi&config=eyJ1cmwiOiAiaHR0cHM6Ly9zZWJiaS5wcm8vbWNwIn0=">Add to Cursor</a></span></div>
+  <div><b>VS Code</b><span><a class="btn ghost" href="vscode:mcp/install?%7B%22name%22%3A%20%22sebbi%22%2C%20%22type%22%3A%20%22http%22%2C%20%22url%22%3A%20%22https%3A//sebbi.pro/mcp%22%7D">Add to VS Code</a></span></div>
+  <div><b>Claude Code</b><span><code id="ccmd">claude mcp add --transport http sebbi https://sebbi.pro/mcp</code></span></div>
+  <div><b>Anything else</b><span>Any assistant that takes an MCP server link works with the same address.</span></div>
+ </div>
+ <p class="hint" style="margin-top:14px">Same terms as signing up here: free for 90 days, then 50p per device per month. Your assistant shows you the terms before anything is opened, and your agreement is sealed with a receipt.</p>
 </div>
 </section>
 
@@ -905,6 +937,7 @@ function show(k){cur=k;$$('.stack button').forEach(b=>b.classList.toggle('on',b.
  $('#snip').innerHTML='<p class="how">'+s.how+'</p>'+(s.tool?'<a class="tool" href="'+s.tool[1]+'" rel="noopener">'+s.tool[0]+'</a>':'')+'<pre id="code">'+esc(s.code())+'</pre><div class="btns"><button class="btn ghost" id="copy">Copy</button></div>';
  $('#copy').onclick=()=>{navigator.clipboard.writeText(s.code());$('#copy').textContent='Copied'}}
 $$('.stack button').forEach(b=>b.onclick=()=>show(b.dataset.s));show('python');
+$('#mcopy').onclick=()=>{navigator.clipboard.writeText('https://sebbi.pro/mcp');$('#mcopy').textContent='Copied'};
 $('#fire').onclick=async()=>{if(!KEY){$('#fmsg').textContent='Add your key in step one first.';$('#fmsg').className='msg err';document.querySelector('#t-new').scrollIntoView({behavior:'smooth'});return}
  const w=$('#wire'),f=$('#fire');f.disabled=true;w.classList.remove('go');void w.offsetWidth;['n1','n2','n3'].forEach(n=>$('#'+n).classList.remove('lit'));
  $('#n1t').textContent='Refund, £120';$('#n1').classList.add('lit');$('#fmsg').textContent='Sending…';$('#fmsg').className='msg';
