@@ -340,6 +340,26 @@ console.log(JSON.stringify({ok:r.ok,height:r.height,bad:r2.ok,steps}))})().catch
     except FileNotFoundError:
         print("  note node not installed - browser verifier not run")
 
+    # every file of the code
+    st, cbx, _ = http_("GET", "/x/notary/codebase")
+    paths = {f["path"] for f in cbx.get("files", [])}
+    chk("every code file sealed", {"server.py", "modules/notary.py", "forever_verify.py"} <= paths and cbx["files_sealed"] >= 100, len(paths))
+    chk("no data or secrets read", not any(x.endswith((".db", ".pem", ".key")) or "/.git/" in "/" + x or x.startswith(".env") for x in paths),
+        [x for x in paths if x.endswith(".db")])
+    chk("codebase snapshot", cbx.get("snapshot", {}).get("files") == cbx["files_sealed"], cbx.get("snapshot"))
+    st, man, _ = http_("GET", "/bitcoin/code/manifest.txt", raw=True)
+    line = [l for l in man.decode().splitlines() if l.endswith("  forever_verify.py")]
+    chk("manifest matches the real file", line and line[0].split()[0] == hashlib.sha256(open("forever_verify.py", "rb").read()).hexdigest()
+        and hashlib.sha256(man).hexdigest() == cbx["snapshot"]["digest"], line)
+    fv = [f for f in cbx["files"] if f["path"] == "forever_verify.py"][0]
+    chk("code file confirmed in Bitcoin", fv["state"] == "confirmed" and fv["bitcoin_block"], fv)
+    st, cbund, _ = http_("GET", "/x/notary/bundle?code=" + fv["code"])
+    chk("code file Forever Proof against the real file", FV.check(cbund, explorers=EXPL, file_bytes=open("forever_verify.py", "rb").read())["ok"])
+    st, pg, _ = http_("GET", "/bitcoin/code", raw=True)
+    chk("code page", st == 200 and b"Every file" in pg, st)
+    st, r2, _ = http_("POST", "/x/notary/run", {}, {"Authorization": "Bearer " + key})
+    chk("unchanged files are not sealed twice", r2.get("codebase", {}).get("new_or_changed") == 0 and r2["codebase"]["snapshot"] == "unchanged", r2.get("codebase"))
+
     # AI connector tools
     st, tl, _ = rpc("tools/list")
     names = [t["name"] for t in tl["result"]["tools"]]
