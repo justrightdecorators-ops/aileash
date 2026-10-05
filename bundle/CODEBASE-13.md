@@ -1,11 +1,300 @@
 # Codebase — part 13 of 45
 
 Contains:
+- `modules/meter.py`
 - `modules/mutual.py`
 - `modules/network.py`
 - `modules/noexec.py`
 - `modules/ots.py`
-- `modules/oversight.py`
+
+
+## `modules/meter.py`
+
+281 lines, 10630 bytes
+
+```python
+"""
+modules/meter.py  v1.0.0
+The 50p device meter, done per device per month - without touching server.py.
+
+Armed by https://sebbi.pro/x/meter/status after each deploy, it swaps these
+functions inside the running server for new versions (same names, same
+callers, nothing in server.py edited):
+
+  record_device(api_key, device_id)
+      Counts each distinct device a key sends in a calendar month (UTC), once,
+      however many decisions it makes. Resets every month. Reading the count
+      is a single-row lookup, so it holds at millions of devices per key.
+      The engine (/api/govern) and the plug-in log (public_proof_adapter.py)
+      both call this, so one central server acting for 20 million phones is
+      billed for 20 million devices.
+
+  device_count(api_key)
+      What the key is billed for: the larger of last month's full count and
+      this month so far. Growth is billed straight away; a customer who
+      shrinks pays less the month after. Used by the trial-end checkout,
+      /api/usage and the trial-expired answers.
+
+  sync_stripe_quantities()
+      The existing 6-hourly Stripe job now sets each paying subscription to
+      device_count() - up or down - so every renewal charges 50p for each
+      device actually used.
+
+On first arming, each key's existing all-time device count is carried into
+last month, so nobody's bill drops while the monthly count builds up.
+
+Watch for keys stamping one device id on a whole network:
+    https://sebbi.pro/admin/meter      (your admin login)
+Public summary (no keys shown):
+    https://sebbi.pro/x/meter/status
+"""
+
+import json
+import sys
+import threading
+import time
+from collections import defaultdict
+
+VERSION = "1.0.0"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
+RATE_GBP = 0.50
+FLAG_EVENTS_PER_DEVICE = 10000
+CACHE_MAX = 500000
+
+_srv = None
+_armed = False
+_patched_http = False
+_cache = {}
+_lock = threading.Lock()
+_events = defaultdict(int)
+_orig = {}
+
+
+def _month(ts=None):
+    return time.strftime("%Y-%m", time.gmtime(ts if ts is not None else time.time()))
+
+
+def _prev_month(ts=None):
+    t = time.gmtime(ts if ts is not None else time.time())
+    y, m = t.tm_year, t.tm_mon - 1
+    if m == 0:
+        y, m = y - 1, 12
+    return "%04d-%02d" % (y, m)
+
+
+def _find_server():
+    for name in ("__main__", "server"):
+        m = sys.modules.get(name)
+        if m is not None and hasattr(m, "record_device") and hasattr(m, "_conn") and hasattr(m, "_db_lock"):
+            return m
+    return None
+
+
+# ---------------------------------------------------------------- the meter
+
+def _setup(s):
+    with s._db_lock:
+        c = s._conn
+        c.execute("CREATE TABLE IF NOT EXISTS device_month(api_key TEXT,month TEXT,device_id TEXT,first_seen REAL,"
+                  "PRIMARY KEY(api_key,month,device_id)) WITHOUT ROWID")
+        c.execute("CREATE TABLE IF NOT EXISTS device_month_count(api_key TEXT,month TEXT,n INTEGER DEFAULT 0,"
+                  "PRIMARY KEY(api_key,month)) WITHOUT ROWID")
+        c.execute("CREATE TABLE IF NOT EXISTS config(k TEXT PRIMARY KEY,v TEXT)")
+        if not c.execute("SELECT 1 FROM config WHERE k='meter_v2_seeded'").fetchone():
+            c.execute("INSERT OR IGNORE INTO device_month_count(api_key,month,n) "
+                      "SELECT api_key,?,COUNT(*) FROM device_seen GROUP BY api_key", (_prev_month(),))
+            c.execute("INSERT OR REPLACE INTO config(k,v) VALUES('meter_v2_seeded',?)", (str(time.time()),))
+        c.commit()
+
+
+def month_count(api_key, month=None):
+    s = _srv
+    with s._db_lock:
+        try:
+            r = s._conn.execute("SELECT n FROM device_month_count WHERE api_key=? AND month=?",
+                                (api_key, month or _month())).fetchone()
+            return r[0] if r else 0
+        except Exception:
+            return 0
+
+
+def device_count(api_key):
+    """Billable devices: the larger of last month's full count and this month so far."""
+    return max(month_count(api_key, _prev_month()), month_count(api_key))
+
+
+def record_device(api_key, device_id):
+    """Count device_id on api_key for this calendar month. Returns the billable count."""
+    if not api_key or not device_id:
+        return None
+    s = _srv
+    device_id = str(device_id)[:200]
+    mon = _month()
+    ck = (api_key, mon, device_id)
+    with _lock:
+        _events[(api_key, mon)] += 1
+        hit = ck in _cache
+    if not hit:
+        with s._db_lock:
+            try:
+                c = s._conn
+                cur = c.execute("INSERT OR IGNORE INTO device_month(api_key,month,device_id,first_seen) VALUES(?,?,?,?)",
+                                (api_key, mon, device_id, time.time()))
+                if cur.rowcount == 1:
+                    c.execute("INSERT OR IGNORE INTO device_month_count(api_key,month,n) VALUES(?,?,0)", (api_key, mon))
+                    c.execute("UPDATE device_month_count SET n=n+1 WHERE api_key=? AND month=?", (api_key, mon))
+                    c.execute("INSERT OR IGNORE INTO device_seen(api_key,device_id,first_seen) VALUES(?,?,?)",
+                              (api_key, device_id, time.time()))
+                c.commit()
+            except Exception as e:
+                try:
+                    s._conn.rollback()
+                except Exception:
+                    pass
+                print("meter record_device err:" + str(e), flush=True)
+                return None
+        with _lock:
+            if len(_cache) >= CACHE_MAX:
+                _cache.clear()
+            _cache[ck] = 1
+    return device_count(api_key)
+
+
+def sync_stripe_quantities():
+    """Set each paying subscription's quantity to the billable device count, up or down."""
+    s = _srv
+    if not getattr(s, "STRIPE_SECRET", ""):
+        print("QSYNC skip: no STRIPE_SECRET", flush=True)
+        return
+    with s._db_lock:
+        rows = s._conn.execute("SELECT key,email,stripe_sub FROM api_keys WHERE is_paid=1 AND active=1 "
+                               "AND stripe_sub!=''").fetchall()
+    for key, email, sub_id in rows:
+        try:
+            n = device_count(key)
+            if not n:
+                continue
+            sub = s.stripe_call("GET", "/subscriptions/" + sub_id)
+            if not sub or "items" not in sub:
+                print("QSYNC no sub for " + email, flush=True)
+                continue
+            items = sub["items"].get("data", [])
+            if not items:
+                continue
+            item = items[0]
+            current = int(item.get("quantity", 0) or 0)
+            if n != current:
+                r = s.stripe_call("POST", "/subscription_items/" + item["id"],
+                                  {"quantity": str(n), "proration_behavior": "none"})
+                if r and "id" in r:
+                    print("QSYNC " + email + ": " + str(current) + " -> " + str(n) + " devices", flush=True)
+                else:
+                    print("QSYNC FAIL " + email, flush=True)
+        except Exception as e:
+            print("QSYNC ERR " + email + ": " + str(e), flush=True)
+
+
+def watch(limit=200):
+    mon = _month()
+    with _lock:
+        ev = [(k, n) for (k, m), n in _events.items() if m == mon]
+    out = []
+    for k, n in ev:
+        d = month_count(k) or 1
+        out.append({"key_prefix": k[:12], "events_this_month": n, "devices_this_month": d,
+                    "events_per_device": round(n / float(d), 1), "flag": n / float(d) >= FLAG_EVENTS_PER_DEVICE})
+    out.sort(key=lambda x: -x["events_per_device"])
+    return out[:limit]
+
+
+# ---------------------------------------------------------------- arming
+
+def _arm():
+    global _srv, _armed
+    s = _find_server()
+    if s is None:
+        return False
+    _srv = s
+    _setup(s)
+    if not _armed:
+        for name in ("record_device", "device_count", "sync_stripe_quantities"):
+            _orig.setdefault(name, getattr(s, name, None))
+        s.record_device = record_device
+        s.device_count = device_count
+        s.sync_stripe_quantities = sync_stripe_quantities
+        _armed = True
+    return True
+
+
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        o = f.f_locals.get("self")
+        if o is not None and hasattr(type(o), "do_GET") and hasattr(o, "wfile"):
+            return type(o)
+        f = f.f_back
+    return None
+
+
+def _install_http(ctx):
+    """Serve /admin/meter behind the server's own admin login."""
+    global _patched_http
+    if _patched_http:
+        return True
+    cls = _find_handler_class(ctx)
+    if cls is None:
+        return False
+    if getattr(cls, "_meter_patched", False):
+        _patched_http = True
+        return True
+    og = cls.do_GET
+
+    def do_GET(self):
+        if self.path.split("?")[0].rstrip("/") == "/admin/meter":
+            ok = False
+            try:
+                ok = bool(_srv and _srv.check_admin(self))
+            except Exception:
+                ok = False
+            body = json.dumps({"error": "unauthorized"} if not ok else
+                              {"month": _month(), "rate_per_device_gbp": RATE_GBP, "keys": watch(),
+                               "flag_rule": "%d or more events per device this month - check the key is sending "
+                                            "real device ids" % FLAG_EVENTS_PER_DEVICE}).encode("utf-8")
+            self.send_response(200 if ok else 401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return og(self)
+
+    cls.do_GET = do_GET
+    cls._meter_patched = True
+    _patched_http = True
+    return True
+
+
+def handle(method, action, data, api_key, ctx):
+    armed = _arm()
+    http = _install_http(ctx)
+    flags = [w for w in watch() if w["flag"]] if armed else []
+    return ({"module": "meter", "version": VERSION, "armed": armed and http,
+             "month": _month(), "rate_per_device_gbp": RATE_GBP,
+             "rule": "50p per distinct device per calendar month; billed on the larger of last month and this month so far",
+             "keys_metered_this_month": len(watch()) if armed else 0,
+             "keys_flagged": len(flags),
+             "stripe_sync": "every 6 hours, follows the meter up and down"}, 200)
+
+```
 
 
 ## `modules/mutual.py`
@@ -2309,262 +2598,5 @@ def handle(method, action, data, api_key, ctx):
             return {"ok": False, "error": "api_key_required"}, 401
         return _upgrade(data)
     return {"ok": False, "error": "unknown_action", "action": action}, 404
-
-```
-
-
-## `modules/oversight.py`
-
-249 lines, 11339 bytes
-
-```python
-"""
-Human oversight notary - /x/oversight/<action>
-
-THE PROBLEM
------------
-Nobody can prove a person thought about a decision. That is an internal state
-and no amount of logging reaches it. Any vendor claiming to prove genuine
-human oversight is overselling.
-
-But rubber stamping is not an internal state. It is a pattern, and patterns
-leave marks - if you record the right things, in the right order, at the time.
-
-WHAT THIS DOES
---------------
-Three things, none of which claim to read minds.
-
-1. ORDER. The reviewer's own call is sealed BEFORE the machine's verdict is
-   revealed to them. Two blocks, in that order, in a chain that cannot be
-   reordered afterwards. So a reviewer cannot have simply agreed with an
-   answer they had already seen - the chain shows they committed while it was
-   still hidden.
-
-2. ATTENTION. The gap between opening the case and committing is recorded.
-   A 0.8 second approval sits in the record permanently, next to a two minute
-   one. Not proof of thought - but a 400-case history of sub-second calls is
-   not something anyone can explain away.
-
-3. INDEPENDENCE. Agreement rate over time. A reviewer who has never once
-   diverged from the machine is visible in the data. One who diverges
-   sometimes is demonstrably exercising judgement.
-
-WHAT IT DOES NOT DO
--------------------
-- It cannot prove the reviewer read the material. They can leave a screen open.
-- Dwell time is measurable but gameable by anyone deliberately gaming it.
-- It does not stop a reviewer being wrong. It records that they decided.
-- If the integrating system shows its user the machine verdict before calling
-  /open, this proves nothing. The ordering guarantee is only as good as the
-  integration honouring it. That is a documented limit, not a hidden one.
-
-WHAT IT IS FOR
---------------
-Turning "we have human oversight" from an assertion into a dataset that an
-auditor can test - and that a rubber stamper cannot hide inside.
-
-    POST /x/oversight/open      case_ref, material, machine_verdict, reviewer
-    POST /x/oversight/commit    case_id, reviewer_verdict, reasoning
-    GET  /x/oversight/case?id=OVS-XXXXXXXX
-    GET  /x/oversight/reviewer?id=<reviewer id>
-    GET  /x/oversight/list
-"""
-
-import hashlib, json, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-VERDICTS = {"allow", "block", "challenge", "escalate"}
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS oversight_cases(case_id TEXT PRIMARY KEY,api_key TEXT,case_ref TEXT,reviewer TEXT,material_hash TEXT,machine_verdict TEXT,opened REAL,committed REAL,reviewer_verdict TEXT,agreed INTEGER,dwell REAL,status TEXT DEFAULT 'open')")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_key ON oversight_cases(api_key)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_ovs_rev ON oversight_cases(api_key,reviewer)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _hash(x):
-    if not isinstance(x, str):
-        x = json.dumps(x, sort_keys=True)
-    return hashlib.sha256(x.encode()).hexdigest()
-
-
-def _seal_event(ctx, api_key, cid, action, detail):
-    ts = time.time()
-    ev = {"user_id": "ovs:" + cid, "action": "oversight_" + action, "amount": 0,
-          "country": "UK", "device_id": "oversight", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "OVERSIGHT_SEALED", "score": 0, "oversight_action": action,
-           "oversight_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-    return h, idx, seq, ts
-
-
-def _open(ctx, api_key, data):
-    ref = str(data.get("case_ref", "")).strip()
-    if not ref:
-        return {"error": "case_ref_required"}, 400
-    reviewer = str(data.get("reviewer", "")).strip()
-    if not reviewer:
-        return {"error": "reviewer_required",
-                "message": "Oversight without a named reviewer is not oversight."}, 400
-    material = data.get("material")
-    if material is None:
-        return {"error": "material_required",
-                "message": "Send exactly what the reviewer will see. Only its hash is stored."}, 400
-    mv = str(data.get("machine_verdict", "")).strip().lower()
-    if mv and mv not in VERDICTS:
-        return {"error": "invalid_machine_verdict", "allowed": sorted(VERDICTS)}, 400
-
-    cid = "OVS-" + secrets.token_hex(4).upper()
-    mh = _hash(material)
-    detail = ("ref=" + ref[:80] + ";reviewer=" + reviewer[:60] +
-              ";material_sha256=" + mh + ";machine_verdict_sealed=" + (mv or "none"))
-    h, idx, seq, ts = _seal_event(ctx, api_key, cid, "opened", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO oversight_cases(case_id,api_key,case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status) VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,'open')",
-                            (cid, api_key, ref, reviewer, mh, mv or None, ts))
-        ctx["conn"].commit()
-
-    return {"case_id": cid, "opened": _iso(ts), "material_sha256": mh,
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "machine_verdict": "withheld until commit",
-            "message": "Clock running. Show the reviewer the material, not the verdict."}, 200
-
-
-def _commit(ctx, api_key, data):
-    cid = str(data.get("case_id", "")).strip()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT reviewer,material_hash,machine_verdict,opened,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-    if not row:
-        return {"error": "unknown_case_id"}, 404
-    if row[4] != "open":
-        return {"error": "already_committed",
-                "message": "A reviewer commits once. That is the point."}, 400
-
-    rv = str(data.get("reviewer_verdict", "")).strip().lower()
-    if rv not in VERDICTS:
-        return {"error": "invalid_reviewer_verdict", "allowed": sorted(VERDICTS)}, 400
-    reasoning = str(data.get("reasoning", "")).strip()
-    if not reasoning:
-        return {"error": "reasoning_required",
-                "message": "Sealed at commit, before the machine verdict is revealed. Blank is not permitted."}, 400
-
-    ts = time.time()
-    dwell = round(ts - row[3], 3)
-    agreed = None if not row[2] else (1 if rv == row[2] else 0)
-    detail = ("reviewer_verdict=" + rv + ";dwell_seconds=" + str(dwell) +
-              ";reasoning=" + reasoning[:600])
-    h, idx, seq, _x = _seal_event(ctx, api_key, cid, "committed", detail)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE oversight_cases SET committed=?,reviewer_verdict=?,agreed=?,dwell=?,status='committed' WHERE case_id=? AND api_key=?",
-                            (ts, rv, agreed, dwell, cid, api_key))
-        ctx["conn"].commit()
-
-    out = {"case_id": cid, "reviewer_verdict": rv, "dwell_seconds": dwell,
-           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-           "machine_verdict": row[2],
-           "note": "Your call was sealed before this line was returned. The chain shows the order."}
-    if agreed is not None:
-        out["agreed"] = bool(agreed)
-    if dwell < 2:
-        out["flag"] = "committed in under 2 seconds - recorded permanently"
-    return out, 200
-
-
-def _case(ctx, api_key, cid):
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT case_ref,reviewer,material_hash,machine_verdict,opened,committed,reviewer_verdict,agreed,dwell,status FROM oversight_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-        if not row:
-            return {"error": "unknown_case_id"}, 404
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash,key_seq FROM audit_log WHERE user_id=? ORDER BY id ASC", ("ovs:" + cid,)).fetchall()
-    events = []
-    for ts_, res, ah, seq in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(ts_), "event": r.get("oversight_action"),
-                           "detail": r.get("detail"), "sealed": ah, "receipt_seq": seq})
-        except Exception:
-            pass
-    return {"case_id": cid, "case_ref": row[0], "reviewer": row[1],
-            "material_sha256": row[2], "machine_verdict": row[3],
-            "opened": _iso(row[4]), "committed": _iso(row[5]),
-            "reviewer_verdict": row[6],
-            "agreed": (None if row[7] is None else bool(row[7])),
-            "dwell_seconds": row[8], "status": row[9], "events": events,
-            "ordering_proof": "The opened block precedes the committed block in the chain. Neither can be reordered or altered without breaking every block after it."}, 200
-
-
-def _reviewer(ctx, api_key, rid):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT dwell,agreed FROM oversight_cases WHERE api_key=? AND reviewer=? AND status='committed'", (api_key, rid)).fetchall()
-    if not rows:
-        return {"reviewer": rid, "cases": 0,
-                "note": "No committed cases on record for this reviewer."}, 200
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    scored = [r[1] for r in rows if r[1] is not None]
-    n = len(dwells)
-    median = dwells[n // 2] if n else None
-    under2 = len([d for d in dwells if d < 2])
-    out = {"reviewer": rid, "cases": len(rows),
-           "median_dwell_seconds": median,
-           "fastest_seconds": (dwells[0] if dwells else None),
-           "under_2_seconds": under2,
-           "under_2_seconds_pct": (round(100 * under2 / n, 1) if n else None)}
-    if scored:
-        agree = sum(scored)
-        out["agreement_rate_pct"] = round(100 * agree / len(scored), 1)
-        out["diverged"] = len(scored) - agree
-        if len(scored) >= 20 and agree == len(scored):
-            out["pattern"] = "never diverged from the machine across " + str(len(scored)) + " cases"
-    return out, 200
-
-
-def _list(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT case_id,case_ref,reviewer,opened,status,reviewer_verdict,dwell,agreed FROM oversight_cases WHERE api_key=? ORDER BY opened DESC LIMIT 200", (api_key,)).fetchall()
-    return {"count": len(rows),
-            "cases": [{"case_id": r[0], "case_ref": r[1], "reviewer": r[2],
-                       "opened": _iso(r[3]), "status": r[4],
-                       "reviewer_verdict": r[5], "dwell_seconds": r[6],
-                       "agreed": (None if r[7] is None else bool(r[7]))} for r in rows]}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "open":
-            return _open(ctx, api_key, data)
-        if action == "commit":
-            return _commit(ctx, api_key, data)
-    else:
-        if action == "list":
-            return _list(ctx, api_key)
-        if action == "case":
-            cid = str(data.get("id", "")).strip()
-            if not cid:
-                return {"error": "id_required"}, 400
-            return _case(ctx, api_key, cid)
-        if action == "reviewer":
-            rid = str(data.get("id", "")).strip()
-            if not rid:
-                return {"error": "id_required"}, 400
-            return _reviewer(ctx, api_key, rid)
-    return {"error": "unknown_action", "action": action}, 404
 
 ```
