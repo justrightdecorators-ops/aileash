@@ -1,5 +1,5 @@
 """
-modules/arm.py  v1.0.0
+modules/arm.py  v1.0.1
 One tap arms everything:  https://sebbi.pro/x/arm/status
 
 Every Railway deploy clears the page hooks that modules add. This finds every
@@ -13,13 +13,18 @@ never needs updating - and arms each one in the right order:
 It answers with each module's name, version and whether it armed, so one
 look tells you the whole site is up. A module that fails is reported and
 skipped; it never stops the others.
+
+v1.0.1: two taps at once now run one after the other, so a double tap or a
+browser retrying a slow first tap never has two threads patching the page
+handler at the same moment.
 """
 
 import importlib
 import os
+import threading
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PUBLIC = {("GET", "status"), ("GET", "spec")}
 
 FIRST = ["meter"]
@@ -40,7 +45,15 @@ def _load(name):
     return importlib.import_module(pkg + "." + name if pkg else name)
 
 
+_run_lock = threading.Lock()
+
+
 def handle(method, action, data, api_key, ctx):
+    with _run_lock:
+        return _arm_all(ctx)
+
+
+def _arm_all(ctx):
     started = time.time()
     results, ok, failed = [], 0, 0
     for name in _names():

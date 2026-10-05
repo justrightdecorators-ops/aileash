@@ -952,6 +952,10 @@ def arm(ctx=None):
     _setup(s._conn, s._db_lock)
     _start_writer()
     _wrap_seal()
+    # modules armed after this one in the same pass (heartbeat, witness...)
+    # keep the ctx they were armed with; hand them the capturing seal
+    if isinstance(ctx, dict) and "seal" in ctx and _state["wrapped"]:
+        ctx["seal"] = s.seal
     _install_page()
     _start_root_thread()
     _state["ready"] = True
