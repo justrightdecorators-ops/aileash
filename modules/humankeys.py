@@ -1,5 +1,5 @@
 """
-modules/humankeys.py  v1.0.0  -  Human Keys: proof a human typed it
+modules/humankeys.py  v1.1.0  -  Human Keys: proof a human typed it
 
     Page:    https://sebbi.pro/keys
     Check:   https://sebbi.pro/k/<code>
@@ -42,17 +42,21 @@ thrown away; only summary figures are kept. Nothing identifies the typist.
 
 PRICE
 -----
-50p per sealed proof, paid from the same credit wallet as Monop Studio
-(top up once at https://sebbi.pro/credits). Checking a proof is free, always.
-Businesses seal with their API key instead, for review sign-offs:
-POST /x/humankeys/seal with "reference" set to the decision block or case.
+50p a month, unlimited proofs - the same as everything else on sebbi.pro.
+The first proof takes 50p from the credit wallet (the same wallet as Monop
+Studio, topped up at https://sebbi.pro/credits) and opens a 30-day pass;
+every proof in those 30 days is free. Checking a proof is free, always.
+Businesses seal with their API key instead - included in the 50p per device
+per month they already pay. POST /x/humankeys/seal with "reference" set to
+the decision block or case.
 
 ROUTES
 ------
   GET  /x/humankeys/status            public
   GET  /x/humankeys/spec              public
   GET  /x/humankeys/challenge         public - start a typing session
-  POST /x/humankeys/seal              public with a credit wallet (50p), or API key
+  POST /x/humankeys/seal              public with a 50p monthly pass, or API key
+  GET  /x/humankeys/pass?viewer=      public - is this wallet's pass active
   GET  /x/humankeys/check?code=       public - the sealed record
   POST /x/humankeys/compare           public - {code, text_hash}: does it match
   GET  /keys                          the keyboard
@@ -78,14 +82,15 @@ try:
 except Exception:
     _UK = None
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PRICE_PENCE = 50
+PASS_DAYS = 30
 CHALLENGE_TTL = 4 * 3600
 MIN_KEYS = 30
 MAX_INTERVALS = 6000
 
 PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "challenge"), ("POST", "seal"),
-          ("GET", "check"), ("POST", "compare")}
+          ("GET", "check"), ("POST", "compare"), ("GET", "pass")}
 
 CODE_RE = re.compile(r"^HK-[A-Z2-9]{4}-[A-Z2-9]{4}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -135,6 +140,8 @@ def _setup():
                         "summary_json TEXT, challenge_json TEXT, sealed_at REAL,"
                         "block_index INTEGER, audit_hash TEXT, payer TEXT, reference TEXT)")
         s._conn.execute("CREATE INDEX IF NOT EXISTS idx_hk_hash ON humankeys_proof(text_hash)")
+        s._conn.execute("CREATE TABLE IF NOT EXISTS humankeys_pass("
+                        "viewer TEXT PRIMARY KEY, paid_at REAL, expires REAL, months INTEGER DEFAULT 0)")
         s._conn.commit()
 
 
@@ -309,29 +316,63 @@ VERDICT_TEXT = {
 # sealing and payment
 # ---------------------------------------------------------------------
 
-def _debit(viewer):
+def _pass(viewer):
+    """(active, expires) for a wallet's monthly pass."""
     s = _srv()
+    with s._db_lock:
+        r = s._conn.execute("SELECT expires FROM humankeys_pass WHERE viewer=?", (viewer,)).fetchone()
+    if r and r[0] > time.time():
+        return True, r[0]
+    return False, (r[0] if r else None)
+
+
+def _balance(viewer):
+    s = _srv()
+    with s._db_lock:
+        try:
+            r = s._conn.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()
+            return r[0] if r else 0
+        except Exception:
+            return 0
+
+
+def _buy_pass(viewer):
+    """Take 50p and open a 30-day pass. Returns (ok, expires, balance)."""
+    s = _srv()
+    now = time.time()
     with s._db_lock:
         try:
             cur = s._conn.execute("UPDATE credit_viewer SET balance=balance-?, spent=spent+? "
                                   "WHERE id=? AND balance>=?", (PRICE_PENCE, PRICE_PENCE, viewer, PRICE_PENCE))
-            s._conn.commit()
             ok = cur.rowcount == 1
         except Exception:
             ok = False
-        try:
-            r = s._conn.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()
-            bal = r[0] if r else 0
-        except Exception:
-            bal = 0
-    return ok, bal
+        if ok:
+            exp = now + PASS_DAYS * 86400
+            s._conn.execute("INSERT INTO humankeys_pass(viewer,paid_at,expires,months) VALUES(?,?,?,1) "
+                            "ON CONFLICT(viewer) DO UPDATE SET paid_at=excluded.paid_at, "
+                            "expires=excluded.expires, months=months+1", (viewer, now, exp))
+        s._conn.commit()
+    bal = _balance(viewer)
+    if not ok:
+        return False, None, bal
+    try:
+        ev = {"user_id": "humankeys", "action": "monthly_pass", "amount": 0, "country": "UK",
+              "device_id": "humankeys", "anomaly": 0, "device_risk": 0}
+        s.seal(ev, {"decision": "PASS_PURCHASED", "score": 0, "version": VERSION, "timestamp": now,
+                    "price_pence": PRICE_PENCE, "days": PASS_DAYS,
+                    "wallet": hashlib.sha256(viewer.encode()).hexdigest()[:16]}, now)
+    except Exception as e:
+        _state["last_error"] = "pass seal: %s" % e
+    return True, now + PASS_DAYS * 86400, bal
 
 
-def _refund(viewer):
+def _refund_pass(viewer):
     s = _srv()
     with s._db_lock:
         s._conn.execute("UPDATE credit_viewer SET balance=balance+?, spent=spent-? WHERE id=?",
                         (PRICE_PENCE, PRICE_PENCE, viewer))
+        s._conn.execute("UPDATE humankeys_pass SET expires=paid_at WHERE viewer=?", (viewer,))
         s._conn.commit()
 
 
@@ -352,6 +393,7 @@ def _seal(data, api_key):
 
     reference = str(data.get("reference", ""))[:120] or None
     viewer = str(data.get("viewer", "")).strip()
+    expires = None
     if api_key and s.get_key(api_key):
         payer = "key:" + hashlib.sha256(api_key.encode()).hexdigest()[:16]
         paid = None
@@ -360,11 +402,15 @@ def _seal(data, api_key):
         if not VIEWER_RE.match(viewer):
             return {"error": "wallet_needed", "message": "Top up once at https://sebbi.pro/credits",
                     "price_pence": PRICE_PENCE}, 402
-        paid, balance = _debit(viewer)
-        if not paid:
-            return {"sealed": False, "reason": "not_enough_credit", "price_pence": PRICE_PENCE,
-                    "balance_pence": balance, "topup": "https://sebbi.pro/credits",
-                    "message": "A proof is 50p. Top up and seal it straight away."}, 402
+        active, expires = _pass(viewer)
+        if active:
+            paid, balance = False, _balance(viewer)
+        else:
+            paid, expires, balance = _buy_pass(viewer)
+            if not paid:
+                return {"sealed": False, "reason": "pass_needed", "price_pence": PRICE_PENCE,
+                        "balance_pence": balance, "topup": "https://sebbi.pro/credits",
+                        "message": "Human Keys is 50p a month for unlimited proofs. Top up and seal straight away."}, 402
         payer = "credit:" + hashlib.sha256(viewer.encode()).hexdigest()[:16]
 
     code = _new_code()
@@ -378,13 +424,13 @@ def _seal(data, api_key):
               "beacon": (ch.get("beacon") or {}).get("round"),
               "beacon_value": (ch.get("beacon") or {}).get("value"),
               "chain_tip_at_start": (ch.get("beacon") or {}).get("chain_tip"),
-              "reference": reference, "price_pence": PRICE_PENCE if paid else 0}
+              "reference": reference, "pass_purchased": bool(paid)}
     try:
         out = s.seal(event, result, ts)
         h, idx = out[0], out[1]
     except Exception as e:
         if paid:
-            _refund(viewer)
+            _refund_pass(viewer)
         return {"error": "seal_failed", "detail": str(e)[:160]}, 500
     with s._db_lock:
         s._conn.execute("INSERT INTO humankeys_proof VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -398,6 +444,9 @@ def _seal(data, api_key):
            "badge": "https://sebbi.pro/k/%s.svg" % code}
     if balance is not None:
         out["balance_pence"] = balance
+    if expires:
+        out["pass_until_uk"] = _uk(expires)
+        out["pass_purchased_now"] = bool(paid)
     return out, 200
 
 
@@ -508,12 +557,12 @@ def handle(method, action, data, api_key, ctx):
         with s._db_lock:
             n = s._conn.execute("SELECT COUNT(*) FROM humankeys_proof").fetchone()[0]
         return {"module": "humankeys", "version": VERSION, "armed": _state["page"],
-                "page": "https://sebbi.pro/keys", "proofs_sealed": n, "price_pence": PRICE_PENCE,
+                "page": "https://sebbi.pro/keys", "proofs_sealed": n, "price": "50p a month, unlimited proofs",
                 "last_error": _state["last_error"]}, 200
     if action == "spec":
         return {"module": "humankeys", "version": VERSION,
                 "what": "Proof a human typed a text, live. The text never leaves the device; its fingerprint and a score of the typing rhythm are sealed.",
-                "price": "50p per proof from the credit wallet, or included with an API key. Checking is free.",
+                "price": "50p a month for unlimited proofs, from the credit wallet, or included with an API key. Checking is free.",
                 "verdicts": VERDICT_TEXT,
                 "routes": {"challenge": "GET https://sebbi.pro/x/humankeys/challenge",
                            "seal": "POST https://sebbi.pro/x/humankeys/seal {challenge, sig, text_hash, intervals, counts, viewer | API key, reference}",
@@ -523,6 +572,13 @@ def handle(method, action, data, api_key, ctx):
                 "text_hash": "SHA-256 of the text as UTF-8, after normalising to NFC, converting line endings to \\n and trimming the ends."}, 200
     if action == "challenge" and method == "GET":
         return _challenge(), 200
+    if action == "pass" and method == "GET":
+        v = str(data.get("viewer", "")).strip()
+        if not VIEWER_RE.match(v):
+            return {"error": "viewer needed"}, 400
+        active, exp = _pass(v)
+        return {"active": active, "until_uk": _uk(exp) if exp else None, "price_pence": PRICE_PENCE,
+                "days": PASS_DAYS, "balance_pence": _balance(v)}, 200
     if action == "seal" and method == "POST":
         return _seal(data, api_key)
     if action == "check" and method == "GET":
@@ -591,7 +647,7 @@ footer a{color:var(--gold);text-decoration:none}
 
 KEYS_PAGE = _HEAD + r"""
 <title>Human Keys · proof a human typed it</title>
-<meta name="description" content="Type it here and get a sealed code that proves a human typed it, live, not pasted or generated. 50p per proof. Checking is free.">
+<meta name="description" content="Type it here and get a sealed code that proves a human typed it, live, not pasted or generated. 50p a month, unlimited proofs. Checking is free.">
 </head><body>
 <div class="top"><div class="wrap"><a class="brand" href="https://sebbi.pro/">AI<b>Leash</b> · Human Keys</a><a class="l" href="https://sebbi.pro/k/">Check a code</a></div></div>
 <div class="wrap">
@@ -601,7 +657,7 @@ KEYS_PAGE = _HEAD + r"""
 
 <div class="how">
 <div><b>01 · TYPE</b><p>Write it here, by hand. Your words stay on your phone.</p></div>
-<div><b>02 · SEAL · 50P</b><p>The rhythm is scored and sealed with a public clock nobody can predict.</p></div>
+<div><b>02 · SEAL</b><p>The rhythm is scored and sealed with a public clock nobody can predict. 50p a month, as many proofs as you like.</p></div>
 <div><b>03 · SHARE</b><p>Put the code or badge under your post, essay, review or sign-off.</p></div>
 </div>
 
@@ -614,7 +670,7 @@ KEYS_PAGE = _HEAD + r"""
 <div class="st"><b id="sp">0</b><span>thinking pauses</span></div>
 <div class="st"><b id="sv">0</b><span>pasted characters</span></div>
 </div>
-<div class="btns"><button class="btn" id="seal" disabled>Seal it · 50p</button><span class="wallet" id="wallet">Wallet: …</span><a class="btn g" id="topup" href="https://sebbi.pro/credits" style="display:none">Top up</a></div>
+<div class="btns"><button class="btn" id="seal" disabled>Seal it</button><span class="wallet" id="wallet">Wallet: …</span><a class="btn g" id="topup" href="https://sebbi.pro/credits" style="display:none">Top up</a></div>
 <div class="msg" id="msg"></div>
 </div>
 <div id="out"></div>
@@ -629,8 +685,10 @@ let viewer=null;try{viewer=localStorage.getItem('sebbi.viewer')}catch(e){}
 if(!viewer){viewer=Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');try{localStorage.setItem('sebbi.viewer',viewer)}catch(e){}}
 function msg(x,c){const m=$('#msg');m.textContent=x;m.className='msg '+(c||'')}
 async function start(){try{const r=await fetch('/x/humankeys/challenge');ch=await r.json()}catch(e){msg('Could not reach sebbi.pro. Check your connection.','err')}}
-async function wallet(){try{const r=await fetch('/c/hello?viewer='+viewer);const d=await r.json();const b=d.balance_pence||0;
- $('#wallet').textContent='Wallet: £'+(b/100).toFixed(2);$('#topup').style.display=b<50?'inline-block':'none';return b}catch(e){$('#wallet').textContent='Wallet: —';return 0}}
+async function wallet(){try{await fetch('/c/hello?viewer='+viewer);const r=await fetch('/x/humankeys/pass?viewer='+viewer);const d=await r.json();const b=d.balance_pence||0;
+ if(d.active){$('#wallet').textContent='Unlimited proofs until '+d.until_uk;$('#topup').style.display='none'}
+ else{$('#wallet').textContent='50p a month, unlimited proofs · wallet £'+(b/100).toFixed(2);$('#topup').style.display=b<50?'inline-block':'none'}
+ return b}catch(e){$('#wallet').textContent='50p a month, unlimited proofs';return 0}}
 start();wallet();
 function tick(){const now=performance.now();if(last){const g=now-last;iv.push(Math.round(g));if(g>2000)pauses++}last=now;if(iv.length>6000)iv.shift();draw();stats()}
 let comp=0;
@@ -662,14 +720,14 @@ function norm(s){return s.normalize('NFC').replace(/\r\n?/g,'\n').trim()}
 async function sha(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('')}
 $('#seal').onclick=async()=>{
  const btn=$('#seal');btn.disabled=true;btn.textContent='Sealing…';msg('');
- if(!ch||!ch.sig){await start();if(!ch||!ch.sig){btn.disabled=false;btn.textContent='Seal it · 50p';return}}
+ if(!ch||!ch.sig){await start();if(!ch||!ch.sig){btn.disabled=false;btn.textContent='Seal it';return}}
  const text=norm(t.value);const h=await sha(text);
  const body={challenge:ch.challenge,sig:ch.sig,text_hash:h,intervals:iv,counts:Object.assign({final_length:text.length},n),viewer:viewer};
  try{const r=await fetch('/x/humankeys/seal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();
-  if(r.status===402){msg(d.message||'A proof is 50p. Top up first.','err');$('#topup').style.display='inline-block';btn.disabled=false;btn.textContent='Seal it · 50p';return}
-  if(!r.ok||!d.sealed){msg(d.message||d.error||'Could not seal it.','err');btn.disabled=false;btn.textContent='Seal it · 50p';return}
+  if(r.status===402){msg(d.message||'Human Keys is 50p a month for unlimited proofs. Top up first.','err');$('#topup').style.display='inline-block';btn.disabled=false;btn.textContent='Seal it';return}
+  if(!r.ok||!d.sealed){msg(d.message||d.error||'Could not seal it.','err');btn.disabled=false;btn.textContent='Seal it';return}
   render(d);wallet();btn.textContent='Sealed';
- }catch(e){msg('Could not reach sebbi.pro.','err');btn.disabled=false;btn.textContent='Seal it · 50p'}};
+ }catch(e){msg('Could not reach sebbi.pro.','err');btn.disabled=false;btn.textContent='Seal it'}};
 function render(d){const cls=d.verdict==='HUMAN_TYPED'?'':(d.verdict==='HUMAN_TYPED_PART_PASTED'?'part':'bad');const s=d.summary||{};
  const share='✓ Human typed · check it: '+d.check;
  $('#out').innerHTML='<div class="cert '+cls+'"><div class="seal"><div class="ring">'+(cls==='bad'?'!':'✓')+'</div><h2>'+d.verdict_text+'</h2></div>'+
@@ -695,7 +753,7 @@ CHECK_PAGE = _HEAD + r"""
 <div class="btns"><button class="btn" id="look">Look it up</button></div><div class="msg" id="msg"></div></div>
 <div id="out"></div>
 </div>
-<footer><div class="wrap">Monop Content · <a href="https://sebbi.pro/x/humankeys/spec">How the proof works</a> · <a href="https://sebbi.pro/keys">Make your own · 50p</a></div></footer>
+<footer><div class="wrap">Monop Content · <a href="https://sebbi.pro/x/humankeys/spec">How the proof works</a> · <a href="https://sebbi.pro/keys">Make your own · 50p a month</a></div></footer>
 <script>
 (function(){
 const $=s=>document.querySelector(s);
