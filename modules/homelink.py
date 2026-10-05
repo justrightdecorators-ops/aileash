@@ -1,5 +1,5 @@
 """
-modules/homelink.py  v1.12.0
+modules/homelink.py  v1.13.0
 Adds the "Auditors", "Cinema", "Deep Run", "Agent Room", "Machine readable" and "Agent Passport" buttons to the sebbi.pro homepage without
 editing index.html or server.py.
 
@@ -21,6 +21,12 @@ homepage can never be broken by this module, only left as it was.
 
 Armed by hitting /x/homelink/status once after each deploy.
 
+1.13.0: the sebbi bubble gains Connect your AI (/connect), Build your own
+rules (/build), Human Keys (/keys), Check a Human Keys proof (/k/), the
+Machine-proof report (/dossier) and
+Featured on AI Business; the plug in bubble gains Connect any AI (/connect).
+Existing buttons unchanged.
+
 1.12.0: arming homelink also arms the modules its bubbles lead to - meter.py
 (the 50p device meter) and plugin.py (the /plugin page and its /p/ routes) -
 so those work even if the router does not list them. If a file is missing,
@@ -30,7 +36,7 @@ homelink still arms and the status says which one.
 import io
 import sys
 
-VERSION = "1.12.1"
+VERSION = "1.13.0"
 PATHS = ("/", "/index.html")
 MARK = b"<!--sebbi-homelink-->"
 
@@ -125,6 +131,7 @@ BUTTON = (
     b'<a class="x" href="#" aria-label="Close" onclick="event.preventDefault();this.parentNode.style.display=\'none\';'
     b'document.getElementById(\'sebbi-toolbubble\').style.visibility=\'visible\';document.getElementById(\'sebbi-plugbubble\').style.display=\'flex\'">&times;</a>'
     b'<a href="/plugin" style="border-color:#8fd0ff"><span class="tag" style="background:#8fd0ff">NEW</span>Keep your system, add the proof</a>'
+    b'<a href="/connect" style="border-color:#f0d78a"><span class="tag" style="background:#f0d78a">NEW</span>Connect any AI in a minute</a>'
     b'<a href="/plugin#key" style="border-color:#7fe3b0"><span class="tag" style="background:#7fe3b0">FREE</span>Get your key</a>'
     b'<a href="/p/sebbi_adapter.py" download>Download the adapter</a>'
     b'<a href="/plugin#account">Your account &amp; bill</a>'
@@ -168,6 +175,12 @@ BUTTON = (
     b'<a class="portal" href="/room"><span class="ring"></span>Enter the Agent Room &rarr;</a>'
     b'<a href="/prove" style="border:1.5px solid #7fe3b0"><span class="tag" style="background:#7fe3b0">PROOF</span>Machine readable &rarr;</a>'
     b'<a href="/passport" style="border:1.5px solid #c9a84c"><span class="tag" style="background:#c9a84c">NEW</span>Agent Passport &rarr;</a>'
+    b'<a href="/connect" style="border:1.5px solid #8fd0ff"><span class="tag" style="background:#8fd0ff">NEW</span>Connect your AI &rarr;</a>'
+    b'<a href="/build" style="border:1.5px solid #7fe3b0"><span class="tag" style="background:#7fe3b0">BUILD</span>Build your own rules &rarr;</a>'
+    b'<a href="/keys" style="border:1.5px solid #f0d78a"><span class="tag" style="background:#f0d78a">HUMAN</span>Human Keys &rarr;</a>'
+    b'<a href="/k/" style="border:1.5px solid #f0d78a"><span class="tag" style="background:#f0d78a">CHECK</span>Check a Human Keys proof &rarr;</a>'
+    b'<a href="/dossier" style="border:1.5px solid #c9a84c"><span class="tag" style="background:#c9a84c">REPORT</span>Machine-proof report &rarr;</a>'
+    b'<a href="https://aibusiness.vc/startups/sebbi-aileash-justin-dobson-seal-every-ai-decision" style="border:1.5px solid rgba(255,255,255,.45)"><span class="tag" style="background:#fff">PRESS</span>Featured on AI Business &rarr;</a>'
     b'</div>'
 )
 
@@ -284,7 +297,7 @@ def handle(method, action, data, api_key, ctx):
     companions = _arm_companions(ctx)
     armed = _install(ctx)
     return ({"module": "homelink", "version": VERSION, "armed": armed,
-             "adds": "Plug in bubble (/plugin, bottom, between tools and studio), My earnings (/earn, top right), Monop Studio bubble (/create, bottom centre, with My earnings & withdraw at the top), Free tools bubble (/tools, bottom left), Start here (/start, top left), Auditors (/auditors), Cinema (/cinema), Deep Run (/game), Agent Room (/room), Machine readable (/prove) and Agent Passport (/passport) buttons",
+             "adds": "Plug in bubble (/plugin, bottom, between tools and studio), My earnings (/earn, top right), Monop Studio bubble (/create, bottom centre, with My earnings & withdraw at the top), Free tools bubble (/tools, bottom left), Start here (/start, top left), Auditors (/auditors), Cinema (/cinema), Deep Run (/game), Agent Room (/room), Machine readable (/prove), Agent Passport (/passport), Connect your AI (/connect), Build your own rules (/build), Human Keys (/keys), Check a Human Keys proof (/k/), Machine-proof report (/dossier) and Featured on AI Business buttons",
              "also_armed": companions,
              "safe": "any response that is not a plain 200 HTML page is sent untouched"}, 200)
 

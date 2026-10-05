@@ -47,6 +47,7 @@ jobs:
           check https://sebbi.pro/connect 200
           check https://sebbi.pro/build 200
           check https://sebbi.pro/keys 200
+          if curl -s -m 30 https://sebbi.pro/ | grep -q 'href="/connect" style'; then echo "ok   homelink new buttons"; else echo "FAIL homelink new buttons missing"; echo "::error title=homelink buttons missing::the new homepage buttons are not on https://sebbi.pro/ - arm the site"; fail=1; fi
           if curl -s -m 30 https://sebbi.pro/ | grep -q 'class="sbx"'; then echo "ok   homepage feature strip"; else echo "FAIL homepage feature strip missing"; echo "::error title=homepage feature strip missing::the AI Business strip is not on https://sebbi.pro/ - arm the site"; fail=1; fi
           # a route that does not exist must answer 404 quickly - a timeout
           # here means the server has stopped loading modules
