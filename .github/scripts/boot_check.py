@@ -68,6 +68,9 @@ PAGES = [
     "/connect",
     "/build",
     "/x/connect/status",
+    "/mcp",
+    "/x/mcp/status",
+    "/x/mcp/terms",
 ]
 
 
