@@ -1,11 +1,509 @@
-# Codebase — part 3 of 48
+# Codebase — part 3 of 49
 
 Contains:
+- `modules/auditbridge.py`
 - `modules/bind.py`
 - `modules/binddesk.py`
 - `modules/blocks.py`
 - `modules/brand.py`
-- `modules/capture.py`
+
+
+## `modules/auditbridge.py`
+
+490 lines, 27978 bytes
+
+```python
+"""
+modules/auditbridge.py  v1.0.0
+sebbi.pro for auditors: the chain answers inside Excel and Google Sheets.
+
+Page module (runtime do_GET patch, like map.py). Serves:
+
+    /auditors                     the page
+    /a/help                       every command, plain text
+    /a/verify?hash=H              VERIFIED · block N · time   or   NOT FOUND
+    /a/tip                        the latest block
+    /a/count?day=YYYY[-MM[-DD]]   records sealed in that period
+    /a/btc                        the latest Bitcoin block height and hash
+    /a/sample?n=25&btc=HEIGHT     a CSV sample selected by that Bitcoin block's hash
+    /a/audit?domain=D             any company's AI integrity level, checked live, sealed
+    /a/oscal                      OSCAL assessment results pointing at live proofs
+
+Plain text (one line, or CSV for samples) so spreadsheets read it directly:
+    Google Sheets  =IMPORTDATA("https://sebbi.pro/a/verify?hash="&A2)
+    Excel          =WEBSERVICE("https://sebbi.pro/a/verify?hash="&A2)
+
+Read-only against the chain, except /a/audit, which runs the existing
+integrity checker (that checker seals its own verdicts, one per domain per day).
+Armed by /x/auditbridge/status after each deploy.
+"""
+
+import base64
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
+PAGE = "/auditors"
+BASE = "https://sebbi.pro"
+MAX_SAMPLE = 200
+
+_HTML_B64 = (
+    "PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij48bWV0YSBuYW1lPSJ2aWV3"
+    "cG9ydCIgY29udGVudD0id2lkdGg9ZGV2aWNlLXdpZHRoLGluaXRpYWwtc2NhbGU9MSx2aWV3cG9ydC1maXQ9Y292ZXIiPgo8dGl0"
+    "bGU+c2ViYmkucHJvIGZvciBhdWRpdG9ycyDigJQgdGhlIGNoYWluIGluc2lkZSB5b3VyIHNwcmVhZHNoZWV0PC90aXRsZT4KPG1l"
+    "dGEgbmFtZT0iZGVzY3JpcHRpb24iIGNvbnRlbnQ9IlR5cGUgYSBmb3JtdWxhIGluIEV4Y2VsIG9yIEdvb2dsZSBTaGVldHMgYW5k"
+    "IGV2ZXJ5IHJvdyB2ZXJpZmllcyBpdHNlbGYgYWdhaW5zdCB0aGUgc2ViYmkucHJvIGNoYWluLiBQbHVzIHRoZSBhdWRpdCBzYW1w"
+    "bGUgbm9ib2R5IGNob3NlLCBzZWVkZWQgYnkgYSBmdXR1cmUgQml0Y29pbiBibG9jay4iPgo8bGluayBocmVmPSJodHRwczovL2Zv"
+    "bnRzLmdvb2dsZWFwaXMuY29tL2NzczI/ZmFtaWx5PU5ld3NyZWFkZXI6b3Bzeix3Z2h0QDYuLjcyLDUwMCZmYW1pbHk9SUJNK1Bs"
+    "ZXgrU2Fuczp3Z2h0QDQwMDs1MDA7NjAwJmZhbWlseT1JQk0rUGxleCtNb25vOndnaHRANDAwOzUwMCZkaXNwbGF5PXN3YXAiIHJl"
+    "bD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7LS1pbms6IzBhMGYxZTstLXBhcGVyOiNGQUZBRjY7LS1saW5lOiNERURCRDE7"
+    "LS1nb2xkOiNjOWE4NGM7LS1vazojMkU3RDU3Oy0tbXV0ZWQ6IzVBNjI3MDstLXNhbnM6J0lCTSBQbGV4IFNhbnMnLHN5c3RlbS11"
+    "aSxzYW5zLXNlcmlmOy0tc2VyaWY6J05ld3NyZWFkZXInLEdlb3JnaWEsc2VyaWY7LS1tb25vOidJQk0gUGxleCBNb25vJyx1aS1t"
+    "b25vc3BhY2UsbW9ub3NwYWNlfQoqe2JveC1zaXppbmc6Ym9yZGVyLWJveDttYXJnaW46MDtwYWRkaW5nOjB9Ym9keXtmb250LWZh"
+    "bWlseTp2YXIoLS1zYW5zKTtiYWNrZ3JvdW5kOnZhcigtLXBhcGVyKTtjb2xvcjp2YXIoLS1pbmspO2xpbmUtaGVpZ2h0OjEuNn0K"
+    "LndyYXB7bWF4LXdpZHRoOjgyMHB4O21hcmdpbjowIGF1dG87cGFkZGluZzowIDIwcHh9LnRvcHtib3JkZXItYm90dG9tOjFweCBz"
+    "b2xpZCB2YXIoLS1saW5lKTtwYWRkaW5nOjE1cHggMH0udG9wIC53cmFwe2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3Bh"
+    "Y2UtYmV0d2VlbjtmbGV4LXdyYXA6d3JhcDtnYXA6MTBweH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6"
+    "ZToxM3B4fS5icmFuZCBie2NvbG9yOnZhcigtLWdvbGQpO2ZvbnQtd2VpZ2h0OjUwMH0udG9wIGF7Zm9udC1mYW1pbHk6dmFyKC0t"
+    "bW9ubyk7Zm9udC1zaXplOjEyLjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7dGV4dC1kZWNvcmF0aW9uOm5vbmU7bWFyZ2luLWxlZnQ6"
+    "MTRweH0KLmhlcm97cGFkZGluZzo1MHB4IDAgMjRweH0ua2lja3tmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTJw"
+    "eDtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3BhY2luZzouMDdlbTttYXJnaW4tYm90dG9tOjEycHh9Cmgxe2ZvbnQtZmFtaWx5"
+    "OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDMycHgsNnZ3LDUycHgpO2xpbmUtaGVpZ2h0OjEu"
+    "MDY7bWF4LXdpZHRoOjE3Y2g7bWFyZ2luLWJvdHRvbToxNnB4fS5oZXJvIHB7Zm9udC1zaXplOjE3cHg7Y29sb3I6dmFyKC0tbXV0"
+    "ZWQpO21heC13aWR0aDo1OGNofQpzZWN0aW9ue3BhZGRpbmc6MzhweCAwO2JvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUp"
+    "fWgye2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDI0cHgsNHZ3LDM0cHgp"
+    "O2xpbmUtaGVpZ2h0OjEuMTU7bWFyZ2luLWJvdHRvbToxMnB4O21heC13aWR0aDoyNGNofQoubGVhZHtjb2xvcjp2YXIoLS1tdXRl"
+    "ZCk7bWF4LXdpZHRoOjYyY2g7bWFyZ2luLWJvdHRvbToxOHB4fQouc2hlZXR7YmFja2dyb3VuZDojZmZmO2JvcmRlcjoxcHggc29s"
+    "aWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo4cHg7b3ZlcmZsb3c6aGlkZGVuO2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2Zv"
+    "bnQtc2l6ZToxMnB4fQouc2hlZXQgLmZ4e2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRpbmc6OXB4IDEy"
+    "cHg7YmFja2dyb3VuZDojZjNmMmVjO292ZXJmbG93LXg6YXV0bzt3aGl0ZS1zcGFjZTpub3dyYXB9LnNoZWV0IC5meCBie2NvbG9y"
+    "OnZhcigtLWdvbGQpfQouc2hlZXQgdGFibGV7d2lkdGg6MTAwJTtib3JkZXItY29sbGFwc2U6Y29sbGFwc2V9LnNoZWV0IHRke2Jv"
+    "cmRlci10b3A6MXB4IHNvbGlkICNlZWU7cGFkZGluZzo4cHggMTJweDt3aGl0ZS1zcGFjZTpub3dyYXB9LnNoZWV0IHRkLm9re2Nv"
+    "bG9yOnZhcigtLW9rKTtmb250LXdlaWdodDo1MDB9LnNoZWV0IHRkLmJhZHtjb2xvcjojOUMyRjI2O2ZvbnQtd2VpZ2h0OjUwMH0K"
+    "LmdyaWR7ZGlzcGxheTpncmlkO2dhcDoxMnB4O2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnJ9QG1lZGlhKG1pbi13aWR0aDo3MDBw"
+    "eCl7LmdyaWR7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmciAxZnJ9fQouY2FyZHtiYWNrZ3JvdW5kOiNmZmY7Ym9yZGVyOjFweCBz"
+    "b2xpZCB2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjhweDtwYWRkaW5nOjE4cHggMjBweH0uY2FyZCAudHtmb250LWZhbWlseTp2"
+    "YXIoLS1tb25vKTtmb250LXNpemU6MTFweDtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3BhY2luZzouMDVlbX0uY2FyZCBoM3tm"
+    "b250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToyMHB4O21hcmdpbjo0cHggMCA2cHh9LmNh"
+    "cmQgcHtmb250LXNpemU6MTQuNXB4O2NvbG9yOnZhcigtLW11dGVkKX0KY29kZSxwcmV7Zm9udC1mYW1pbHk6dmFyKC0tbW9ubyk7"
+    "Zm9udC1zaXplOjEycHh9cHJle2JhY2tncm91bmQ6dmFyKC0taW5rKTtjb2xvcjojZThlNmRmO2JvcmRlci1yYWRpdXM6NnB4O3Bh"
+    "ZGRpbmc6MTJweCAxNHB4O292ZXJmbG93LXg6YXV0bzttYXJnaW4tdG9wOjhweDt3aGl0ZS1zcGFjZTpwcmV9Ci50cnl7ZGlzcGxh"
+    "eTpmbGV4O2dhcDo4cHg7ZmxleC13cmFwOndyYXA7bWFyZ2luLXRvcDoxMnB4fS50cnkgaW5wdXR7ZmxleDoxO21pbi13aWR0aDoy"
+    "MDBweDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6NnB4O3BhZGRpbmc6MTFweCAxMnB4O2ZvbnQt"
+    "ZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxM3B4fQouYnRue2JhY2tncm91bmQ6dmFyKC0tZ29sZCk7Y29sb3I6dmFyKC0t"
+    "aW5rKTtib3JkZXI6MDtib3JkZXItcmFkaXVzOjZweDtwYWRkaW5nOjExcHggMTZweDtmb250LWZhbWlseTp2YXIoLS1tb25vKTtm"
+    "b250LXNpemU6MTNweDtmb250LXdlaWdodDo1MDA7Y3Vyc29yOnBvaW50ZXI7dGV4dC1kZWNvcmF0aW9uOm5vbmU7ZGlzcGxheTpp"
+    "bmxpbmUtYmxvY2t9CiNvdXR7bWFyZ2luLXRvcDoxMnB4O2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxM3B4O2Jh"
+    "Y2tncm91bmQ6I2ZmZjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6NnB4O3BhZGRpbmc6MTJweDt3"
+    "aGl0ZS1zcGFjZTpwcmUtd3JhcDtkaXNwbGF5Om5vbmU7d29yZC1icmVhazpicmVhay1hbGx9CmZvb3Rlcntib3JkZXItdG9wOjFw"
+    "eCBzb2xpZCB2YXIoLS1saW5lKTtwYWRkaW5nOjIycHggMCA0NnB4O2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZTox"
+    "MS41cHg7Y29sb3I6IzhBOTBBMH0KPC9zdHlsZT48L2hlYWQ+PGJvZHk+CjxoZWFkZXIgY2xhc3M9InRvcCI+PGRpdiBjbGFzcz0i"
+    "d3JhcCI+PGRpdiBjbGFzcz0iYnJhbmQiPnNlYmJpPGI+LnBybzwvYj4gwrcgZm9yIGF1ZGl0b3JzPC9kaXY+PG5hdj48YSBocmVm"
+    "PSIvIj5Ib21lPC9hPjxhIGhyZWY9Ii9wcm92ZSI+UHJvb2Y8L2E+PGEgaHJlZj0iL2Evb3NjYWwiPk9TQ0FMPC9hPjwvbmF2Pjwv"
+    "ZGl2PjwvaGVhZGVyPgo8ZGl2IGNsYXNzPSJ3cmFwIj4KPGRpdiBjbGFzcz0iaGVybyI+PGRpdiBjbGFzcz0ia2ljayI+VEhFIENI"
+    "QUlOLCBJTlNJREUgWU9VUiBTUFJFQURTSEVFVDwvZGl2Pgo8aDE+VHlwZSBhIGZvcm11bGEuIEV2ZXJ5IHJvdyBwcm92ZXMgaXRz"
+    "ZWxmLjwvaDE+CjxwPk5vIGxvZ2luLCBubyBwbHVnLWluLCBubyBleHBvcnQgcmVxdWVzdC4gQXVkaXRvcnMgYWxyZWFkeSBsaXZl"
+    "IGluIEV4Y2VsIGFuZCBHb29nbGUgU2hlZXRzLiBTbyB0aGUgc2ViYmkucHJvIGNoYWluIG5vdyBhbnN3ZXJzIGZyb20gaW5zaWRl"
+    "IGEgY2VsbDogcGFzdGUgYSBjb2x1bW4gb2YgcmVjZWlwdHMsIGRyYWcgb25lIGZvcm11bGEgZG93biwgYW5kIGV2ZXJ5IHJvdyB2"
+    "ZXJpZmllcyBpdHNlbGYgbGl2ZSBhZ2FpbnN0IHRoZSBjaGFpbi48L3A+PC9kaXY+Cgo8c2VjdGlvbiBpZD0iYW55b25lIj48aDI+"
+    "QXVkaXQgYW55b25lIGluIHRoZSBsYW5kPC9oMj4KPHAgY2xhc3M9ImxlYWQiPlR5cGUgYW55IGNvbXBhbnkncyBkb21haW4uIHNl"
+    "YmJpLnBybyBjaGVja3MgdGhlaXIgcHVibGlzaGVkIEFJIGludGVncml0eSBkZWNsYXJhdGlvbiBsaXZlLCB3YWxrcyBhbmQgcmVj"
+    "b21wdXRlcyB0aGVpciBjaGFpbiBpZiB0aGV5IGhhdmUgb25lLCByYXRlcyB0aGVtIEwwIHRvIEw0LCBhbmQgc2VhbHMgdGhlIHZl"
+    "cmRpY3QgaW50byBvdXIgY2hhaW4gc28gaXQgY2FuIG5ldmVyIGJlIHF1aWV0bHkgY2hhbmdlZC4gTm8gZGVjbGFyYXRpb24gbWVh"
+    "bnMgTDAsIGFuZCB0aGF0IGlzIHNlYWxlZCB0b28uPC9wPgo8ZGl2IGNsYXNzPSJ0cnkiPjxpbnB1dCBpZD0iZCIgcGxhY2Vob2xk"
+    "ZXI9ImFueS1jb21wYW55LmNvbSI+PGJ1dHRvbiBjbGFzcz0iYnRuIiBvbmNsaWNrPSJnbygnYXVkaXQ/ZG9tYWluPScrZW5jb2Rl"
+    "VVJJQ29tcG9uZW50KGQudmFsdWUudHJpbSgpKSkiPkF1ZGl0IHRoZW08L2J1dHRvbj48L2Rpdj4KPHByZT49SU1QT1JUREFUQSgi"
+    "aHR0cHM6Ly9zZWJiaS5wcm8vYS9hdWRpdD9kb21haW49IiZhbXA7QTIpPC9wcmU+CjxwIGNsYXNzPSJsZWFkIiBzdHlsZT0ibWFy"
+    "Z2luLXRvcDoxMnB4Ij5QdXQgYSBsaXN0IG9mIHlvdXIgc3VwcGxpZXJzIGluIGNvbHVtbiBBIGFuZCBkcmFnLiBFdmVyeSBBSSBz"
+    "dXBwbGllciB5b3UgcmVseSBvbiwgcmF0ZWQgYW5kIHNlYWxlZCwgaW4gb25lIHNoZWV0LjwvcD48L3NlY3Rpb24+Cgo8c2VjdGlv"
+    "bj48aDI+VmVyaWZ5IGEgd2hvbGUgY29sdW1uIGluIG9uZSBkcmFnPC9oMj4KPHAgY2xhc3M9ImxlYWQiPkVhY2ggY2VsbCBhc2tz"
+    "IHRoZSBjaGFpbiBkaXJlY3RseSBhbmQgZ2V0cyBvbmUgcGxhaW4gbGluZSBiYWNrLjwvcD4KPGRpdiBjbGFzcz0ic2hlZXQiPjxk"
+    "aXYgY2xhc3M9ImZ4Ij48Yj5meDwvYj4mbmJzcDsgPUlNUE9SVERBVEEoImh0dHBzOi8vc2ViYmkucHJvL2EvdmVyaWZ5P2hhc2g9"
+    "IiZhbXA7QTIpPC9kaXY+Cjx0YWJsZT48dHI+PHRkPjRkZmU5NWFi4oCmYzU3NDg4MzQ8L3RkPjx0ZCBjbGFzcz0ib2siPlZFUklG"
+    "SUVEIMK3IGJsb2NrIDIzOTggwrcgMjAyNi0wOS0yMVQxNDowMToyMlo8L3RkPjwvdHI+Cjx0cj48dGQ+ZDdlNzIwODDigKZkYTE2"
+    "ZmM1Zjk8L3RkPjx0ZCBjbGFzcz0ib2siPlZFUklGSUVEIMK3IGJsb2NrIDIzODcgwrcgMjAyNi0wOS0yMVQxNDowMTowOVo8L3Rk"
+    "PjwvdHI+Cjx0cj48dGQ+MDAwMGJhZGPigKYwZmZlZTAwMDwvdGQ+PHRkIGNsYXNzPSJiYWQiPk5PVCBGT1VORCDCtyB0aGlzIGhh"
+    "c2ggaXMgbm90IGluIHRoZSBjaGFpbjwvdGQ+PC90cj48L3RhYmxlPjwvZGl2Pgo8cHJlPkdvb2dsZSBTaGVldHM6ICA9SU1QT1JU"
+    "REFUQSgiaHR0cHM6Ly9zZWJiaS5wcm8vYS92ZXJpZnk/aGFzaD0iJmFtcDtBMikKRXhjZWwgKFdpbmRvd3MpOiA9V0VCU0VSVklD"
+    "RSgiaHR0cHM6Ly9zZWJiaS5wcm8vYS92ZXJpZnk/aGFzaD0iJmFtcDtBMik8L3ByZT4KPGRpdiBjbGFzcz0idHJ5Ij48aW5wdXQg"
+    "aWQ9ImgiIHBsYWNlaG9sZGVyPSJwYXN0ZSBhbnkgcmVjZWlwdCBoYXNoIj48YnV0dG9uIGNsYXNzPSJidG4iIG9uY2xpY2s9Imdv"
+    "KCd2ZXJpZnk/aGFzaD0nK2VuY29kZVVSSUNvbXBvbmVudChoLnZhbHVlLnRyaW0oKSkpIj5WZXJpZnk8L2J1dHRvbj48L2Rpdj4K"
+    "PGRpdiBpZD0ib3V0Ij48L2Rpdj48L3NlY3Rpb24+Cgo8c2VjdGlvbj48aDI+VGhlIGF1ZGl0IHNhbXBsZSBub2JvZHkgY2hvc2U8"
+    "L2gyPgo8cCBjbGFzcz0ibGVhZCI+RXZlcnkgYXVkaXQgdGVzdHMgYSBzYW1wbGUsIGFuZCB0aGUgb2xkIHF1ZXN0aW9uIGlzIHdo"
+    "byBwaWNrZWQgaXQuIEhlcmUgdGhlIHJhbmRvbSBzZWVkIGlzIGEgQml0Y29pbiBibG9jayB0aGF0IGhhcyBub3QgYmVlbiBtaW5l"
+    "ZCB5ZXQgd2hlbiB5b3UgYXNrLiBOb2JvZHksIG5vdCB0aGUgY29tcGFueSwgbm90IHRoZSBhdWRpdG9yLCBub3Qgc2ViYmkucHJv"
+    "LCBjYW4gaW5mbHVlbmNlIGl0LiBXaGVuIHRoZSBibG9jayBsYW5kcywgdGhlIHNhbXBsZSBleGlzdHM7IGJlZm9yZSB0aGVuIGl0"
+    "IGNhbm5vdC48L3A+CjxwcmU+PUlNUE9SVERBVEEoImh0dHBzOi8vc2ViYmkucHJvL2Evc2FtcGxlP249MjUmYW1wO2J0Yz08aT5m"
+    "dXR1cmUgYmxvY2sgaGVpZ2h0PC9pPiIpPC9wcmU+CjxwIGNsYXNzPSJsZWFkIiBzdHlsZT0ibWFyZ2luLXRvcDoxMnB4Ij5Zb3Ug"
+    "Z2V0IGEgQ1NWIG9mIHNhbXBsZWQgcmVjb3Jkcywgc3RyYWlnaHQgaW50byBTaGVldHMsIEV4Y2VsLCBJREVBIG9yIEFDTCwgd2l0"
+    "aCB0aGUgQml0Y29pbiBibG9jayBoYXNoIHRoYXQgc2VsZWN0ZWQgdGhlbSwgc28gYW55b25lIGNhbiByZS1ydW4gdGhlIHNlbGVj"
+    "dGlvbiBhbmQgZ2V0IHRoZSBzYW1lIHJvd3MuPC9wPgo8ZGl2IGNsYXNzPSJ0cnkiPjxidXR0b24gY2xhc3M9ImJ0biIgb25jbGlj"
+    "az0iZ28oJ2J0YycpIj5XaGF0J3MgdGhlIG5leHQgQml0Y29pbiBibG9jaz88L2J1dHRvbj48YnV0dG9uIGNsYXNzPSJidG4iIG9u"
+    "Y2xpY2s9ImdvKCdzYW1wbGU/bj0xMCZidGM9bGF0ZXN0JykiPlNhbXBsZSAxMCB1c2luZyB0aGUgbGF0ZXN0IGJsb2NrPC9idXR0"
+    "b24+PC9kaXY+PC9zZWN0aW9uPgoKPHNlY3Rpb24+PGgyPkV2ZXJ5IGNvbW1hbmQsIG9uZSBsaW5lIGJhY2s8L2gyPgo8ZGl2IGNs"
+    "YXNzPSJncmlkIj4KPGRpdiBjbGFzcz0iY2FyZCI+PGRpdiBjbGFzcz0idCI+L2EvdmVyaWZ5P2hhc2g9PC9kaXY+PGgzPklzIHRo"
+    "aXMgcmVjb3JkIGluIHRoZSBjaGFpbj88L2gzPjxwPlZFUklGSUVEIHdpdGggYmxvY2sgYW5kIHRpbWUsIG9yIE5PVCBGT1VORC48"
+    "L3A+PC9kaXY+CjxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9InQiPi9hL2F1ZGl0P2RvbWFpbj08L2Rpdj48aDM+QXVkaXQg"
+    "YW55IGNvbXBhbnk8L2gzPjxwPlRoZWlyIEFJIGludGVncml0eSBsZXZlbCwgY2hlY2tlZCBsaXZlIGFuZCBzZWFsZWQuPC9wPjwv"
+    "ZGl2Pgo8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJ0Ij4vYS90aXA8L2Rpdj48aDM+V2hlcmUgaXMgdGhlIGNoYWluIG5v"
+    "dz88L2gzPjxwPkxhdGVzdCBibG9jaywgaXRzIGhhc2ggYW5kIHdoZW4gaXQgd2FzIHNlYWxlZC48L3A+PC9kaXY+CjxkaXYgY2xh"
+    "c3M9ImNhcmQiPjxkaXYgY2xhc3M9InQiPi9hL2NvdW50P2RheT0yMDI2LTA5LTIxPC9kaXY+PGgzPkhvdyBtYW55IHJlY29yZHMg"
+    "dGhhdCBkYXk/PC9oMz48cD5UaGUgY291bnQgZm9yIGFueSBkYXksIG1vbnRoIG9yIHllYXIsIHRvIHJlY29uY2lsZSBhZ2FpbnN0"
+    "IHlvdXIgcG9wdWxhdGlvbi48L3A+PC9kaXY+CjxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9InQiPi9hL3NhbXBsZT9uPTI1"
+    "JmFtcDtidGM9PC9kaXY+PGgzPlRoZSBzYW1wbGUgbm9ib2R5IGNob3NlPC9oMz48cD5TZWVkZWQgYnkgYSBmdXR1cmUgQml0Y29p"
+    "biBibG9jay4gUmUtcnVubmFibGUgYnkgYW55b25lLjwvcD48L2Rpdj4KPGRpdiBjbGFzcz0iY2FyZCI+PGRpdiBjbGFzcz0idCI+"
+    "L2Evb3NjYWw8L2Rpdj48aDM+T1NDQUwgYXNzZXNzbWVudCByZXN1bHRzPC9oMz48cD5UaGUgVVMgZ292ZXJubWVudCdzIG1hY2hp"
+    "bmUgZm9ybWF0IGZvciBhdWRpdCBldmlkZW5jZS4gSW1wb3J0IGl0IGludG8gR1JDIHRvb2xzOyBldmVyeSBmaW5kaW5nIHBvaW50"
+    "cyBhdCBhIGxpdmUgcHJvb2YuPC9wPjwvZGl2Pgo8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJ0Ij4vYS9oZWxwPC9kaXY+"
+    "PGgzPkFsbCBjb21tYW5kczwvaDM+PHA+UGxhaW4gdGV4dCwgcmVhZGFibGUgYnkgYW55IHRvb2wsIHNjcmlwdCBvciBBSS48L3A+"
+    "PC9kaXY+CjwvZGl2Pjwvc2VjdGlvbj4KCjxkaXYgc3R5bGU9ImJhY2tncm91bmQ6dmFyKC0taW5rKTtjb2xvcjojZmZmO2JvcmRl"
+    "ci1yYWRpdXM6MTBweDtwYWRkaW5nOjMwcHggMjRweDttYXJnaW46MzRweCAwIDQ4cHgiPgo8aDIgc3R5bGU9ImNvbG9yOiNmZmYi"
+    "PkF1ZGl0b3JzOiBzdG9wIGFza2luZyBmb3Igc2NyZWVuc2hvdHMuPC9oMj4KPHAgc3R5bGU9ImNvbG9yOnJnYmEoMjU1LDI1NSwy"
+    "NTUsLjc1KTttYXgtd2lkdGg6NTZjaDttYXJnaW4tYm90dG9tOjE4cHgiPkFzayB0aGUgY2hhaW4uIEl0IGFuc3dlcnMgaW4geW91"
+    "ciBvd24gdG9vbHMsIHdpdGggb3VyIHNlcnZlcnMgc3dpdGNoZWQgb2ZmIGZvciBhbnl0aGluZyB5b3UgaGF2ZSBhbHJlYWR5IHZl"
+    "cmlmaWVkIG9mZmxpbmUuPC9wPgo8YSBjbGFzcz0iYnRuIiBocmVmPSIjYW55b25lIj5BdWRpdCBhIGNvbXBhbnkgbm93PC9hPiA8"
+    "YSBjbGFzcz0iYnRuIiBocmVmPSIvcHJvdmUiIHN0eWxlPSJiYWNrZ3JvdW5kOnRyYW5zcGFyZW50O2NvbG9yOiNmZmY7Ym9yZGVy"
+    "OjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4zKSI+U2VlIGV2ZXJ5IHByb29mPC9hPjwvZGl2Pgo8L2Rpdj4KPGZvb3Rlcj48"
+    "ZGl2IGNsYXNzPSJ3cmFwIj5zZWJiaS5wcm8gwrcgTW9ub3AgQ29udGVudCDCtyBCbHl0aCwgTm9ydGh1bWJlcmxhbmQsIFVLPC9k"
+    "aXY+PC9mb290ZXI+CjxzY3JpcHQ+CnZhciBoPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdoJyksbz1kb2N1bWVudC5nZXRFbGVt"
+    "ZW50QnlJZCgnb3V0Jyk7CmZ1bmN0aW9uIGdvKHEpe28uc3R5bGUuZGlzcGxheT0nYmxvY2snO28udGV4dENvbnRlbnQ9J0Fza2lu"
+    "ZyB0aGUgY2hhaW7igKYnO2ZldGNoKCcvYS8nK3Ese2NhY2hlOiduby1zdG9yZSd9KS50aGVuKGZ1bmN0aW9uKHIpe3JldHVybiBy"
+    "LnRleHQoKX0pLnRoZW4oZnVuY3Rpb24odCl7by50ZXh0Q29udGVudD10fSkuY2F0Y2goZnVuY3Rpb24oKXtvLnRleHRDb250ZW50"
+    "PSdDb3VsZCBub3QgcmVhY2ggdGhlIGNoYWluLid9KX0KPC9zY3JpcHQ+PC9ib2R5PjwvaHRtbD4K"
+)
+_HTML = base64.b64decode("".join(_HTML_B64.split()))
+_patched = False
+_ctx = {}
+_cols = {}
+_btc_cache = {}
+
+
+def _iso(ts):
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return str(ts)
+
+
+def _schema():
+    """Find the audit_log column names rather than assuming them."""
+    if _cols:
+        return _cols
+    with _ctx["lock"]:
+        rows = _ctx["conn"].execute("PRAGMA table_info(audit_log)").fetchall()
+    names = [r[1] for r in rows]
+    if not names:
+        return {}
+
+    def first(opts):
+        for o in opts:
+            if o in names:
+                return o
+        return None
+    _cols.update(hash=first(["audit_hash", "hash", "block_hash"]),
+                 ts=first(["ts", "timestamp", "created", "time"]),
+                 idx=first(["block_index", "idx", "block", "height", "id"]) or "rowid")
+    return _cols
+
+
+def _q(sql, args=()):
+    with _ctx["lock"]:
+        return _ctx["conn"].execute(sql, args).fetchall()
+
+
+def _period(s):
+    s = (s or "").strip()
+    try:
+        if re.fullmatch(r"\d{4}", s):
+            a = datetime(int(s), 1, 1, tzinfo=timezone.utc); b = datetime(int(s) + 1, 1, 1, tzinfo=timezone.utc)
+        elif re.fullmatch(r"\d{4}-\d{2}", s):
+            y, m = map(int, s.split("-")); a = datetime(y, m, 1, tzinfo=timezone.utc)
+            b = datetime(y + (m == 12), m % 12 + 1, 1, tzinfo=timezone.utc)
+        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            a = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc); b = a.fromtimestamp(a.timestamp() + 86400, tz=timezone.utc)
+        else:
+            return None
+    except ValueError:
+        return None
+    return a.timestamp(), b.timestamp()
+
+
+def _get(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": "sebbi-auditbridge/" + VERSION})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(200000).decode("utf-8", "replace").strip()
+
+
+def _btc(height=None):
+    """Bitcoin block (height, hash) from two public explorers; they must agree."""
+    key = str(height)
+    if key in _btc_cache and (height is not None or time.time() - _btc_cache[key][2] < 60):
+        return _btc_cache[key][:2]
+    if height is None:
+        height = int(_get("https://mempool.space/api/blocks/tip/height"))
+    hashes = []
+    for url in ("https://mempool.space/api/block-height/%d" % height,
+                "https://blockstream.info/api/block-height/%d" % height):
+        try:
+            hashes.append(_get(url))
+        except Exception:
+            pass
+    good = [h for h in hashes if re.fullmatch(r"[0-9a-f]{64}", h)]
+    if not good:
+        return height, None
+    if len(set(good)) > 1:
+        raise ValueError("explorers disagree on block %d" % height)
+    _btc_cache[key] = (height, good[0], time.time())
+    return height, good[0]
+
+
+# ---------------------------------------------------------------- commands
+
+def c_help(q):
+    return ("sebbi.pro auditor commands (plain text, one line each)\n"
+            "/a/verify?hash=H             is this record in the chain\n"
+            "/a/tip                       latest block\n"
+            "/a/count?day=YYYY[-MM[-DD]]  records in a period\n"
+            "/a/btc                       latest Bitcoin block\n"
+            "/a/sample?n=25&btc=HEIGHT    sample chosen by a Bitcoin block (CSV)\n"
+            "/a/audit?domain=D            any company's AI integrity level, sealed\n"
+            "/a/oscal                     OSCAL assessment results\n"
+            "Sheets: =IMPORTDATA(\"https://sebbi.pro/a/verify?hash=\"&A2)\n"
+            "Excel:  =WEBSERVICE(\"https://sebbi.pro/a/verify?hash=\"&A2)\n"), "text/plain"
+
+
+def c_verify(q):
+    c = _schema()
+    h = (q.get("hash") or "").strip().lower()
+    if not c.get("hash"):
+        return "ERROR · chain table not readable", "text/plain"
+    if not re.fullmatch(r"[0-9a-f]{64}", h):
+        return "INVALID · a receipt hash is 64 hex characters", "text/plain"
+    r = _q("SELECT %s,%s FROM audit_log WHERE %s=? LIMIT 1" % (c["idx"], c["ts"] or "NULL", c["hash"]), (h,))
+    if not r:
+        return "NOT FOUND · this hash is not in the chain", "text/plain"
+    tip = _q("SELECT MAX(%s) FROM audit_log" % c["idx"])[0][0]
+    depth = (tip - r[0][0]) if isinstance(tip, int) and isinstance(r[0][0], int) else "?"
+    return "VERIFIED · block %s · %s · %s blocks deep" % (r[0][0], _iso(r[0][1]), depth), "text/plain"
+
+
+def c_tip(q):
+    c = _schema()
+    r = _q("SELECT %s,%s,%s FROM audit_log ORDER BY %s DESC LIMIT 1" % (c["idx"], c["hash"], c["ts"] or "NULL", c["idx"]))
+    if not r:
+        return "EMPTY", "text/plain"
+    return "TIP · block %s · %s · %s" % (r[0][0], r[0][1], _iso(r[0][2])), "text/plain"
+
+
+def c_count(q):
+    c = _schema()
+    p = _period(q.get("day") or q.get("period"))
+    if not p or not c.get("ts"):
+        return "INVALID · use day=YYYY, YYYY-MM or YYYY-MM-DD", "text/plain"
+    n = _q("SELECT COUNT(*) FROM audit_log WHERE %s>=? AND %s<?" % (c["ts"], c["ts"]), p)[0][0]
+    return "COUNT · %s · %d records" % (q.get("day") or q.get("period"), n), "text/plain"
+
+
+def c_btc(q):
+    try:
+        h, bh = _btc()
+    except Exception as e:
+        return "ERROR · %s" % e, "text/plain"
+    return "BITCOIN · latest block %s · %s · ask for a sample with btc=%d or later" % (h, bh, h + 1), "text/plain"
+
+
+def c_sample(q):
+    c = _schema()
+    try:
+        n = max(1, min(MAX_SAMPLE, int(q.get("n", 25))))
+    except ValueError:
+        n = 25
+    want = (q.get("btc") or "").strip().lower()
+    try:
+        height, bh = _btc(None if want in ("", "latest") else int(want))
+    except ValueError as e:
+        return "ERROR · %s" % e, "text/plain"
+    except Exception:
+        return "ERROR · could not reach Bitcoin explorers", "text/plain"
+    if not bh:
+        return ("PENDING · Bitcoin block %s is not mined yet. The sample cannot exist until it is, "
+                "so nobody can have chosen it. Ask again after it lands." % height), "text/plain"
+    total = _q("SELECT COUNT(*) FROM audit_log")[0][0]
+    if not total:
+        return "EMPTY", "text/plain"
+    picks, seen, i = [], set(), 0
+    while len(picks) < min(n, total):
+        k = int(hashlib.sha256(("%s:%d" % (bh, i)).encode()).hexdigest(), 16) % total
+        i += 1
+        if k in seen:
+            continue
+        seen.add(k)
+        r = _q("SELECT %s,%s,%s FROM audit_log ORDER BY %s LIMIT 1 OFFSET ?" % (c["idx"], c["hash"], c["ts"] or "NULL", c["idx"]), (k,))
+        if r:
+            picks.append((k, r[0]))
+    lines = ["position,block,hash,sealed_at,verify"]
+    for k, r in sorted(picks):
+        lines.append("%d,%s,%s,%s,%s/a/verify?hash=%s" % (k, r[0], r[1], _iso(r[2]), BASE, r[1]))
+    lines.append("# selected by Bitcoin block %s hash %s from %d records" % (height, bh, total))
+    lines.append("# rule: position_i = int(sha256(blockhash + ':' + i)) mod total, skipping repeats, ordered by chain position")
+    return "\n".join(lines) + "\n", "text/csv"
+
+
+def _integrity():
+    for m in list(sys.modules.values()):
+        f = getattr(m, "__file__", "") or ""
+        if f.endswith("integrity.py") and hasattr(m, "handle"):
+            return m
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "integrity.py")
+    spec = importlib.util.spec_from_file_location("auditbridge_integrity", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _find(obj, keys, depth=0):
+    if depth > 4:
+        return None
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj and isinstance(obj[k], (str, int)):
+                return obj[k]
+        for v in obj.values():
+            r = _find(v, keys, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def c_audit(q):
+    d = (q.get("domain") or "").strip().lower()
+    d = re.sub(r"^https?://", "", d).split("/")[0]
+    if not re.fullmatch(r"[a-z0-9.-]{3,253}", d) or "." not in d:
+        return "INVALID · give a domain like example.com", "text/plain"
+    try:
+        res = _integrity().handle("GET", "check", {"domain": d}, None, _ctx)
+        body = res[0] if isinstance(res, tuple) else res
+    except Exception as e:
+        return "ERROR · checker unavailable: %s" % str(e)[:120], "text/plain"
+    lvl = _find(body, ["verified_level", "level", "verdict", "rating", "result"]) or "UNRATED"
+    blk = _find(body, ["block_index", "sealed_block", "block"])
+    why = _find(body, ["summary", "reason", "message", "note"])
+    out = "%s · %s" % (d, lvl)
+    if blk is not None:
+        out += " · sealed in block %s" % blk
+    if why:
+        out += " · %s" % str(why)[:160]
+    return out + " · full report %s/x/integrity/check?domain=%s" % (BASE, d), "text/plain"
+
+
+def c_oscal(q):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tip = c_tip(q)[0]
+    obs = [("Record integrity", "Every record is SHA-256 hash-chained; any edit breaks all later records.", "/api/verify-chain"),
+           ("Append-only log", "RFC 6962 consistency proofs show the log only grows.", "/x/consistency/root"),
+           ("Completeness", "Per-period Merkle roots with committed counts; absence is provable.", "/x/complete/periods"),
+           ("External time anchor", "Chain tips anchored to Bitcoin via OpenTimestamps.", "/x/ots/latest_confirmed"),
+           ("Independent witnessing", "Independent organisations hold and witness chain tips.", "/x/roster/list"),
+           ("Custody", "Daily self-proving archive file with a sealed count of independent holders.", "/x/custody/status"),
+           ("Authority at the moment of action", "Authority re-derived at the execution boundary; signed proofs.", "/x/continuity/decisions"),
+           ("Agent permission", "Signed single-use Agent Passports, redeemed once with standing re-checked.", "/x/passport/status")]
+    doc = {"assessment-results": {
+        "uuid": hashlib.sha256(("sebbi-oscal:" + now[:10]).encode()).hexdigest()[:32],
+        "metadata": {"title": "sebbi.pro live assessment results", "last-modified": now, "version": VERSION,
+                     "oscal-version": "1.1.2", "parties": [{"type": "organization", "name": "Monop Content (sebbi.pro)"}]},
+        "results": [{"title": "Live machine-verifiable evidence", "start": now,
+                     "description": "Each observation links to a public route that returns the evidence itself. " + tip,
+                     "observations": [{"title": t, "description": desc, "methods": ["TEST"],
+                                       "relevant-evidence": [{"href": BASE + u, "description": "live, no account required"}],
+                                       "collected": now} for t, desc, u in obs]}]}}
+    return json.dumps(doc, indent=1), "application/json"
+
+
+CMDS = {"help": c_help, "verify": c_verify, "tip": c_tip, "count": c_count, "btc": c_btc,
+        "sample": c_sample, "audit": c_audit, "oscal": c_oscal}
+
+
+def _send(h, body, ctype, code=200):
+    b = body.encode("utf-8") if isinstance(body, str) else body
+    h.send_response(code)
+    h.send_header("Content-Type", ctype + ("; charset=utf-8" if not ctype.endswith("utf-8") else ""))
+    h.send_header("Content-Length", str(len(b)))
+    h.send_header("Access-Control-Allow-Origin", "*")
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(b)
+
+
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        s = f.f_locals.get("self")
+        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
+            return type(s)
+        f = f.f_back
+    return None
+
+
+def _install(ctx):
+    global _patched
+    if isinstance(ctx, dict) and "conn" in ctx:
+        _ctx.update(ctx)
+    if _patched:
+        return True
+    cls = _find_handler_class(ctx)
+    if cls is None:
+        return False
+    if getattr(cls, "_auditbridge_patched", False):
+        _patched = True
+        return True
+    original = cls.do_GET
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        path = u.path.rstrip("/") or "/"
+        if path == PAGE:
+            return _send(self, _HTML, "text/html")
+        if path.startswith("/a/") and path[3:] in CMDS:
+            if "conn" not in _ctx:
+                return _send(self, "NOT ARMED · open /x/auditbridge/status once", "text/plain", 503)
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+            try:
+                body, ctype = CMDS[path[3:]](q)
+            except Exception as e:
+                body, ctype = "ERROR · %s" % str(e)[:160], "text/plain"
+            return _send(self, body, ctype)
+        return original(self)
+
+    cls.do_GET = do_GET
+    cls._auditbridge_patched = True
+    _patched = True
+    return True
+
+
+def handle(method, action, data, api_key, ctx):
+    armed = _install(ctx)
+    return {"module": "auditbridge", "version": VERSION, "armed": armed,
+            "serves": [PAGE] + ["/a/" + k for k in CMDS],
+            "page": BASE + PAGE}, 200
+
+```
 
 
 ## `modules/bind.py`
@@ -1695,398 +2193,5 @@ def handle(method, action, data, api_key, ctx):
     return {"module": "brand", "version": VERSION, "armed": armed, "on": _state["on"],
             "pages_rewritten": _state["rewritten"], "replacements": _state["replacements"],
             "left_as_they_are": list(SKIP_PATHS), "last_error": _state["last_error"]}, 200
-
-```
-
-
-## `modules/capture.py`
-
-385 lines, 17851 bytes
-
-```python
-"""
-One-button decision capture - /x/capture/<action>
-
-WHAT IT IS
-----------
-A drop-in button for an operator's own review screen. A human reviews an AI
-output, clicks once, and the decision is sealed into the chain with who
-reviewed it, on what device, against which inputs, and how long they took.
-
-WHY IT IS TWO CALLS AND NOT ONE
--------------------------------
-The obvious version is a single POST carrying a dwell time measured in the
-browser. That number is the whole point - it is what makes rubber stamping
-visible - and a number the reviewed party computes for itself is not
-evidence. Anyone can set it to whatever looks diligent.
-
-So the widget opens a case first. The server records the open time. When the
-reviewer commits, the server computes the dwell itself from two timestamps it
-owns. The browser never supplies the figure it is being judged on.
-
-Same reason the verdict is withheld between the two calls: the machine's
-answer is sealed at open and only returned at seal, so the chain shows the
-human committed before they saw it. Ordering is the one thing that separates
-judgement from agreement.
-
-KEYS IN BROWSERS
-----------------
-An API key pasted into page JavaScript is public. Anyone reading the source
-can post as that operator, forever.
-
-So capture accepts a CAPTURE TOKEN: minted server-side by the operator from
-their real key, bound to one origin, short-lived, and able to do exactly two
-things - open a case and seal it. It cannot read records, cannot see other
-cases, cannot touch any other module. Same idea as a publishable key.
-
-The real API key still works for server-to-server calls. It should never
-appear in a page.
-
-DEVICES ARE THE BILLING UNIT
-----------------------------
-Every capture carries a device_id, and distinct devices per calendar month is
-what billing is counted on. The registry here is that count: first seen, last
-seen, events, per month. An operator can query their own figure at any time
-and reconcile it against an invoice, rather than being told a number.
-
-Device identifiers are hashed on arrival. The chain and the registry hold a
-fingerprint, never the raw identifier.
-
-    POST /x/capture/token     mint a browser-safe capture token (real key only)
-    POST /x/capture/open      start a case, server records the clock
-    POST /x/capture/seal      commit a verdict, server computes the dwell
-    GET  /x/capture/devices   this month's billable device count
-    GET  /x/capture/case?id=  the sealed record of one capture
-    GET  /x/capture/summary   dwell and divergence across recent captures
-"""
-
-import hashlib, hmac, json, os, re, secrets, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-VERDICTS = {"allow", "block", "challenge", "escalate", "approve", "reject"}
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-TOKEN_TTL = 3600 * 12
-MAX_OPEN_AGE = 3600 * 6
-
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS capture_cases(case_id TEXT PRIMARY KEY,api_key TEXT,operator_fp TEXT,device_fp TEXT,input_hash TEXT,output_hash TEXT,machine_verdict TEXT,opened REAL,sealed REAL,human_verdict TEXT,dwell REAL,agreed INTEGER,note TEXT)")
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS capture_devices(api_key TEXT,device_fp TEXT,month TEXT,first_seen REAL,last_seen REAL,events INTEGER DEFAULT 0,PRIMARY KEY(api_key,device_fp,month))")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_cap_key ON capture_cases(api_key,opened)")
-        ctx["conn"].execute("CREATE INDEX IF NOT EXISTS idx_cap_dev ON capture_devices(api_key,month)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _secret():
-    s = os.environ.get("CAPTURE_SECRET", "").strip() or os.environ.get("LICENCE_SECRET", "").strip()
-    return s.encode() if s else None
-
-
-def _fp(v):
-    s = _secret()
-    if not s:
-        return None
-    return hmac.new(s, str(v).strip().lower().encode(), hashlib.sha256).hexdigest()
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _month(ts=None):
-    return datetime.fromtimestamp(ts or time.time(), tz=timezone.utc).strftime("%Y-%m")
-
-
-# ------------------------------------------------------------ capture token
-
-def _mint(ctx, api_key, data):
-    """Real key only. Returns a token safe to put in a page."""
-    s = _secret()
-    if not s:
-        return {"error": "capture_secret_not_set",
-                "message": "Set CAPTURE_SECRET in the environment first."}, 503
-    origin = str(data.get("origin", "")).strip().lower()[:120]
-    if not origin:
-        return {"error": "origin_required",
-                "message": "Bind the token to the site that will use it, e.g. https://app.yourcompany.com"}, 400
-    try:
-        ttl = min(int(data.get("ttl_seconds", TOKEN_TTL)), TOKEN_TTL)
-    except (TypeError, ValueError):
-        ttl = TOKEN_TTL
-    exp = int(time.time()) + max(60, ttl)
-    body = api_key + "|" + origin + "|" + str(exp)
-    sig = hmac.new(s, body.encode(), hashlib.sha256).hexdigest()[:32]
-    token = "cap_" + str(exp) + "_" + hashlib.sha256(origin.encode()).hexdigest()[:8] + "_" + sig
-    return {"capture_token": token, "origin": origin,
-            "expires": _iso(exp), "expires_in_seconds": exp - int(time.time()),
-            "scope": ["capture:open", "capture:seal"],
-            "note": "Safe to place in a page. It cannot read records, cannot see other cases, and cannot reach any other module. Mint a fresh one from your server as needed - never put your real API key in a browser."}, 200
-
-
-def _verify_token(ctx, token, origin):
-    """Returns the owning api_key, or None."""
-    s = _secret()
-    if not s or not token or not token.startswith("cap_"):
-        return None
-    parts = token.split("_")
-    if len(parts) != 4:
-        return None
-    try:
-        exp = int(parts[1])
-    except ValueError:
-        return None
-    if exp < time.time():
-        return None
-    ohash, sig = parts[2], parts[3]
-    if origin:
-        o = str(origin).strip().lower()[:120]
-        if hashlib.sha256(o.encode()).hexdigest()[:8] != ohash:
-            return None
-    else:
-        o = None
-    with ctx["lock"]:
-        keys = ctx["conn"].execute("SELECT key FROM api_keys WHERE active=1").fetchall()
-    for (k,) in keys:
-        if o is None:
-            continue
-        body = k + "|" + o + "|" + str(exp)
-        if hmac.compare_digest(hmac.new(s, body.encode(), hashlib.sha256).hexdigest()[:32], sig):
-            return k
-    return None
-
-
-def _resolve(ctx, api_key, data):
-    """A real key wins; otherwise try a capture token bound to an origin."""
-    if api_key:
-        return api_key, "api_key"
-    tok = str(data.get("capture_token", "")).strip()
-    origin = str(data.get("origin", "")).strip()
-    owner = _verify_token(ctx, tok, origin)
-    if owner:
-        return owner, "capture_token"
-    return None, None
-
-
-# ------------------------------------------------------------------ devices
-
-def _touch_device(ctx, api_key, device_fp, ts):
-    m = _month(ts)
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT events FROM capture_devices WHERE api_key=? AND device_fp=? AND month=?", (api_key, device_fp, m)).fetchone()
-        if row:
-            ctx["conn"].execute("UPDATE capture_devices SET last_seen=?,events=events+1 WHERE api_key=? AND device_fp=? AND month=?", (ts, api_key, device_fp, m))
-            new = False
-        else:
-            ctx["conn"].execute("INSERT INTO capture_devices(api_key,device_fp,month,first_seen,last_seen,events) VALUES(?,?,?,?,?,1)", (api_key, device_fp, m, ts, ts))
-            new = True
-        ctx["conn"].commit()
-    return new
-
-
-def _devices(ctx, api_key, data):
-    m = str(data.get("month", "")).strip() or _month()
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT COUNT(*),SUM(events) FROM capture_devices WHERE api_key=? AND month=?", (api_key, m)).fetchone()
-        months = ctx["conn"].execute("SELECT month,COUNT(*) FROM capture_devices WHERE api_key=? GROUP BY month ORDER BY month DESC LIMIT 12", (api_key,)).fetchall()
-    n = rows[0] or 0
-    return {"month": m, "billable_devices": n, "captures": rows[1] or 0,
-            "rate_per_device": 0.50, "currency": "GBP",
-            "estimated_charge": round(n * 0.50, 2),
-            "history": [{"month": a, "devices": b} for a, b in months],
-            "note": "A device counts once per calendar month however many captures it makes. Distinct devices is the billing unit - this is the same figure the invoice uses, so you can reconcile it yourself rather than being told a number."}, 200
-
-
-# -------------------------------------------------------------------- cases
-
-def _open(ctx, api_key, data):
-    if not _secret():
-        return {"error": "capture_secret_not_set"}, 503
-    operator = str(data.get("operator_id", "")).strip()
-    if not operator:
-        return {"error": "operator_id_required",
-                "message": "A capture with no named reviewer is not oversight."}, 400
-    device = str(data.get("device_id", "")).strip()
-    if not device:
-        return {"error": "device_id_required",
-                "message": "Devices are the billing unit and the record needs to say which one acted."}, 400
-
-    ih = str(data.get("input_hash", "")).strip().lower()
-    oh = str(data.get("output_hash", "")).strip().lower()
-    for name, v in (("input_hash", ih), ("output_hash", oh)):
-        if v and not HEX64.match(v):
-            return {"error": "invalid_" + name,
-                    "message": "Hash the content locally and send 64 hex characters. Never send the content itself."}, 400
-
-    mv = str(data.get("machine_verdict", "")).strip().lower()
-    if mv and mv not in VERDICTS:
-        return {"error": "invalid_machine_verdict", "allowed": sorted(VERDICTS)}, 400
-
-    ts = time.time()
-    ofp, dfp = _fp(operator), _fp(device)
-    cid = "CAP-" + secrets.token_hex(5).upper()
-    new_device = _touch_device(ctx, api_key, dfp, ts)
-
-    detail = ("operator=" + (ofp or "")[:32] + ";device=" + (dfp or "")[:32] +
-              ";input=" + (ih or "none") + ";output=" + (oh or "none") +
-              ";machine_verdict_sealed=" + (mv or "none"))
-    ev = {"user_id": "cap:" + cid, "action": "capture_opened", "amount": 0,
-          "country": "UK", "device_id": "capture", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "CAPTURE_SEALED", "score": 0, "capture_action": "opened",
-           "capture_version": VERSION, "timestamp": ts, "detail": detail,
-           "note": "no personal data and no content in this block - fingerprints and hashes only"}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO capture_cases(case_id,api_key,operator_fp,device_fp,input_hash,output_hash,machine_verdict,opened,sealed,human_verdict,dwell,agreed,note) VALUES(?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL)",
-                            (cid, api_key, ofp, dfp, ih or None, oh or None, mv or None, ts))
-        ctx["conn"].commit()
-
-    return {"case_id": cid, "opened": _iso(ts),
-            "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-            "machine_verdict": "withheld until seal",
-            "new_device_this_month": new_device,
-            "next": "POST the reviewer's verdict to /x/capture/seal with this case_id",
-            "note": "The clock started here, on the server. The dwell time is not something the browser gets to report."}, 200
-
-
-def _seal(ctx, api_key, data):
-    cid = str(data.get("case_id", "")).strip().upper()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT operator_fp,device_fp,machine_verdict,opened,sealed FROM capture_cases WHERE case_id=? AND api_key=?", (cid, api_key)).fetchone()
-    if not row:
-        return {"error": "unknown_case_id"}, 404
-    if row[4]:
-        return {"error": "already_sealed",
-                "message": "A capture commits once."}, 400
-
-    hv = str(data.get("verdict", "")).strip().lower()
-    if hv not in VERDICTS:
-        return {"error": "invalid_verdict", "allowed": sorted(VERDICTS)}, 400
-    reasoning = str(data.get("reasoning", "")).strip()
-
-    ts = time.time()
-    dwell = round(ts - row[3], 3)
-    if dwell > MAX_OPEN_AGE:
-        return {"error": "case_expired",
-                "opened": _iso(row[3]),
-                "message": "This case was opened more than six hours ago. Open a fresh one rather than sealing a stale clock."}, 400
-    agreed = None if not row[2] else (1 if hv == row[2] else 0)
-
-    detail = ("verdict=" + hv + ";dwell_seconds=" + str(dwell) +
-              ";server_measured=true;reasoning=" + reasoning[:600])
-    ev = {"user_id": "cap:" + cid, "action": "capture_sealed", "amount": 0,
-          "country": "UK", "device_id": "capture", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "CAPTURE_SEALED", "score": 0, "capture_action": "sealed",
-           "capture_version": VERSION, "timestamp": ts, "detail": detail}
-    h, idx, seq = ctx["seal"](ev, res, ts, api_key)
-
-    with ctx["lock"]:
-        ctx["conn"].execute("UPDATE capture_cases SET sealed=?,human_verdict=?,dwell=?,agreed=? WHERE case_id=? AND api_key=?",
-                            (ts, hv, dwell, agreed, cid, api_key))
-        ctx["conn"].commit()
-
-    out = {"case_id": cid, "verdict": hv, "dwell_seconds": dwell,
-           "machine_verdict": row[2], "sealed": _iso(ts),
-           "audit_hash": h, "block_index": idx, "receipt_seq": seq,
-           "measured_by": "server",
-           "note": "Your verdict was sealed before this response revealed ours. The chain fixes that order."}
-    if agreed is not None:
-        out["agreed"] = bool(agreed)
-    if dwell < 2:
-        out["flag"] = "sealed " + str(dwell) + "s after the case opened - recorded permanently"
-    return out, 200
-
-
-def _case(ctx, api_key, cid):
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT operator_fp,device_fp,input_hash,output_hash,machine_verdict,opened,sealed,human_verdict,dwell,agreed FROM capture_cases WHERE case_id=? AND api_key=?", (cid.upper(), api_key)).fetchone()
-        if not row:
-            return {"error": "unknown_case_id"}, 404
-        blocks = ctx["conn"].execute("SELECT ts,result_json,audit_hash FROM audit_log WHERE user_id=? ORDER BY id ASC", ("cap:" + cid.upper(),)).fetchall()
-    events = []
-    for bts, res, ah in blocks:
-        try:
-            r = json.loads(res)
-            events.append({"at": _iso(bts), "event": r.get("capture_action"),
-                           "detail": r.get("detail"), "sealed": ah})
-        except Exception:
-            pass
-    return {"case_id": cid.upper(),
-            "operator_fingerprint": (row[0] or "")[:16] + "...",
-            "device_fingerprint": (row[1] or "")[:16] + "...",
-            "input_hash": row[2], "output_hash": row[3],
-            "machine_verdict": row[4], "opened": _iso(row[5]),
-            "sealed": _iso(row[6]), "human_verdict": row[7],
-            "dwell_seconds": row[8],
-            "agreed": (None if row[9] is None else bool(row[9])),
-            "events": events,
-            "ordering_proof": "The opened block precedes the sealed block in the chain, and both timestamps are the server's."}, 200
-
-
-def _summary(ctx, api_key):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT dwell,agreed FROM capture_cases WHERE api_key=? AND sealed IS NOT NULL", (api_key,)).fetchall()
-        openc = ctx["conn"].execute("SELECT COUNT(*) FROM capture_cases WHERE api_key=? AND sealed IS NULL", (api_key,)).fetchone()[0]
-    if not rows:
-        return {"captures": 0, "open_cases": openc,
-                "note": "No sealed captures yet."}, 200
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    scored = [r[1] for r in rows if r[1] is not None]
-    n = len(dwells)
-    under2 = len([d for d in dwells if d < 2])
-    out = {"captures": len(rows), "open_cases": openc,
-           "median_dwell_seconds": (dwells[n // 2] if n else None),
-           "fastest_seconds": (dwells[0] if dwells else None),
-           "under_2_seconds": under2,
-           "under_2_seconds_pct": (round(100 * under2 / n, 1) if n else None)}
-    if scored:
-        agree = sum(scored)
-        out["agreement_rate_pct"] = round(100 * agree / len(scored), 1)
-        out["diverged"] = len(scored) - agree
-        if len(scored) >= 20 and agree == len(scored):
-            out["pattern"] = "never diverged from the machine across " + str(len(scored)) + " captures"
-    return out, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    if method == "POST":
-        if action == "token":
-            if not api_key:
-                return {"error": "api_key_required",
-                        "message": "Mint capture tokens from your server using your real key."}, 401
-            return _mint(ctx, api_key, data)
-        owner, how = _resolve(ctx, api_key, data)
-        if not owner:
-            return {"error": "invalid_credentials",
-                    "message": "Send a real API key server-side, or a valid capture_token with the origin it was bound to."}, 401
-        if action == "open":
-            return _open(ctx, owner, data)
-        if action == "seal":
-            return _seal(ctx, owner, data)
-    else:
-        if not api_key:
-            return {"error": "api_key_required",
-                    "message": "Reading capture records needs the real key, not a capture token."}, 401
-        if action == "devices":
-            return _devices(ctx, api_key, data)
-        if action == "summary":
-            return _summary(ctx, api_key)
-        if action == "case":
-            cid = str(data.get("id", "")).strip()
-            if not cid:
-                return {"error": "id_required"}, 400
-            return _case(ctx, api_key, cid)
-    return {"error": "unknown_action", "action": action}, 404
 
 ```

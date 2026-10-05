@@ -1,925 +1,2036 @@
-# Codebase — part 12 of 48
+# Codebase — part 12 of 49
 
 Contains:
-- `modules/humankeys.py`
+- `modules/grade.py`
+- `modules/heartbeat.py`
+- `modules/held.py`
+- `modules/homelink.py`
 
 
-## `modules/humankeys.py`
+## `modules/grade.py`
 
-913 lines, 53817 bytes
+674 lines, 26478 bytes
 
 ```python
 """
-modules/humankeys.py  v1.2.0  -  Human Keys: proof a human typed it
-
-    Page:    https://sebbi.pro/keys
-    Check:   https://sebbi.pro/k/<code>
-    Arm:     https://sebbi.pro/x/arm/status
+modules/grade.py  v1.0.0  —  public transparency-file scanner
 
 WHAT IT DOES
 ------------
-Someone types on the Human Keys page. The page records HOW they type - the
-gaps between keystrokes, the corrections, the thinking pauses, whether
-anything was pasted - and never WHAT they type. The text is fingerprinted
-(SHA-256) on their own device and only the fingerprint is sent.
+Fetches a domain's public convention files and reports, per file, what was
+actually found: served or not, parses or not, and the specific fields present.
+Nothing else.
 
-The rhythm is scored on the server, the fingerprint and the score are sealed
-into the chain, and they get a short code like HK-7Q2M-X9KD. Anyone can open
-https://sebbi.pro/k/HK-7Q2M-X9KD, paste the text, and see whether it matches
-something a human typed, live, on the date shown.
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+It does not issue a letter grade, a score, or a verdict, and the words
+"compliant" and "non-compliant" appear nowhere in its output.
 
-WHY IT CANNOT BE PREPARED IN ADVANCE
-------------------------------------
-A session starts with a challenge from the server: the latest public beacon
-(drand, sealed by the heartbeat module), the current chain tip and a signed
-server timestamp. The seal must carry that challenge, and the time the server
-saw pass between issuing it and the seal must be at least as long as the
-typing the page reports. A typing session cannot claim to be longer than the
-real time that passed, and cannot have started before a beacon nobody could
-know in advance.
+The reason is not squeamishness. Half of these files are conventions rather
+than requirements. No law anywhere obliges a company to serve ai.txt,
+comply.txt, llms.txt or an AI-safety file, and two of those are conventions
+this operator helped write. Scoring the market against your own file format
+and publishing a letter is marking other people's homework with your own
+marking scheme. So this reports observations and lets the reader conclude.
 
-WHAT IT PROVES, PRECISELY
--------------------------
-That the text was typed into this page by hand, live, with a human typing
-rhythm, and was not pasted or inserted by a program. It cannot see what is
-on the typist's screen, so it does not prove the words were their own; the
-"composition" signals (corrections, thinking pauses) are reported so a
-reader can judge.
+Absence is reported as absence. That is a fact about a file. It is not a
+finding about a company, and this module never converts one into the other.
 
-OWNERSHIP - SO NOBODY CAN PINCH IT
-----------------------------------
-The first time someone seals, their phone makes its own signing key (ECDSA
-P-256) and keeps it on the device. Every proof is signed with it and the
-public half is sealed with the proof. Later the owner taps "Prove this is
-mine" on the check page; their phone signs a fresh, timestamped message and
-gives them a link. Anyone opening the link sees the signature checked in
-their own browser against the sealed key. Someone who copied the text and
-the code cannot do that.
-
-The private key never comes to sebbi.pro, with one exception the owner
-chooses: they can have a backup code emailed to themselves when the key is
-first made. It passes through to the email and is never stored. The backup
-code restores the key on a new phone from https://sebbi.pro/keys.
-
-PRIVACY
--------
-The text never leaves the device. The raw keystroke timings are scored and
-thrown away; only summary figures are kept. Nothing identifies the typist.
-
-PRICE
------
-50p a month, unlimited proofs - the same as everything else on sebbi.pro.
-The first proof takes 50p from the credit wallet (the same wallet as Monop
-Studio, topped up at https://sebbi.pro/credits) and opens a 30-day pass;
-every proof in those 30 days is free. Checking a proof is free, always.
-Businesses seal with their API key instead - included in the 50p per device
-per month they already pay. POST /x/humankeys/seal with "reference" set to
-the decision block or case.
+THE CLOAKING CHECK WAS REMOVED
+------------------------------
+An earlier version compared homepage byte-length under two user agents and
+scored a >10% difference as cloaking. Any page with a clock, a nonce or a
+rotating banner fails that; real cloaking returning a similar-length page
+passes it. It measured noise and reported it as a signal, so it is gone
+rather than reworded.
 
 ROUTES
 ------
-  GET  /x/humankeys/status            public
-  GET  /x/humankeys/spec              public
-  GET  /x/humankeys/challenge         public - start a typing session
-  POST /x/humankeys/seal              public with a 50p monthly pass, or API key
-  GET  /x/humankeys/pass?viewer=      public - is this wallet's pass active
-  GET  /x/humankeys/check?code=       public - the sealed record
-  POST /x/humankeys/compare           public - {code, text_hash}: does it match
-  GET  /keys                          the keyboard
-  GET  /k/<code>                      the check page
-  GET  /k/<code>.svg                  a badge for the proof
+  POST /x/grade/scan          KEYED   scan a domain, seal the result
+  GET  /x/grade/report        public  ?domain= — the last scan of that domain
+  GET  /x/grade/list          public  domains scanned, most recent first
+  GET  /x/grade/spec          public  what each check means
+  GET  /grade-badge?domain=   public  SVG, served from cache ONLY
+
+BADGE BEHAVIOUR THAT MATTERS
+----------------------------
+The badge never triggers a fetch of the target. An earlier version re-ran
+every check on every image load, so embedding the badge on a busy page would
+have pointed sustained unsolicited traffic at somebody else's server from
+this IP. The badge now renders from the stored scan or says "not scanned".
+
+SAFETY
+------
+https only, port 443, DNS resolved and checked against private, loopback,
+link-local, multicast and reserved ranges before any request, redirects not
+followed, 8s timeout, 256KB cap per file. Known limit, stated rather than
+hidden: resolve-then-connect leaves a DNS rebinding window, the same gap
+witness.py has.
+
+/robots.txt is read first and its Disallow rules for * are honoured. A
+scanner that ignores robots while grading other people on transparency
+would be a poor advertisement for the point being made.
 """
 
-import hashlib
-import hmac
 import json
-import math
-import os
-import re
-import secrets
-import sys
-import threading
+import socket
+import ssl
 import time
-from datetime import datetime, timezone
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
 
-try:
-    from zoneinfo import ZoneInfo
-    _UK = ZoneInfo("Europe/London")
-except Exception:
-    _UK = None
+VERSION = "1.0.0"
 
-VERSION = "1.2.0"
-PRICE_PENCE = 50
-PASS_DAYS = 30
-CHALLENGE_TTL = 4 * 3600
-MIN_KEYS = 30
-MAX_INTERVALS = 6000
+PUBLIC = {("GET", "report"), ("GET", "list"), ("GET", "spec"), ("GET", "")}
 
-PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "challenge"), ("POST", "seal"),
-          ("GET", "check"), ("POST", "compare"), ("GET", "pass")}
+PAGE_PATHS = ("/grade-badge",)
 
-CODE_RE = re.compile(r"^HK-[A-Z2-9]{4}-[A-Z2-9]{4}$")
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-B64 = re.compile(r"^[A-Za-z0-9+/=_-]{40,400}$")
-EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,24}$")
-VIEWER_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
-ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+UA = "AILeash-Transparency-Scan/1.0 (+https://sebbi.pro/x/grade/spec)"
+TIMEOUT = 8
+MAX_BYTES = 262144
+CACHE_TTL = 3600
 
-_state = {"ready": False, "page": False, "sealed": 0, "last_error": None}
-_lock = threading.Lock()
-_EPHEMERAL = secrets.token_bytes(32)
+# Files that are genuine public-web standards with an RFC or a long-standing
+# convention behind them. Absence here is still not a legal finding, but the
+# expectation is at least widely shared.
+STANDARDS = [
+    ("security_txt", "/.well-known/security.txt", "RFC 9116 security contact"),
+    ("robots_txt", "/robots.txt", "crawler directives"),
+    ("sitemap_xml", "/sitemap.xml", "site index"),
+]
+
+# Files that are emerging AI-transparency conventions. Reported as adoption
+# facts, never scored, because nobody is obliged to serve any of them.
+CONVENTIONS = [
+    ("ai_txt", "/.well-known/ai.txt", "AI system manifest"),
+    ("ai_txt_root", "/ai.txt", "AI system manifest at root"),
+    ("comply_txt", "/.well-known/comply.txt", "compliance index"),
+    ("llms_txt", "/llms.txt", "guidance for language models"),
+    ("ai_safety_txt", "/.well-known/ai-safety.txt", "AI-safety declaration"),
+]
+
+_patched = [False]
+_ready = [False]
+_cache = {}
+
+
+def _setup(ctx):
+    if _ready[0]:
+        return
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "CREATE TABLE IF NOT EXISTS grade_scan("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,domain TEXT,scanned REAL,"
+            "findings TEXT,standards_served INTEGER,conventions_served INTEGER,"
+            "audit_hash TEXT,block_index INTEGER)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_grade_domain ON grade_scan(domain)")
+        ctx["conn"].execute(
+            "CREATE INDEX IF NOT EXISTS idx_grade_hash ON grade_scan(audit_hash)")
+        ctx["conn"].commit()
+    _ready[0] = True
+
+
+# ----------------------------------------------------------------------
+# safety
+# ----------------------------------------------------------------------
+
+def _clean_domain(raw):
+    d = str(raw or "").strip().lower()
+    d = d.replace("https://", "").replace("http://", "")
+    d = d.split("/")[0].split("?")[0].strip().rstrip(".")
+    if "@" in d or ":" in d or " " in d:
+        return None
+    if not d or "." not in d or len(d) > 253:
+        return None
+    for ch in d:
+        if not (ch.isalnum() or ch in ".-"):
+            return None
+    return d
+
+
+def _private(ip):
+    parts = ip.split(".")
+    if len(parts) == 4:
+        try:
+            a, b = int(parts[0]), int(parts[1])
+        except ValueError:
+            return True
+        if a == 10 or a == 127 or a == 0:
+            return True
+        if a == 172 and 16 <= b <= 31:
+            return True
+        if a == 192 and b == 168:
+            return True
+        if a == 169 and b == 254:
+            return True
+        if a == 100 and 64 <= b <= 127:
+            return True
+        if a >= 224:
+            return True
+        return False
+    low = ip.lower()
+    if low in ("::1", "::", "") or low.startswith(("fc", "fd", "fe80", "::ffff:")):
+        return True
+    return False
+
+
+def _resolvable(domain):
+    try:
+        infos = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, "dns_failed: " + type(exc).__name__
+    for info in infos:
+        ip = info[4][0]
+        if _private(ip):
+            return False, "resolves_to_non_public_address"
+    return True, None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def _get(url):
+    """One request. Returns (status, text, note). Never raises."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    opener = urllib.request.build_opener(
+        _NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    try:
+        with opener.open(req, timeout=TIMEOUT) as resp:
+            raw = resp.read(MAX_BYTES + 1)
+            truncated = len(raw) > MAX_BYTES
+            text = raw[:MAX_BYTES].decode("utf-8", errors="replace")
+            return resp.status, text, ("truncated" if truncated else None)
+    except urllib.error.HTTPError as exc:
+        return exc.code, None, None
+    except Exception as exc:
+        return None, None, type(exc).__name__
+
+
+# ----------------------------------------------------------------------
+# parsing — every check states exactly what it looked at
+# ----------------------------------------------------------------------
+
+def _fields(text):
+    """Key: value lines, lowercased keys. Comments and blanks ignored."""
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip().lower()
+        if k and k not in out:
+            out[k] = v.strip()
+    return out
+
+
+def _check_security(text):
+    f = _fields(text)
+    return {
+        "parses_as_fields": bool(f),
+        "has_contact": "contact" in f,
+        "has_expires": "expires" in f,
+        "expires_value": f.get("expires"),
+        "note": ("RFC 9116 requires Contact and Expires. Both presence checks "
+                 "above are literal: the field is there or it is not. Whether "
+                 "the contact works is not tested."),
+    }
+
+
+def _check_robots(text):
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    directives = [l for l in lines if ":" in l and not l.startswith("#")]
+    return {
+        "non_empty": bool(lines),
+        "directive_lines": len(directives),
+        "note": "Presence and shape only. The rules themselves are not judged.",
+    }
+
+
+def _check_sitemap(text):
+    try:
+        import xml.etree.ElementTree as ET
+        ET.fromstring(text or "")
+        return {"parses_as_xml": True,
+                "note": "Parsed as XML. Contents and freshness are not checked."}
+    except Exception as exc:
+        return {"parses_as_xml": False, "parse_error": type(exc).__name__,
+                "note": "Served but did not parse as XML."}
+
+
+def _check_ai_safety(text):
+    """The old version passed if the file contained 'ai-safe:' and the word
+    'true' anywhere in it, so 'AI-Safe: false' with 'true' elsewhere passed.
+    This reads the field's own value and reports it verbatim."""
+    f = _fields(text)
+    val = f.get("ai-safe")
+    return {
+        "has_ai_safe_field": val is not None,
+        "ai_safe_value": val,
+        "declared_safe": (val.strip().lower() == "true") if val else None,
+        "note": ("This reports what the domain declares about itself. A "
+                 "self-declaration is not a verification, and nothing here "
+                 "checks whether the declaration is true."),
+    }
+
+
+def _check_manifest(text):
+    f = _fields(text)
+    interesting = ["standard", "domain", "chain-head", "chain-tip-url", "witness-tip",
+                   "verify-chain", "consistency-proof", "self-check",
+                   "security-contact", "contact", "governance-engine"]
+    return {
+        "parses_as_fields": bool(f),
+        "field_count": len(f),
+        "fields_present": [k for k in interesting if k in f],
+        "declares_standard": f.get("standard"),
+        "note": ("Fields are reported as served. Nothing here follows the URLs "
+                 "they contain or verifies any chain they point at."),
+    }
+
+
+def _check_present(text):
+    return {"non_empty": bool(text and text.strip()),
+            "bytes": len(text or ""),
+            "note": "Presence and size only."}
+
+
+PARSERS = {
+    "security_txt": _check_security,
+    "robots_txt": _check_robots,
+    "sitemap_xml": _check_sitemap,
+    "ai_safety_txt": _check_ai_safety,
+    "ai_txt": _check_manifest,
+    "ai_txt_root": _check_manifest,
+    "comply_txt": _check_manifest,
+    "llms_txt": _check_present,
+}
+
+
+def _disallowed(robots_text):
+    """Paths Disallowed for * in robots.txt. Honoured for every other fetch."""
+    blocked = []
+    applies = False
+    for line in (robots_text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k, _, v = line.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if k == "user-agent":
+            applies = (v == "*")
+        elif k == "disallow" and applies and v:
+            blocked.append(v)
+    return blocked
+
+
+def _blocked(path, rules):
+    for rule in rules:
+        if rule == "/" or path.startswith(rule):
+            return True
+    return False
+
+
+# ----------------------------------------------------------------------
+# the scan
+# ----------------------------------------------------------------------
+
+def _scan(domain):
+    base = "https://" + domain
+    findings = {}
+
+    status, robots_text, note = _get(base + "/robots.txt")
+    rules = _disallowed(robots_text) if status == 200 else []
+    findings["robots_txt"] = {
+        "path": "/robots.txt", "http_status": status,
+        "served": status == 200, "transport_note": note,
+        "detail": _check_robots(robots_text) if status == 200 else None,
+        "kind": "standard", "description": "crawler directives",
+    }
+
+    for key, path, desc in STANDARDS + CONVENTIONS:
+        if key == "robots_txt":
+            continue
+        if _blocked(path, rules):
+            findings[key] = {
+                "path": path, "served": None, "http_status": None,
+                "skipped": "disallowed_by_robots_txt",
+                "kind": "standard" if key in [k for k, _, _ in STANDARDS] else "convention",
+                "description": desc,
+                "note": ("This domain's robots.txt disallows it, so it was not "
+                         "requested. Not requested is not the same as absent."),
+            }
+            continue
+        st, text, tnote = _get(base + path)
+        served = (st == 200 and bool(text and text.strip()))
+        findings[key] = {
+            "path": path, "http_status": st, "served": served,
+            "transport_note": tnote,
+            "detail": PARSERS[key](text) if served else None,
+            "kind": "standard" if key in [k for k, _, _ in STANDARDS] else "convention",
+            "description": desc,
+        }
+
+    std_keys = [k for k, _, _ in STANDARDS]
+    conv_keys = [k for k, _, _ in CONVENTIONS]
+    std_served = sum(1 for k in std_keys if findings.get(k, {}).get("served"))
+    conv_served = sum(1 for k in conv_keys if findings.get(k, {}).get("served"))
+
+    return findings, std_served, conv_served
+
+
+def _summary(domain, findings, std, conv, scanned, receipt=None, block=None):
+    return {
+        "domain": domain,
+        "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(scanned)),
+        "standards_served": "%d of %d" % (std, len(STANDARDS)),
+        "conventions_served": "%d of %d" % (conv, len(CONVENTIONS)),
+        "findings": findings,
+        "receipt": receipt,
+        "block_index": block,
+        "what_this_is": (
+            "A record of which public files this domain served at the time of "
+            "the scan, and what each one contained. Every check is named and "
+            "every result is what the fetch returned."),
+        "what_this_is_not": (
+            "Not a grade, not a score, and not a statement about whether this "
+            "organisation complies with anything. No law requires any of the "
+            "files above. Absence of a file is absence of a file."),
+        "conventions_disclaimer": (
+            "ai.txt and comply.txt are conventions sebbi.pro publishes and helped "
+            "shape. A domain not serving them has declined nothing and broken "
+            "nothing - it has simply not adopted a format that is not a standard."),
+        "if_you_are_the_domain_owner": (
+            "This scan requested public files over https and followed your "
+            "robots.txt. Nothing was crawled beyond the paths listed. The scan "
+            "is sealed, so exactly what was fetched and when is on record and "
+            "can be produced. Contact justrightdecorators@gmail.com to have a "
+            "scan removed from the public list."),
+    }
+
+
+# ----------------------------------------------------------------------
+# badge — cache only, never triggers a fetch of the target
+# ----------------------------------------------------------------------
+
+def _badge_svg(label, value, colour):
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="260" height="20" '
+        'role="img" aria-label="%s %s">'
+        '<rect width="176" height="20" fill="#0a0f1e"/>'
+        '<rect x="176" width="84" height="20" fill="%s"/>'
+        '<text x="88" y="14" fill="#fff" font-family="Verdana,sans-serif" '
+        'font-size="10" text-anchor="middle">%s</text>'
+        '<text x="218" y="14" fill="#0a0f1e" font-family="Verdana,sans-serif" '
+        'font-size="10" font-weight="bold" text-anchor="middle">%s</text>'
+        '</svg>' % (label, value, colour, label, value))
+
+
+def _srv():
+    import sys
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s, ctx):
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_grade_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    conn, lock = ctx["conn"], ctx["lock"]
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            u = urlparse(self.path)
+            p = u.path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            domain = ""
+            try:
+                q = dict(pair.split("=", 1) for pair in (u.query or "").split("&") if "=" in pair)
+                domain = _clean_domain(q.get("domain", "")) or ""
+            except Exception:
+                domain = ""
+            label = "transparency files"
+            value, colour = "not scanned", "#6b6353"
+            if domain:
+                try:
+                    with lock:
+                        row = conn.execute(
+                            "SELECT standards_served,conventions_served FROM grade_scan "
+                            "WHERE domain=? ORDER BY id DESC LIMIT 1", (domain,)).fetchone()
+                    if row:
+                        value = "%d/%d std · %d/%d conv" % (
+                            row[0], len(STANDARDS), row[1], len(CONVENTIONS))
+                        colour = "#7fe3b0" if row[0] == len(STANDARDS) else "#c9a84c"
+                except Exception:
+                    pass
+            body = _badge_svg(label, value, colour).encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._grade_patched = True
+    _patched[0] = True
+    print("GRADE: /grade-badge installed at runtime", flush=True)
+    return "installed"
+
+
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
+
+def _do_scan(ctx, api_key, data):
+    domain = _clean_domain((data or {}).get("domain"))
+    if not domain:
+        return {"error": "domain_required",
+                "message": "Send {\"domain\": \"example.com\"}."}, 400
+
+    cached = _cache.get(domain)
+    if cached and (time.time() - cached[0]) < CACHE_TTL and not (data or {}).get("force"):
+        out = dict(cached[1])
+        out["from_cache"] = True
+        out["cache_age_seconds"] = int(time.time() - cached[0])
+        return out, 200
+
+    ok, why = _resolvable(domain)
+    if not ok:
+        return {"error": "domain_refused", "domain": domain, "reason": why,
+                "message": "Only public, resolvable hosts are scanned."}, 400
+
+    scanned = time.time()
+    findings, std, conv = _scan(domain)
+
+    ev = {"user_id": "grade:" + domain, "action": "transparency_scan",
+          "amount": 0, "country": "UK", "device_id": "grade",
+          "anomaly": 0, "device_risk": 0}
+    res = {"decision": "SCAN_RECORDED", "score": 0, "grade_version": VERSION,
+           "domain": domain, "standards_served": std, "conventions_served": conv,
+           "timestamp": scanned,
+           "detail": "domain=%s;standards=%d/%d;conventions=%d/%d"
+                     % (domain, std, len(STANDARDS), conv, len(CONVENTIONS))}
+    try:
+        h, idx, seq = ctx["seal"](ev, res, scanned, api_key)
+    except Exception as exc:
+        return {"error": "seal_failed",
+                "detail": type(exc).__name__ + ": " + str(exc)[:250],
+                "message": ("The scan ran but was not recorded, so nothing is "
+                            "published. A scan nobody can audit is not published "
+                            "here.")}, 500
+    if not h:
+        return {"error": "seal_failed", "detail": "seal returned no hash"}, 500
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO grade_scan(domain,scanned,findings,standards_served,"
+            "conventions_served,audit_hash,block_index) VALUES(?,?,?,?,?,?,?)",
+            (domain, scanned, json.dumps(findings), std, conv, h, idx))
+        ctx["conn"].commit()
+
+    out = _summary(domain, findings, std, conv, scanned, h, idx)
+    out["receipt_seq"] = seq
+    out["badge"] = "https://sebbi.pro/grade-badge?domain=" + domain
+    out["report"] = "https://sebbi.pro/x/grade/report?domain=" + domain
+    _cache[domain] = (scanned, out)
+    if len(_cache) > 500:
+        for k in sorted(_cache, key=lambda k: _cache[k][0])[:100]:
+            _cache.pop(k, None)
+    return out, 200
+
+
+def _report(ctx, data):
+    domain = _clean_domain((data or {}).get("domain"))
+    if not domain:
+        return {"error": "domain_required"}, 400
+    with ctx["lock"]:
+        row = ctx["conn"].execute(
+            "SELECT scanned,findings,standards_served,conventions_served,"
+            "audit_hash,block_index FROM grade_scan WHERE domain=? "
+            "ORDER BY id DESC LIMIT 1", (domain,)).fetchone()
+    if not row:
+        return {"found": False, "domain": domain,
+                "message": "This domain has not been scanned."}, 404
+    try:
+        findings = json.loads(row[1])
+    except Exception:
+        findings = {}
+    out = _summary(domain, findings, row[2], row[3], row[0], row[4], row[5])
+    out["found"] = True
+    out["badge"] = "https://sebbi.pro/grade-badge?domain=" + domain
+    return out, 200
+
+
+def _list(ctx, data):
+    try:
+        limit = min(200, max(1, int((data or {}).get("limit", 50))))
+    except (TypeError, ValueError):
+        limit = 50
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT domain,MAX(scanned),standards_served,conventions_served "
+            "FROM grade_scan GROUP BY domain ORDER BY MAX(scanned) DESC LIMIT ?",
+            (limit,)).fetchall()
+    return {
+        "count": len(rows),
+        "scans": [{
+            "domain": r[0],
+            "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[1])),
+            "standards_served": "%d of %d" % (r[2], len(STANDARDS)),
+            "conventions_served": "%d of %d" % (r[3], len(CONVENTIONS)),
+            "report": "/x/grade/report?domain=" + r[0],
+        } for r in rows],
+        "what_this_list_is": (
+            "Domains that have been scanned, with what they served. It is not a "
+            "ranking, not a shortlist and not an allegation about anyone on it."),
+    }, 200
+
+
+def _spec():
+    return {
+        "module": "grade", "version": VERSION,
+        "question": "Which public transparency files does this domain serve, and what is in them?",
+        "standards_checked": [{"key": k, "path": p, "what": d} for k, p, d in STANDARDS],
+        "conventions_checked": [{"key": k, "path": p, "what": d} for k, p, d in CONVENTIONS],
+        "no_grade": (
+            "This module issues no letter, no score and no verdict, and the word "
+            "compliant appears nowhere in its output. Half of these files are "
+            "conventions rather than requirements, two of them are conventions "
+            "sebbi.pro helped write, and grading strangers against your own "
+            "format would be marking their homework with your marking scheme."),
+        "absence": (
+            "A file that is not served is reported as not served. That is a fact "
+            "about a file and never a finding about a company."),
+        "self_declarations": (
+            "Where a file declares something about the domain - ai-safe: true, a "
+            "chain head, a standard version - the declaration is reported "
+            "verbatim and is never treated as verified. Nothing here follows the "
+            "URLs a manifest contains."),
+        "how_it_fetches": {
+            "scheme": "https only, port 443",
+            "redirects": "not followed",
+            "timeout_seconds": TIMEOUT,
+            "max_bytes_per_file": MAX_BYTES,
+            "address_check": ("DNS resolved and rejected if it points at private, "
+                              "loopback, link-local, multicast or reserved space"),
+            "known_limit": ("resolve-then-connect leaves a DNS rebinding window; "
+                            "stated rather than hidden"),
+            "robots": "/robots.txt is read first and Disallow rules for * are honoured",
+            "user_agent": UA,
+        },
+        "badge": {
+            "url": "https://sebbi.pro/grade-badge?domain=example.com",
+            "behaviour": ("renders from the stored scan only and never fetches the "
+                          "target, so embedding it cannot point traffic at anyone"),
+        },
+        "every_scan_is_sealed": (
+            "Each scan is written into the audit chain with its receipt, so a "
+            "domain owner who objects can be shown exactly what was requested "
+            "and when."),
+        "auth": "scan is keyed. report, list, spec and the badge are public.",
+    }, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    s = _srv()
+    if s is not None and not _patched[0]:
+        try:
+            _install(s, ctx)
+        except Exception as exc:
+            print("GRADE: patch failed - " + str(exc), flush=True)
+
+    action = (action or "").strip("/").lower()
+
+    if method == "POST":
+        if action == "scan":
+            if not api_key:
+                return {"error": "api_key_required",
+                        "message": ("Scanning fetches somebody else's server, so it "
+                                    "is keyed and attributable. Reading results is "
+                                    "public.")}, 401
+            return _do_scan(ctx, api_key, data)
+        return {"error": "unknown_action", "action": action, "POST": ["scan"]}, 404
+
+    if action in ("", "spec"):
+        return _spec()
+    if action == "report":
+        return _report(ctx, data)
+    if action == "list":
+        return _list(ctx, data)
+    if action == "status":
+        return {"module": "grade", "version": VERSION,
+                "badge_installed": bool(_patched[0]),
+                "cached_domains": len(_cache)}, 200
+    return {"error": "unknown_action", "action": action,
+            "GET": ["spec", "report", "list", "status"], "POST": ["scan"]}, 404
+
+```
+
+
+## `modules/heartbeat.py`
+
+872 lines, 31733 bytes
+
+```python
+"""
+heartbeat.py - the two-sided clock.
+
+WHAT PROBLEM THIS SOLVES
+------------------------
+Every timestamp in this system is a number the operator wrote. External
+anchoring (OpenTimestamps) and peer witnessing both prove a record existed
+BEFORE some later public event. They are ceilings.
+
+Nothing proved a floor. Nothing stopped a record being created EARLIER than
+it claims, or a whole chain being pre-computed in advance and released
+slowly to look live. That is the fraud that actually happens: the grant
+written after the incident, the decision dated last Tuesday.
+
+A clock cannot fix this. Anyone can write down what a clock will say at
+14:32:07 tomorrow, so hashing a clock face adds a hash, not a time.
+
+WHAT DOES FIX IT
+----------------
+A public beacon: a source that ticks on a fixed cadence like a clock, but
+whose value at each tick cannot be known by anyone until the tick happens.
+drand (League of Entropy) publishes one every 30 seconds. Bitcoin publishes
+one roughly every ten minutes.
+
+Fold that value into a sealed block and the block cannot have been created
+before the tick existed. Not because we say so - because it contains a
+number that did not exist yet.
+
+THE INTERLEAVE, WHICH IS THE WHOLE TRICK
+----------------------------------------
+We do NOT stamp every decision. We seal one beat into the chain every few
+minutes. The chain is append-only and prev-hash linked, so any record
+sitting between beat A and beat B was necessarily created after A and
+before B.
+
+One beat therefore gives a floor to every record that follows it, and the
+next beat gives all of them a ceiling. Every decision gets a two-sided
+window for free, with no change to seal(), no change to server.py, and no
+extra latency on the decision path.
+
+The window width is published on every answer. It is a live public
+measurement of how much room the operator would have to lie in. It is the
+only number in this system that gets better by us doing more work, and
+worse by us doing less, which is why it is published.
+
+WHAT THIS DOES NOT DO
+---------------------
+- It does not prove the record is true. It proves when it can have been made.
+- It does not verify drand's BLS signature (not feasible in pure stdlib).
+  It records the round and the randomness verbatim, and anyone can re-fetch
+  that round from drand and confirm the value matches. Deterministic,
+  public, and does not involve us.
+- A record inside an open window (after the last beat, before the next) has
+  a floor and no ceiling yet. That is reported as open, never as closed.
+- Beats can only be sealed by whoever runs this server. What stops the
+  operator sealing a stale tick is that the tick is timestamped and public:
+  sealing round N long after round N happened widens the window and shows.
+
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec        public   what this is, how to verify it yourself
+  GET  latest      public   the most recent beat sealed
+  GET  ticks       public   recent beats
+  GET  window      public   ?block= or ?receipt= - the two-sided window
+  GET  verify      public   ?round= - what we sealed, and where to check it
+  GET  status      public   cadence, coverage, mean window
+  POST beat        keyed    fetch a tick now and seal it
+  POST source      keyed    add a beacon reading fetched elsewhere (air-gap)
+"""
+
+import json
+import time
+import sqlite3
+import threading
+import urllib.request
+import urllib.error
+
+VERSION = "1.3.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "latest"),
+    ("GET", "ticks"),
+    ("GET", "window"),
+    ("GET", "verify"),
+    ("GET", "status"),
+}
+
+# ---------------------------------------------------------------------
+# Beacon sources. Fixed hosts only - this is an allowlist, not a fetcher.
+# ---------------------------------------------------------------------
+# Each source: name, url, cadence in seconds, and a parser returning
+# (round, value, source_time_or_None).
+
+BEACON_HOSTS = {
+    "api.drand.sh",
+    "drand.cloudflare.com",
+    "mempool.space",
+}
+
+FETCH_TIMEOUT = 8
+MAX_BODY = 65536
+
+BEAT_SECONDS = 300          # one beat every five minutes
+AUTO_BEAT = True
+MIN_BEAT_GAP = 60           # refuse to beat more often than this
+
+_timer_lock = threading.Lock()
+_timer_started = False
+_beat_runs = 0
+_beat_last = None
+_beat_last_error = None
+
+
+def _parse_drand(raw):
+    d = json.loads(raw)
+    rnd = int(d["round"])
+    val = str(d["randomness"])
+    if not val or len(val) < 32:
+        raise ValueError("drand randomness missing or too short")
+    return rnd, val, None
+
+
+def _parse_btc_tip(raw):
+    val = raw.strip()
+    if len(val) != 64 or any(c not in "0123456789abcdefABCDEF" for c in val):
+        raise ValueError("bitcoin tip hash not a 64-char hex string")
+    return None, val.lower(), None
+
+
+SOURCES = [
+    {
+        "name": "drand-quicknet",
+        "url": "https://api.drand.sh/v2/beacons/quicknet/rounds/latest",
+        "cadence_seconds": 3,
+        "parse": _parse_drand,
+        "verify_url": "https://api.drand.sh/v2/beacons/quicknet/rounds/{round}",
+        "note": "League of Entropy public randomness beacon, quicknet chain",
+    },
+    {
+        "name": "drand-default",
+        "url": "https://api.drand.sh/public/latest",
+        "cadence_seconds": 30,
+        "parse": _parse_drand,
+        "verify_url": "https://api.drand.sh/public/{round}",
+        "note": "League of Entropy public randomness beacon, default chain",
+    },
+    {
+        "name": "bitcoin-tip",
+        "url": "https://mempool.space/api/blocks/tip/hash",
+        "cadence_seconds": 600,
+        "parse": _parse_btc_tip,
+        "verify_url": "https://mempool.space/block/{value}",
+        "note": "Bitcoin chain tip - slower, but the hardest to influence",
+    },
+]
+
+VOCABULARY = {
+    "floor": (
+        "The record was created after this beat, because the chain is "
+        "append-only and the record sits after a block containing a value "
+        "that did not exist before the beat."
+    ),
+    "ceiling": (
+        "The record was created before this beat, because the record sits "
+        "before it in an append-only chain."
+    ),
+    "window": (
+        "The span between floor and ceiling. The record can have been "
+        "created at any moment inside it and no moment outside it. Smaller "
+        "is stronger. This is a measurement, not a claim."
+    ),
+    "open": (
+        "There is a floor but no ceiling yet: the next beat has not been "
+        "sealed. Reported as open rather than closed. It closes on the "
+        "next beat, and nothing about the record changes when it does."
+    ),
+    "unfloored": (
+        "The record predates the first beat ever sealed. It has no floor "
+        "from this module. Its ceiling still holds."
+    ),
+}
+
+WHAT_THIS_PROVES = (
+    "A window, not a truth. Inside the window the record could have been "
+    "created at any instant. Outside it, it could not have been created at "
+    "all. It says nothing about whether the record's contents are correct."
+)
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS heartbeat_tick (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        source       TEXT NOT NULL,
+        beacon_round INTEGER,
+        value        TEXT NOT NULL,
+        fetched_at   REAL NOT NULL,
+        cadence      INTEGER,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT,
+        note         TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_hb_rowid ON heartbeat_tick(chain_rowid)",
+    "CREATE INDEX IF NOT EXISTS idx_hb_round ON heartbeat_tick(source, beacon_round)",
+]
 
 
 # ---------------------------------------------------------------------
 # plumbing
 # ---------------------------------------------------------------------
 
-def _srv():
-    m = sys.modules.get("__main__")
-    if not hasattr(m, "get_bearer"):
-        m = sys.modules.get("server")
-    return m
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        # diagnostic columns, added without breaking an existing table
+        cur.execute("PRAGMA table_info(heartbeat_tick)")
+        have = [r[1] for r in cur.fetchall()]
+        for col in ("seal_shape", "seal_error"):
+            if col not in have:
+                try:
+                    cur.execute("ALTER TABLE heartbeat_tick ADD COLUMN %s TEXT" % col)
+                except Exception:
+                    pass
+        conn.commit()
 
 
-def _secret():
-    s = os.environ.get("HUMANKEYS_SECRET") or os.environ.get("LICENCE_SECRET") or ""
-    return s.encode() if s else _EPHEMERAL
+def _host_of(url):
+    try:
+        rest = url.split("://", 1)[1]
+    except IndexError:
+        return ""
+    return rest.split("/", 1)[0].split(":", 1)[0].lower()
+
+
+def _fetch(url):
+    if not url.startswith("https://"):
+        raise ValueError("https only")
+    host = _host_of(url)
+    if host not in BEACON_HOSTS:
+        raise ValueError("host not on the beacon allowlist: %s" % host)
+    req = urllib.request.Request(url, headers={"User-Agent": "aileash-heartbeat/1.0"})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
+        return r.read(MAX_BODY).decode("utf-8", "replace")
+
+
+def _read_tick(fetcher=None):
+    """Try each source in order. Returns dict or raises."""
+    fetcher = fetcher or _fetch
+    errors = []
+    for src in SOURCES:
+        try:
+            raw = fetcher(src["url"])
+            rnd, val, _ = src["parse"](raw)
+            return {
+                "source": src["name"],
+                "beacon_round": rnd,
+                "value": val,
+                "cadence": src["cadence_seconds"],
+                "note": src["note"],
+            }
+        except Exception as e:
+            errors.append("%s: %s" % (src["name"], e))
+    raise RuntimeError("no beacon reachable | " + " | ".join(errors))
+
+
+def _seal(ctx, action, payload):
+    """Seal through the host's seal().
+
+    Confirmed from server.py: seal(event, result, ts, api_key=None) where
+    EVENT IS A DICT carrying user_id (it is subscripted inside), and the
+    return is (audit_hash, block_index, key_seq). So the block position
+    comes back directly and does not have to be guessed from MAX(rowid).
+
+    Returns (ok, shape, error, audit_hash, block_index).
+    """
+    fn = ctx.get("seal")
+    if fn is None:
+        return False, None, "ctx has no seal function", None, None
+
+    ts = time.time()
+    event = {
+        "user_id": "heartbeat",
+        "action": action,
+        "amount": 0,
+        "country": "UK",
+        "device_id": "heartbeat",
+        "anomaly": 0,
+        "device_risk": 0,
+    }
+    result = dict(payload)
+    result.setdefault("decision", "BEACON_SEALED")
+    result.setdefault("score", 0)
+    result.setdefault("version", VERSION)
+    result.setdefault("timestamp", ts)
+
+    attempts = [
+        ("seal(event_dict, result, ts)", lambda: fn(event, result, ts)),
+        ("seal(event_dict, result, ts, None)", lambda: fn(event, result, ts, None)),
+        ("seal(event_dict, result)", lambda: fn(event, result)),
+    ]
+
+    errors = []
+    for shape, call in attempts:
+        try:
+            out = call()
+        except Exception as e:
+            errors.append("%s -> %s: %s" % (shape, type(e).__name__, e))
+            continue
+        h = idx = None
+        if isinstance(out, (tuple, list)):
+            for item in out:
+                if isinstance(item, str) and len(item) == 64 and h is None:
+                    h = item
+                elif isinstance(item, int) and idx is None:
+                    idx = item
+        elif isinstance(out, str):
+            h = out
+        return True, shape, None, h, idx
+    return False, None, " | ".join(errors), None, None
+
+
+def _audit_table(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'")
+    return cur.fetchone() is not None
+
+
+def _cols(conn, table):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(%s)" % table)
+    return [r[1] for r in cur.fetchall()]
+
+
+def _hash_col(conn):
+    c = _cols(conn, "audit_log")
+    for name in ("audit_hash", "hash", "block_hash"):
+        if name in c:
+            return name
+    return None
+
+
+def _latest_rowid(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(rowid) FROM audit_log")
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else 0
+
+
+def _backfill(conn, lock, tick_id):
+    """After a seal, learn which chain row it landed on."""
+    hcol = _hash_col(conn)
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        row = cur.fetchone()
+        rid = row[0] if row and row[0] is not None else None
+        h = None
+        if rid is not None and hcol:
+            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
+            r2 = cur.fetchone()
+            h = r2[0] if r2 else None
+        cur.execute(
+            "UPDATE heartbeat_tick SET chain_rowid=?, audit_hash=? WHERE id=?",
+            (rid, h, tick_id),
+        )
+        conn.commit()
+    return rid, h
+
+
+# ---------------------------------------------------------------------
+# the beat
+# ---------------------------------------------------------------------
+
+def _do_beat(ctx, fetcher=None, forced=False):
+    global _beat_runs, _beat_last, _beat_last_error
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT fetched_at FROM heartbeat_tick ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+    if row and not forced and (time.time() - row[0]) < MIN_BEAT_GAP:
+        return {"beat": False, "reason": "too_soon", "min_gap_seconds": MIN_BEAT_GAP}, 429
+
+    tick = _read_tick(fetcher)
+    now = time.time()
+
+    event = "heartbeat_beat"
+    result = {
+        "kind": "beacon_tick",
+        "source": tick["source"],
+        "round": tick["beacon_round"],
+        "value": tick["value"],
+        "cadence_seconds": tick["cadence"],
+        "fetched_at": now,
+        "note": (
+            "Unpredictable public value. Any block after this one in this "
+            "append-only chain was created after this tick existed."
+        ),
+    }
+
+    with lock:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO heartbeat_tick (source, beacon_round, value, fetched_at,"
+            " cadence, note) VALUES (?,?,?,?,?,?)",
+            (tick["source"], tick["beacon_round"], tick["value"], now,
+             tick["cadence"], tick["note"]),
+        )
+        tick_id = cur.lastrowid
+        conn.commit()
+
+    ok, shape, err, h, rid = _seal(ctx, event, result)
+    if ok and (rid is None or h is None):
+        try:
+            rid2, h2 = _backfill(conn, lock, tick_id)
+            rid = rid if rid is not None else rid2
+            h = h if h is not None else h2
+        except Exception:
+            pass
+    with lock:
+        conn.execute("UPDATE heartbeat_tick SET seal_shape=?, seal_error=?,"
+                     " chain_rowid=?, audit_hash=? WHERE id=?",
+                     (shape, err, rid, h, tick_id))
+        conn.commit()
+
+    _beat_runs += 1
+    _beat_last = now
+    _beat_last_error = err
+
+    return {
+        "beat": True,
+        "sealed_into_chain": bool(ok and rid),
+        "seal_shape": shape,
+        "seal_error": err,
+        "tick_id": tick_id,
+        "source": tick["source"],
+        "round": tick["beacon_round"],
+        "value": tick["value"],
+        "cadence_seconds": tick["cadence"],
+        "sealed_at_chain_rowid": rid,
+        "audit_hash": h,
+        "verify_yourself": _verify_url(tick["source"], tick["beacon_round"], tick["value"]),
+    }, 200
+
+
+def _verify_url(source, rnd, value):
+    for s in SOURCES:
+        if s["name"] == source:
+            u = s["verify_url"]
+            if rnd is not None:
+                return u.replace("{round}", str(rnd)).replace("{value}", str(value))
+            return u.replace("{value}", str(value))
+    return None
+
+
+def _start_timer(ctx):
+    global _timer_started
+    with _timer_lock:
+        if _timer_started or not AUTO_BEAT:
+            return
+        _timer_started = True
+
+    for t in threading.enumerate():
+        if t.name == "heartbeat" and t.is_alive():
+            return
+
+    def loop():
+        global _beat_last_error
+        while True:
+            try:
+                _do_beat(ctx)
+            except Exception as e:
+                _beat_last_error = str(e)
+            time.sleep(BEAT_SECONDS)
+
+    t = threading.Thread(target=loop, name="heartbeat", daemon=True)
+    t.start()
+
+
+# ---------------------------------------------------------------------
+# the window
+# ---------------------------------------------------------------------
+
+def _find_rowid(conn, block, receipt):
+    if block is not None:
+        try:
+            return int(block)
+        except (TypeError, ValueError):
+            return None
+    if receipt:
+        hcol = _hash_col(conn)
+        if not hcol:
+            return None
+        cur = conn.cursor()
+        cur.execute("SELECT rowid FROM audit_log WHERE %s=? LIMIT 1" % hcol, (receipt,))
+        r = cur.fetchone()
+        return r[0] if r else None
+    return None
+
+
+def _window_for(conn, rowid):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, source, beacon_round, value, fetched_at, chain_rowid, audit_hash"
+        " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid<=?"
+        " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
+    floor = cur.fetchone()
+    cur.execute(
+        "SELECT id, source, beacon_round, value, fetched_at, chain_rowid, audit_hash"
+        " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
+        " ORDER BY chain_rowid ASC LIMIT 1", (rowid,))
+    ceil = cur.fetchone()
+    return floor, ceil
+
+
+def _beat_obj(row, err=None, shape=None):
+    if not row:
+        return None
+    out = {
+        "source": row[1],
+        "round": row[2],
+        "value": row[3],
+        "at": _iso(row[4]),
+        "at_epoch": row[4],
+        "chain_rowid": row[5],
+        "audit_hash": row[6],
+        "verify_yourself": _verify_url(row[1], row[2], row[3]),
+    }
+    if row[5] is None:
+        out["in_chain"] = False
+        out["warning"] = ("This beat is NOT sealed into the chain, so it is "
+                          "not a floor for anything. See seal_error.")
+        if err:
+            out["seal_error"] = err
+    else:
+        out["in_chain"] = True
+        if shape:
+            out["seal_shape"] = shape
+    return out
+
+
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes %d seconds" % (s // 60, s % 60)
+    return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
+
+
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+
+    if not _audit_table(conn):
+        return {"error": "audit_log_missing"}, 500
+
+    _ensure(conn, lock)
+    _start_timer(ctx)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    if method == "GET" and action == "latest":
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash FROM heartbeat_tick ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        if not row:
+            return {"beats": 0, "message": "no beat sealed yet"}, 200
+        age = time.time() - row[4]
+        return {
+            "latest_beat": _beat_obj(row),
+            "seconds_since": round(age, 1),
+            "open_window_so_far": _human(age),
+            "meaning": (
+                "Anything sealed since this beat has this beat as its floor "
+                "and no ceiling until the next beat."
+            ),
+        }, 200
+
+    if method == "GET" and action == "ticks":
+        try:
+            limit = min(int(data.get("limit", 25)), 200)
+        except (TypeError, ValueError):
+            limit = 25
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash, seal_error, seal_shape FROM heartbeat_tick"
+            " ORDER BY id DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        return {
+            "count": len(rows),
+            "beats": [_beat_obj(r, r[7], r[8]) for r in rows],
+            "cadence_target_seconds": BEAT_SECONDS,
+        }, 200
+
+    if method == "GET" and action == "window":
+        rowid = _find_rowid(conn, data.get("block"), data.get("receipt"))
+        if rowid is None:
+            return {"error": "block_or_receipt_required",
+                    "usage": "/x/heartbeat/window?block=846 or ?receipt=<audit_hash>"}, 400
+
+        floor, ceil = _window_for(conn, rowid)
+        out = {
+            "block": rowid,
+            "floor": _beat_obj(floor),
+            "ceiling": _beat_obj(ceil),
+            "what_this_proves": WHAT_THIS_PROVES,
+            "vocabulary": VOCABULARY,
+        }
+
+        if floor and ceil:
+            width = ceil[4] - floor[4]
+            out["state"] = "closed"
+            out["window_seconds"] = round(width, 1)
+            out["window"] = _human(width)
+            out["statement"] = (
+                "Block %d was created after %s and before %s. Window: %s."
+                % (rowid, _iso(floor[4]), _iso(ceil[4]), _human(width))
+            )
+        elif floor:
+            width = time.time() - floor[4]
+            out["state"] = "open"
+            out["window_seconds_so_far"] = round(width, 1)
+            out["window_so_far"] = _human(width)
+            out["statement"] = (
+                "Block %d was created after %s. The ceiling is not sealed "
+                "yet, so the window is open." % (rowid, _iso(floor[4]))
+            )
+        elif ceil:
+            out["state"] = "unfloored"
+            out["statement"] = (
+                "Block %d predates the first beat, so it has no floor from "
+                "this module. It was created before %s." % (rowid, _iso(ceil[4]))
+            )
+        else:
+            out["state"] = "no_beats"
+            out["statement"] = "No beats have been sealed, so no window exists."
+
+        out["external_ceiling"] = {
+            "note": (
+                "A second, independent ceiling comes from OpenTimestamps. "
+                "Anchoring is per proof and has its own pending/confirmed "
+                "state."
+            ),
+            "where": "/x/ots/status",
+        }
+        return out, 200
+
+    if method == "GET" and action == "verify":
+        rnd = data.get("round")
+        if rnd is None:
+            return {"error": "round_required"}, 400
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, source, beacon_round, value, fetched_at, chain_rowid,"
+            " audit_hash FROM heartbeat_tick WHERE beacon_round=?"
+            " ORDER BY id DESC LIMIT 1", (rnd,))
+        row = cur.fetchone()
+        if not row:
+            return {"error": "round_not_sealed", "round": rnd}, 404
+        return {
+            "sealed": _beat_obj(row),
+            "how_to_verify": [
+                "Fetch the round from the beacon operator at the url above.",
+                "Compare its randomness with the value we sealed. They must match.",
+                "Confirm the beat's audit_hash is in our chain at /api/verify-chain.",
+                "Nothing in these three steps requires our cooperation.",
+            ],
+            "we_do_not_verify_the_signature": (
+                "drand signs each round with BLS, which this server does not "
+                "implement. We record the round and value verbatim. The "
+                "operator's own endpoint is the authority, not us."
+            ),
+        }, 200
+
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), MIN(fetched_at), MAX(fetched_at) FROM heartbeat_tick")
+        n, first, last = cur.fetchone()
+        cur.execute(
+            "SELECT fetched_at FROM heartbeat_tick WHERE chain_rowid IS NOT NULL"
+            " ORDER BY chain_rowid ASC")
+        times = [r[0] for r in cur.fetchall()]
+        gaps = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+        mean = sum(gaps) / len(gaps) if gaps else None
+        widest = max(gaps) if gaps else None
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        tip = cur.fetchone()[0] or 0
+        cur.execute("SELECT MIN(chain_rowid) FROM heartbeat_tick WHERE chain_rowid IS NOT NULL")
+        firstrow = cur.fetchone()[0]
+        covered = (tip - firstrow) if firstrow else 0
+        return {
+            "version": VERSION,
+            "beats_sealed": n,
+            "first_beat": _iso(first),
+            "latest_beat": _iso(last),
+            "cadence_target_seconds": BEAT_SECONDS,
+            "auto_beat": AUTO_BEAT,
+            "timer_running": _timer_started,
+            "beat_runs_this_process": _beat_runs,
+            "last_error": _beat_last_error,
+            "beats_not_in_chain": _orphans(conn),
+            "last_seal_error": _last_seal_error(conn),
+            "last_seal_shape": _last_seal_shape(conn),
+            "mean_window_seconds": round(mean, 1) if mean else None,
+            "mean_window": _human(mean),
+            "widest_window_seconds": round(widest, 1) if widest else None,
+            "widest_window": _human(widest),
+            "records_with_a_floor": covered,
+            "chain_height": tip,
+            "honest_note": (
+                "Mean window is the average distance between beats. It is the "
+                "typical amount of room a record has. Widest is the worst "
+                "case, which is the number that actually matters."
+            ),
+        }, 200
+
+    if method == "POST" and action == "beat":
+        try:
+            return _do_beat(ctx, forced=bool(data.get("force")))
+        except Exception as e:
+            return {"beat": False, "error": "beacon_unreachable", "detail": str(e)}, 503
+
+    if method == "POST" and action == "source":
+        # For an engine with no outbound network. The operator hands it a
+        # reading fetched elsewhere. Sealed exactly as supplied and marked.
+        val = data.get("value")
+        src = data.get("source") or "supplied"
+        rnd = data.get("round")
+        if not val or len(str(val)) < 32:
+            return {"error": "value_required", "note": "at least 32 characters"}, 400
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO heartbeat_tick (source, beacon_round, value,"
+                " fetched_at, cadence, note) VALUES (?,?,?,?,?,?)",
+                (src, rnd, str(val), now, None,
+                 "supplied by operator, not fetched by this server"),
+            )
+            tick_id = cur.lastrowid
+            conn.commit()
+        ok, shape, err, h, rid = _seal(ctx, "heartbeat_beat", {
+            "kind": "beacon_tick_supplied",
+            "source": src, "round": rnd, "value": str(val), "fetched_at": now,
+            "note": ("Supplied by the operator rather than fetched here. The "
+                     "floor it gives is only as good as the reader's trust in "
+                     "that source, and it is marked so nobody mistakes it."),
+        })
+        if ok and (rid is None or h is None):
+            try:
+                rid2, h2 = _backfill(conn, lock, tick_id)
+                rid = rid if rid is not None else rid2
+                h = h if h is not None else h2
+            except Exception:
+                pass
+        with lock:
+            conn.execute("UPDATE heartbeat_tick SET seal_shape=?, seal_error=?,"
+                         " chain_rowid=?, audit_hash=? WHERE id=?",
+                         (shape, err, rid, h, tick_id))
+            conn.commit()
+        return {"beat": True, "supplied": True, "tick_id": tick_id,
+                "sealed_at_chain_rowid": rid, "audit_hash": h,
+                "marked": "supplied by operator, not fetched by this server"}, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "latest", "ticks", "window", "verify",
+                        "status", "beat", "source"]}, 404
+
+
+def _orphans(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick WHERE chain_rowid IS NULL")
+        return cur.fetchone()[0]
+    except Exception:
+        return None
+
+
+def _last_seal_error(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT seal_error FROM heartbeat_tick WHERE seal_error IS NOT NULL"
+                    " ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _last_seal_shape(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT seal_shape FROM heartbeat_tick WHERE seal_shape IS NOT NULL"
+                    " ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _spec():
+    return {
+        "module": "heartbeat",
+        "version": VERSION,
+        "what_it_is": (
+            "A clock nobody can wind. Public beacon values are sealed into "
+            "the chain on a cadence. Because a beacon value cannot be known "
+            "before its tick, and because the chain is append-only, every "
+            "record between two beats has a provable earliest and latest "
+            "moment of creation."
+        ),
+        "why_a_clock_alone_fails": (
+            "Anyone can write down what a clock will read tomorrow. A clock "
+            "reading proves nothing about when it was written down. A beacon "
+            "value cannot be written down in advance by anyone."
+        ),
+        "the_interleave": (
+            "Decisions are not stamped individually. One beat every few "
+            "minutes gives a floor to everything after it and a ceiling to "
+            "everything before the next one. No change to the decision path "
+            "and no added latency."
+        ),
+        "sources": [
+            {"name": s["name"], "cadence_seconds": s["cadence_seconds"],
+             "note": s["note"], "url": s["url"]} for s in SOURCES
+        ],
+        "vocabulary": VOCABULARY,
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It bounds when a record can have been made. It says nothing "
+            "about whether the record is correct.",
+            "drand signatures are BLS and are not verified here. The round "
+            "and value are recorded verbatim and are re-fetchable by anyone "
+            "from the beacon operator.",
+            "A record after the newest beat has an open window until the "
+            "next beat is sealed.",
+            "Beats sealed from a value the operator supplied by hand rather "
+            "than fetched are marked as such and are weaker.",
+            "A wide window is reported wide. The number is a measurement of "
+            "our own cadence, and it can embarrass us.",
+        ],
+        "routes": {
+            "GET /x/heartbeat/spec": "this document",
+            "GET /x/heartbeat/latest": "most recent beat and the open window so far",
+            "GET /x/heartbeat/ticks?limit=": "recent beats",
+            "GET /x/heartbeat/window?block=|?receipt=": "two-sided window for a record",
+            "GET /x/heartbeat/verify?round=": "what we sealed and where to check it",
+            "GET /x/heartbeat/status": "cadence, coverage, mean and widest window",
+            "POST /x/heartbeat/beat": "keyed - fetch and seal now",
+            "POST /x/heartbeat/source": "keyed - seal a reading fetched elsewhere",
+        },
+    }
+
+```
+
+
+## `modules/held.py`
+
+145 lines, 5162 bytes
+
+```python
+"""
+modules/held.py  v1.0  -  the tips sebbi.pro holds for other chains
+
+Every time a peer submits its tip, sebbi.pro seals the observation into its
+own chain as a block under user_id "wit:<peer>", with the peer's tip inside.
+Those blocks are already public in the walk. This module lists them per
+peer, so another chain can point a verifier at sebbi.pro as its witness and
+have a machine confirm it.
+
+Reads only. Seals nothing, writes nothing, creates no tables. All public.
+
+Routes:
+  https://sebbi.pro/x/held/status
+  https://sebbi.pro/x/held/peers
+  https://sebbi.pro/x/held/tips?peer=mir
+"""
+
+import json
+import re
+import time
+
+VERSION = "1.0"
+BASE = "https://sebbi.pro/x/held/"
+DEFAULT_LIMIT = 100
+MAX_LIMIT = 500
+
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "peers"),
+          ("GET", "tips")}
+
+_PEER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _q(data, name, default=None):
+    v = (data or {}).get(name, default)
+    if isinstance(v, list):
+        v = v[0] if v else default
+    return v
 
 
 def _iso(ts):
     try:
-        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
     except Exception:
         return None
 
 
-def _uk(ts):
+def _peers(ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+    with lock:
+        rows = conn.execute(
+            "SELECT user_id, COUNT(*), MAX(id), MAX(ts) FROM audit_log "
+            "WHERE user_id LIKE 'wit:%' GROUP BY user_id").fetchall()
+    out = []
+    for uid, n, last_idx, last_ts in rows:
+        name = str(uid)[4:]
+        out.append({"peer": name, "tips_held": n,
+                    "last_block_index": last_idx,
+                    "last_observed_at": _iso(last_ts),
+                    "list": BASE + "tips?peer=" + name})
+    out.sort(key=lambda r: -(r["tips_held"] or 0))
+    return {"ok": True, "holder": "sebbi.pro", "count": len(out),
+            "peers": out}, 200
+
+
+def _tips(data, ctx):
+    peer = str(_q(data, "peer", "") or "").strip().lower()
+    if not _PEER_RE.match(peer):
+        return {"ok": False, "error": "peer_required",
+                "example": BASE + "tips?peer=mir",
+                "peers": BASE + "peers"}, 400
     try:
-        return datetime.fromtimestamp(float(ts), _UK or timezone.utc).strftime("%d %b %Y, %H:%M %Z")
-    except Exception:
-        return None
-
-
-def _setup():
-    s = _srv()
-    with s._db_lock:
-        s._conn.execute("CREATE TABLE IF NOT EXISTS humankeys_proof("
-                        "code TEXT PRIMARY KEY, text_hash TEXT, verdict TEXT, score REAL,"
-                        "summary_json TEXT, challenge_json TEXT, sealed_at REAL,"
-                        "block_index INTEGER, audit_hash TEXT, payer TEXT, reference TEXT)")
-        s._conn.execute("CREATE INDEX IF NOT EXISTS idx_hk_hash ON humankeys_proof(text_hash)")
-        for col in ("pubkey TEXT", "owner_sig TEXT"):
-            try:
-                s._conn.execute("ALTER TABLE humankeys_proof ADD COLUMN " + col)
-            except Exception:
-                pass
-        s._conn.execute("CREATE TABLE IF NOT EXISTS humankeys_pass("
-                        "viewer TEXT PRIMARY KEY, paid_at REAL, expires REAL, months INTEGER DEFAULT 0)")
-        s._conn.commit()
-
-
-def _arm_credits(ctx):
-    """The wallet lives in modules/credits.py. Make sure its /c/ routes are up."""
-    try:
+        limit = max(1, min(MAX_LIMIT, int(_q(data, "limit", DEFAULT_LIMIT))))
+    except (TypeError, ValueError):
+        limit = DEFAULT_LIMIT
+    conn, lock = ctx["conn"], ctx["lock"]
+    with lock:
+        rows = conn.execute(
+            "SELECT id, ts, audit_hash, result_json FROM audit_log "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            ("wit:" + peer, limit)).fetchall()
+    tips = []
+    for idx, ts, h, rj in rows:
         try:
-            from modules import credits as C
+            res = json.loads(rj)
         except Exception:
-            import credits as C
-        C.handle("GET", "status", {}, None, ctx)
-        return True
-    except Exception as e:
-        _state["last_error"] = "credits: %s" % e
-        return False
-
-
-def _new_code():
-    raw = secrets.token_bytes(8)
-    chars = "".join(ALPHABET[b % len(ALPHABET)] for b in raw)
-    return "HK-%s-%s" % (chars[:4], chars[4:8])
-
-
-# ---------------------------------------------------------------------
-# challenge
-# ---------------------------------------------------------------------
-
-def _beacon():
-    s = _srv()
-    out = {}
-    try:
-        with s._db_lock:
-            r = s._conn.execute("SELECT source,beacon_round,value,fetched_at FROM heartbeat_tick "
-                                "ORDER BY id DESC LIMIT 1").fetchone()
-        if r:
-            out = {"source": r[0], "round": r[1], "value": r[2], "fetched_utc": _iso(r[3])}
-    except Exception:
-        pass
-    try:
-        out["chain_tip"] = s.chain_tip()
-    except Exception:
-        pass
-    return out
-
-
-def _sign(body):
-    return hmac.new(_secret(), json.dumps(body, sort_keys=True).encode(), hashlib.sha256).hexdigest()
-
-
-def _challenge():
-    body = {"issued": round(time.time(), 3), "nonce": secrets.token_hex(12), "beacon": _beacon()}
-    return {"challenge": body, "sig": _sign(body), "expires_in": CHALLENGE_TTL}
-
-
-def _check_challenge(ch, sig):
-    if not isinstance(ch, dict) or not isinstance(sig, str):
-        return False, "challenge missing"
-    if not hmac.compare_digest(_sign(ch), sig):
-        return False, "challenge not issued by this server"
-    age = time.time() - float(ch.get("issued", 0))
-    if age < 0 or age > CHALLENGE_TTL:
-        return False, "challenge expired - start a new session"
-    return True, age
-
-
-# ---------------------------------------------------------------------
-# the rhythm
-# ---------------------------------------------------------------------
-
-def score(intervals, counts, server_elapsed):
-    """Score a typing session from its timings alone. Returns (verdict, score, summary)."""
-    iv = []
-    for x in (intervals or [])[:MAX_INTERVALS]:
-        try:
-            v = float(x)
-        except (TypeError, ValueError):
+            res = {}
+        tip = str(res.get("peer_tip") or "").lower()
+        if not re.match(r"^[0-9a-f]{64}$", tip):
             continue
-        if 0 <= v <= 600000:
-            iv.append(v)
-    c = {k: int(counts.get(k, 0) or 0) for k in
-         ("inserts", "deletes", "multi_inserts", "multi_chars", "paste_events", "paste_chars",
-          "final_length", "blurs", "typed_chars")}
-    typed = max(c["typed_chars"], c["inserts"])
-    claimed_ms = sum(iv)
-    flags = []
-
-    active = [v for v in iv if v <= 2000]
-    pauses = [v for v in iv if v > 2000]
-    n = len(active)
-    mean = sum(active) / n if n else 0
-    sd = math.sqrt(sum((v - mean) ** 2 for v in active) / n) if n else 0
-    cv = (sd / mean) if mean else 0
-    too_fast = sum(1 for v in active if v < 12)
-    minutes = (claimed_ms / 60000.0) if claimed_ms else 0
-    cpm = (typed / minutes) if minutes else 0
-    corr_ratio = (c["deletes"] / float(typed)) if typed else 0
-    paste_share = (c["paste_chars"] / float(c["final_length"])) if c["final_length"] else 0
-
-    # text that appeared from nowhere: final length far beyond what was typed or pasted
-    accounted = typed + c["multi_chars"] + c["paste_chars"]
-    unaccounted = max(0, c["final_length"] - accounted)
-
-    summary = {
-        "keystrokes": typed,
-        "corrections": c["deletes"],
-        "correction_rate": round(corr_ratio, 3),
-        "thinking_pauses": len(pauses),
-        "longest_pause_s": round(max(pauses) / 1000.0, 1) if pauses else 0,
-        "typing_minutes": round(minutes, 2),
-        "chars_per_minute": round(cpm),
-        "rhythm_variation": round(cv, 2),
-        "word_suggestions_used": c["multi_inserts"],
-        "pasted_characters": c["paste_chars"],
-        "pasted_share": round(paste_share, 3),
-        "final_length": c["final_length"],
-        "left_the_page": c["blurs"],
-        "server_seconds": round(server_elapsed, 1),
-    }
-
-    if server_elapsed + 5 < claimed_ms / 1000.0:
-        return "REFUSED", 0.0, dict(summary, reason="The typing reported is longer than the real time that passed since the session started.")
-    if unaccounted > max(20, 0.05 * c["final_length"]):
-        return "REFUSED", 0.0, dict(summary, reason="Text appeared that was neither typed nor pasted.")
-    if typed + c["multi_inserts"] < MIN_KEYS:
-        return "TOO_SHORT", 0.0, dict(summary, reason="Type at least %d characters for a proof." % MIN_KEYS)
-
-    s = 1.0
-    if cv < 0.18:
-        flags.append("rhythm is unnaturally even, like a program")
-        s -= 0.6
-    elif cv < 0.3:
-        flags.append("rhythm is very even")
-        s -= 0.2
-    if cpm > 1100 and c["multi_inserts"] < typed / 20:
-        flags.append("faster than human typing")
-        s -= 0.5
-    if n and too_fast / float(n) > 0.15:
-        flags.append("many keystrokes closer together than fingers can manage")
-        s -= 0.4
-    if typed >= 200 and c["deletes"] == 0 and not pauses:
-        flags.append("no corrections and no pauses over a long text - steady copying")
-        s -= 0.15
-    s = max(0.0, min(1.0, s))
-
-    composing = 0
-    if corr_ratio >= 0.02:
-        composing += 1
-    if len(pauses) >= max(1, typed // 250):
-        composing += 1
-    if cv >= 0.6:
-        composing += 1
-    summary["composition_signals"] = ["weak", "some", "clear", "strong"][composing]
-    summary["flags"] = flags
-
-    if s < 0.45:
-        verdict = "MECHANICAL"
-    elif paste_share > 0.02 or c["paste_events"] > 0:
-        verdict = "HUMAN_TYPED_PART_PASTED"
-    else:
-        verdict = "HUMAN_TYPED"
-    return verdict, round(s, 2), summary
+        tips.append({
+            "peer_tip": tip,
+            "observed_at": _iso(ts),
+            "liveness": res.get("liveness"),
+            "sealed_in_block": idx,
+            "sealed_block_hash": h,
+            "check_block": "https://sebbi.pro/x/walk/block?index=%d" % idx,
+        })
+    return {
+        "ok": True,
+        "holder": "sebbi.pro",
+        "peer": peer,
+        "count": len(tips),
+        "newest_first": True,
+        "tips": tips,
+        "what_this_proves": (
+            "sebbi.pro recorded each of these tips from %s and sealed the "
+            "observation into its own public chain. Open check_block to see "
+            "the sealed block, recompute its hash, and confirm peer_tip is "
+            "inside it. sebbi.pro is run independently of %s and cannot be "
+            "made to rewrite these blocks by %s." % (peer, peer, peer)),
+        "what_this_does_not_prove": (
+            "That the tip was correct when submitted - only that this is the "
+            "tip sebbi.pro was shown, and when."),
+    }, 200
 
 
-VERDICT_TEXT = {
-    "HUMAN_TYPED": "Typed by a human, live. Nothing pasted.",
-    "HUMAN_TYPED_PART_PASTED": "Typed by a human, live - but part of it was pasted in.",
-    "MECHANICAL": "The rhythm does not look like a human typing.",
-}
+def _status():
+    return {"ok": True, "module": "held", "version": VERSION,
+            "what": "Tips sebbi.pro holds for other chains, from its own "
+                    "sealed witness blocks.",
+            "routes": {"peers": BASE + "peers",
+                       "tips": BASE + "tips?peer=mir",
+                       "status": BASE + "status"},
+            "use_as_witness": "In an AI Integrity Declaration, set a "
+                              "witness tip_endpoint to " + BASE +
+                              "tips?peer=<your peer name>. The checker at "
+                              "https://sebbi.pro/x/integrity/check then "
+                              "confirms sebbi.pro holds your tip."}
 
-
-# ---------------------------------------------------------------------
-# sealing and payment
-# ---------------------------------------------------------------------
-
-def _pass(viewer):
-    """(active, expires) for a wallet's monthly pass."""
-    s = _srv()
-    with s._db_lock:
-        r = s._conn.execute("SELECT expires FROM humankeys_pass WHERE viewer=?", (viewer,)).fetchone()
-    if r and r[0] > time.time():
-        return True, r[0]
-    return False, (r[0] if r else None)
-
-
-def _balance(viewer):
-    s = _srv()
-    with s._db_lock:
-        try:
-            r = s._conn.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()
-            return r[0] if r else 0
-        except Exception:
-            return 0
-
-
-def _buy_pass(viewer):
-    """Take 50p and open a 30-day pass. Returns (ok, expires, balance)."""
-    s = _srv()
-    now = time.time()
-    with s._db_lock:
-        try:
-            cur = s._conn.execute("UPDATE credit_viewer SET balance=balance-?, spent=spent+? "
-                                  "WHERE id=? AND balance>=?", (PRICE_PENCE, PRICE_PENCE, viewer, PRICE_PENCE))
-            ok = cur.rowcount == 1
-        except Exception:
-            ok = False
-        if ok:
-            exp = now + PASS_DAYS * 86400
-            s._conn.execute("INSERT INTO humankeys_pass(viewer,paid_at,expires,months) VALUES(?,?,?,1) "
-                            "ON CONFLICT(viewer) DO UPDATE SET paid_at=excluded.paid_at, "
-                            "expires=excluded.expires, months=months+1", (viewer, now, exp))
-        s._conn.commit()
-    bal = _balance(viewer)
-    if not ok:
-        return False, None, bal
-    try:
-        ev = {"user_id": "humankeys", "action": "monthly_pass", "amount": 0, "country": "UK",
-              "device_id": "humankeys", "anomaly": 0, "device_risk": 0}
-        s.seal(ev, {"decision": "PASS_PURCHASED", "score": 0, "version": VERSION, "timestamp": now,
-                    "price_pence": PRICE_PENCE, "days": PASS_DAYS,
-                    "wallet": hashlib.sha256(viewer.encode()).hexdigest()[:16]}, now)
-    except Exception as e:
-        _state["last_error"] = "pass seal: %s" % e
-    return True, now + PASS_DAYS * 86400, bal
-
-
-def _refund_pass(viewer):
-    s = _srv()
-    with s._db_lock:
-        s._conn.execute("UPDATE credit_viewer SET balance=balance+?, spent=spent-? WHERE id=?",
-                        (PRICE_PENCE, PRICE_PENCE, viewer))
-        s._conn.execute("UPDATE humankeys_pass SET expires=paid_at WHERE viewer=?", (viewer,))
-        s._conn.commit()
-
-
-def _seal(data, api_key):
-    s = _srv()
-    data = data or {}
-    text_hash = str(data.get("text_hash", "")).strip().lower()
-    if not HEX64.match(text_hash):
-        return {"error": "text_hash must be the SHA-256 of the text"}, 400
-    ok, info = _check_challenge(data.get("challenge"), data.get("sig"))
-    if not ok:
-        return {"error": "bad_challenge", "message": info}, 400
-    elapsed = info
-    counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
-    verdict, sc, summary = score(data.get("intervals") or [], counts, elapsed)
-    if verdict in ("REFUSED", "TOO_SHORT"):
-        return {"sealed": False, "verdict": verdict, "message": summary.get("reason"), "summary": summary}, 422
-
-    reference = str(data.get("reference", ""))[:120] or None
-    pubkey = str(data.get("pubkey", "") or "").strip()
-    owner_sig = str(data.get("owner_sig", "") or "").strip()
-    if not (B64.match(pubkey) and B64.match(owner_sig)):
-        pubkey, owner_sig = None, None
-    viewer = str(data.get("viewer", "")).strip()
-    expires = None
-    if api_key and s.get_key(api_key):
-        payer = "key:" + hashlib.sha256(api_key.encode()).hexdigest()[:16]
-        paid = None
-        balance = None
-    else:
-        if not VIEWER_RE.match(viewer):
-            return {"error": "wallet_needed", "message": "Top up once at https://sebbi.pro/credits",
-                    "price_pence": PRICE_PENCE}, 402
-        active, expires = _pass(viewer)
-        if active:
-            paid, balance = False, _balance(viewer)
-        else:
-            paid, expires, balance = _buy_pass(viewer)
-            if not paid:
-                return {"sealed": False, "reason": "pass_needed", "price_pence": PRICE_PENCE,
-                        "balance_pence": balance, "topup": "https://sebbi.pro/credits",
-                        "message": "Human Keys is 50p a month for unlimited proofs. Top up and seal straight away."}, 402
-        payer = "credit:" + hashlib.sha256(viewer.encode()).hexdigest()[:16]
-
-    code = _new_code()
-    ch = data.get("challenge")
-    ts = time.time()
-    event = {"user_id": "humankeys", "action": "human_typed", "amount": 0, "country": "UK",
-             "device_id": "humankeys", "anomaly": 0, "device_risk": 0}
-    result = {"decision": verdict, "score": sc, "version": VERSION, "timestamp": ts,
-              "code": code, "text_hash": text_hash, "summary": summary,
-              "session_started_utc": _iso(ch.get("issued")),
-              "beacon": (ch.get("beacon") or {}).get("round"),
-              "beacon_value": (ch.get("beacon") or {}).get("value"),
-              "chain_tip_at_start": (ch.get("beacon") or {}).get("chain_tip"),
-              "reference": reference, "pass_purchased": bool(paid),
-              "owner_key": pubkey,
-              "owner_key_fingerprint": hashlib.sha256(pubkey.encode()).hexdigest()[:16] if pubkey else None,
-              "owner_signature": owner_sig}
-    try:
-        out = s.seal(event, result, ts)
-        h, idx = out[0], out[1]
-    except Exception as e:
-        if paid:
-            _refund_pass(viewer)
-        return {"error": "seal_failed", "detail": str(e)[:160]}, 500
-    with s._db_lock:
-        s._conn.execute("INSERT INTO humankeys_proof(code,text_hash,verdict,score,summary_json,"
-                        "challenge_json,sealed_at,block_index,audit_hash,payer,reference,pubkey,owner_sig) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (code, text_hash, verdict, sc, json.dumps(summary), json.dumps(ch), ts,
-                         idx, h, payer, reference, pubkey, owner_sig))
-        s._conn.commit()
-    _state["sealed"] += 1
-    out = {"sealed": True, "code": code, "verdict": verdict, "verdict_text": VERDICT_TEXT.get(verdict),
-           "score": sc, "summary": summary, "block_index": idx, "audit_hash": h,
-           "sealed_uk": _uk(ts), "check": "https://sebbi.pro/k/" + code,
-           "badge": "https://sebbi.pro/k/%s.svg" % code}
-    if balance is not None:
-        out["balance_pence"] = balance
-    if expires:
-        out["pass_until_uk"] = _uk(expires)
-        out["pass_purchased_now"] = bool(paid)
-    out["owner_signed"] = bool(pubkey)
-    email = str(data.get("backup_email", "") or "").strip()
-    backup = str(data.get("backup_code", "") or "").strip()
-    if pubkey and email and backup and EMAIL_RE.match(email) and re.match(r"^[A-Za-z0-9_-]{100,600}$", backup):
-        threading.Thread(target=_email_backup, args=(email, backup, code), daemon=True).start()
-        out["backup_emailed"] = True
-    return out, 200
-
-
-def _email_backup(email, backup, code):
-    """Send the owner their backup code. Passed through, never stored."""
-    try:
-        html = ("<html><body style='font-family:Arial,sans-serif;background:#f5f7fa;padding:20px'>"
-                "<div style='max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden'>"
-                "<div style='background:#0a0f1e;padding:28px;border-bottom:4px solid #c9a84c'>"
-                "<div style='font-size:22px;color:#fff;font-family:Georgia,serif'>Human <span style='color:#c9a84c'>Keys</span></div></div>"
-                "<div style='padding:30px;color:#1a1f2e;font-size:15px;line-height:1.6'>"
-                "<p><b>Your ownership key backup.</b></p>"
-                "<p>Your phone holds the key that proves your Human Keys proofs are yours - starting with "
-                "<b>%s</b>. If you lose or change your phone, this code puts the key back.</p>"
-                "<p style='font-family:monospace;font-size:12px;word-break:break-all;background:#f3f1ea;"
-                "border:1px solid #e2d9bd;padding:14px;border-radius:6px'>%s</p>"
-                "<p>To restore it, open <a href='https://sebbi.pro/keys'>https://sebbi.pro/keys</a> on the new phone "
-                "and tap <b>Restore my key</b>.</p>"
-                "<p style='color:#666;font-size:13px'>Keep this email private. Anyone with this code can prove "
-                "ownership as you. sebbi.pro does not keep a copy.</p>"
-                "<p>Check any proof: <a href='https://sebbi.pro/k/%s'>https://sebbi.pro/k/%s</a></p>"
-                "</div></div></body></html>") % (code, backup, code, code)
-        _srv().send_email(email, "", "Your Human Keys backup code", html)
-    except Exception as e:
-        _state["last_error"] = "backup email: %s" % e
-
-
-def _record(code):
-    s = _srv()
-    with s._db_lock:
-        r = s._conn.execute("SELECT code,text_hash,verdict,score,summary_json,challenge_json,sealed_at,"
-                            "block_index,audit_hash,reference,pubkey,owner_sig FROM humankeys_proof WHERE code=?",
-                            (code,)).fetchone()
-    if not r:
-        return None
-    ch = json.loads(r[5] or "{}")
-    return {"code": r[0], "text_hash": r[1], "verdict": r[2], "verdict_text": VERDICT_TEXT.get(r[2]),
-            "score": r[3], "summary": json.loads(r[4] or "{}"),
-            "session_started_utc": _iso(ch.get("issued")), "sealed_utc": _iso(r[6]), "sealed_uk": _uk(r[6]),
-            "beacon": ch.get("beacon"), "block_index": r[7], "audit_hash": r[8], "reference": r[9],
-            "verify_block": "https://sebbi.pro/x/walk/block?index=%s" % r[7],
-            "owner_key": r[10], "owner_signature": r[11],
-            "check": "https://sebbi.pro/k/" + r[0]}
-
-
-# ---------------------------------------------------------------------
-# pages
-# ---------------------------------------------------------------------
-
-def _send(h, body, ctype, status=200):
-    if isinstance(body, str):
-        body = body.encode("utf-8")
-    h.send_response(status)
-    h.send_header("Content-Type", ctype)
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Cache-Control", "no-store" if "json" in ctype else "public, max-age=60")
-    h.end_headers()
-    h.wfile.write(body)
-
-
-def _esc(t):
-    return (str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
-
-
-def _badge(rec):
-    ok = rec and rec["verdict"] == "HUMAN_TYPED"
-    part = rec and rec["verdict"] == "HUMAN_TYPED_PART_PASTED"
-    label = "Human typed" if ok else ("Human typed · part pasted" if part else "Not verified")
-    colour = "#2fbf71" if ok else ("#c9a84c" if part else "#9aa0ae")
-    code = rec["code"] if rec else "unknown"
-    w = 300 if part else 240
-    return ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="28" role="img" aria-label="%s %s">'
-            '<rect width="%d" height="28" rx="5" fill="#0a0f1e"/><rect x="1" y="1" width="%d" height="26" rx="4" fill="none" stroke="%s" stroke-opacity=".6"/>'
-            '<circle cx="15" cy="14" r="5" fill="%s"/>'
-            '<text x="27" y="18" fill="#fff" font-family="Verdana,sans-serif" font-size="11.5" font-weight="bold">%s</text>'
-            '<text x="%d" y="18" fill="%s" font-family="Verdana,sans-serif" font-size="10.5" text-anchor="end">%s</text></svg>'
-            % (w, _esc(label), code, w, w - 2, colour, colour, _esc(label), w - 10, colour, code))
-
-
-def _install_page():
-    if _state["page"]:
-        return True
-    s = _srv()
-    H = getattr(s, "Handler", None)
-    if H is None:
-        return False
-    if getattr(H, "_humankeys_patched", False):
-        _state["page"] = True
-        return True
-    orig = H.do_GET
-
-    def do_GET(self):
-        p = self.path.split("?")[0].rstrip("/")
-        if p == "/keys":
-            return _send(self, KEYS_PAGE, "text/html; charset=utf-8")
-        if p == "/k" or p.startswith("/k/"):
-            code = p[3:].upper()
-            if code.endswith(".SVG"):
-                code = code[:-4]
-                rec = _record(code) if CODE_RE.match(code) else None
-                return _send(self, _badge(rec), "image/svg+xml")
-            if CODE_RE.match(code):
-                return _send(self, CHECK_PAGE.replace("__CODE__", code), "text/html; charset=utf-8")
-            return _send(self, CHECK_PAGE.replace("__CODE__", ""), "text/html; charset=utf-8")
-        return orig(self)
-
-    H.do_GET = do_GET
-    H._humankeys_patched = True
-    _state["page"] = True
-    return True
-
-
-def arm(ctx=None):
-    with _lock:
-        _setup()
-        _arm_credits(ctx)
-        _install_page()
-        _state["ready"] = True
-
-
-# ---------------------------------------------------------------------
-# router entry
-# ---------------------------------------------------------------------
 
 def handle(method, action, data, api_key, ctx):
     try:
-        arm(ctx)
-    except Exception as e:
-        _state["last_error"] = "arm: %s" % e
-    data = data or {}
-    if action in ("", "status"):
-        s = _srv()
-        with s._db_lock:
-            n = s._conn.execute("SELECT COUNT(*) FROM humankeys_proof").fetchone()[0]
-        return {"module": "humankeys", "version": VERSION, "armed": _state["page"],
-                "page": "https://sebbi.pro/keys", "proofs_sealed": n, "price": "50p a month, unlimited proofs",
-                "last_error": _state["last_error"]}, 200
-    if action == "spec":
-        return {"module": "humankeys", "version": VERSION,
-                "what": "Proof a human typed a text, live. The text never leaves the device; its fingerprint and a score of the typing rhythm are sealed.",
-                "price": "50p a month for unlimited proofs, from the credit wallet, or included with an API key. Checking is free.",
-                "verdicts": VERDICT_TEXT,
-                "routes": {"challenge": "GET https://sebbi.pro/x/humankeys/challenge",
-                           "seal": "POST https://sebbi.pro/x/humankeys/seal {challenge, sig, text_hash, intervals, counts, viewer | API key, reference}",
-                           "check": "GET https://sebbi.pro/x/humankeys/check?code=HK-XXXX-XXXX",
-                           "compare": "POST https://sebbi.pro/x/humankeys/compare {code, text_hash}",
-                           "page": "https://sebbi.pro/keys"},
-                "text_hash": "SHA-256 of the text as UTF-8, after normalising to NFC, converting line endings to \\n and trimming the ends."}, 200
-    if action == "challenge" and method == "GET":
-        return _challenge(), 200
-    if action == "pass" and method == "GET":
-        v = str(data.get("viewer", "")).strip()
-        if not VIEWER_RE.match(v):
-            return {"error": "viewer needed"}, 400
-        active, exp = _pass(v)
-        return {"active": active, "until_uk": _uk(exp) if exp else None, "price_pence": PRICE_PENCE,
-                "days": PASS_DAYS, "balance_pence": _balance(v)}, 200
-    if action == "seal" and method == "POST":
-        return _seal(data, api_key)
-    if action == "check" and method == "GET":
-        code = str(data.get("code", "")).strip().upper()
-        rec = _record(code) if CODE_RE.match(code) else None
-        return (rec, 200) if rec else ({"error": "no_such_proof", "code": code}, 404)
-    if action == "compare" and method == "POST":
-        code = str(data.get("code", "")).strip().upper()
-        th = str(data.get("text_hash", "")).strip().lower()
-        rec = _record(code) if CODE_RE.match(code) else None
-        if not rec:
-            return {"error": "no_such_proof"}, 404
-        return {"code": code, "matches": hmac.compare_digest(rec["text_hash"], th),
-                "verdict": rec["verdict"], "verdict_text": rec["verdict_text"], "sealed_uk": rec["sealed_uk"]}, 200
-    return {"error": "unknown_action", "spec": "https://sebbi.pro/x/humankeys/spec"}, 404
+        if method == "GET" and action in ("status", "spec", ""):
+            return _status(), 200
+        if method == "GET" and action == "peers":
+            return _peers(ctx)
+        if method == "GET" and action == "tips":
+            return _tips(data, ctx)
+        return {"ok": False, "error": "unknown_action",
+                "get": sorted(a for m, a in PUBLIC if m == "GET"),
+                "post": []}, 404
+    except Exception as exc:
+        return {"ok": False, "error": "held_failed",
+                "detail": str(exc)[:200]}, 500
+
+```
 
 
-# ---------------------------------------------------------------------
-# page markup
-# ---------------------------------------------------------------------
+## `modules/homelink.py`
 
-_HEAD = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--gold2:#f0d78a;--ok:#2fbf71;--ok2:#7fe3b0;--err:#ff8a80;--mut:rgba(255,255,255,.62);--line:rgba(201,168,76,.22);
---sans:'IBM Plex Sans',system-ui,sans-serif;--serif:'Newsreader',Georgia,serif;--mono:'IBM Plex Mono',ui-monospace,monospace}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--ink);color:#fff;font-family:var(--sans);line-height:1.55;-webkit-font-smoothing:antialiased;padding-bottom:env(safe-area-inset-bottom,0)}
-.wrap{max-width:820px;margin:0 auto;padding:0 16px}
-.top{border-bottom:1px solid var(--line);padding:14px 0}.top .wrap{display:flex;justify-content:space-between;align-items:baseline}
-.brand{font-family:var(--mono);font-size:13px;color:#fff;text-decoration:none}.brand b{color:var(--gold);font-weight:500}
-.top a.l{font-family:var(--mono);font-size:12px;color:var(--mut);text-decoration:none}
-.hero{padding:38px 0 14px}.kick{font-family:var(--mono);font-size:12px;color:var(--gold);letter-spacing:.08em;margin-bottom:10px}
-h1{font-family:var(--serif);font-weight:500;font-size:clamp(34px,7vw,58px);line-height:1.03;margin-bottom:12px}h1 em{color:var(--gold);font-style:italic}
-.hero p{color:var(--mut);font-size:16.5px;max-width:58ch}
-.card{background:var(--ink2);border:1px solid var(--line);border-radius:10px;padding:18px;margin:18px 0}
-textarea{width:100%;min-height:210px;background:var(--ink);border:1px solid var(--line);border-radius:8px;color:#fff;padding:14px;font-family:var(--sans);font-size:16.5px;line-height:1.6;resize:vertical;outline:none}
-textarea:focus{border-color:var(--gold)}
-input{width:100%;background:var(--ink);border:1px solid var(--line);border-radius:6px;color:#fff;padding:11px 12px;font-family:var(--mono);font-size:14px}
-canvas{width:100%;height:64px;display:block;margin-top:12px}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}
-@media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
-.st{background:var(--ink);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:9px 10px}
-.st b{display:block;font-family:var(--mono);font-size:18px;font-weight:500}.st span{font-size:11.5px;color:var(--mut)}
-.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}
-.btn{background:var(--gold);color:var(--ink);border:0;border-radius:6px;padding:13px 18px;font-family:var(--mono);font-size:14px;font-weight:500;cursor:pointer;text-decoration:none;display:inline-block}
-.btn.g{background:transparent;color:var(--gold);border:1px solid var(--gold)}.btn[disabled]{opacity:.5}
-.msg{font-family:var(--mono);font-size:13px;margin-top:10px;min-height:1em}.msg.err{color:var(--err)}.msg.ok{color:var(--ok2)}
-.wallet{font-family:var(--mono);font-size:12.5px;color:var(--mut)}
-.cert{border:1px solid rgba(47,191,113,.5);background:linear-gradient(160deg,rgba(47,191,113,.10),rgba(16,24,46,1) 60%);border-radius:12px;padding:22px;margin:18px 0}
-.cert.part{border-color:rgba(201,168,76,.6);background:linear-gradient(160deg,rgba(201,168,76,.12),rgba(16,24,46,1) 60%)}
-.cert.bad{border-color:rgba(255,138,128,.5);background:linear-gradient(160deg,rgba(255,138,128,.10),rgba(16,24,46,1) 60%)}
-.seal{display:flex;gap:14px;align-items:center}
-.ring{width:54px;height:54px;border-radius:50%;border:2px solid var(--ok);display:flex;align-items:center;justify-content:center;font-size:26px;color:var(--ok);flex:none}
-.part .ring{border-color:var(--gold);color:var(--gold)}.bad .ring{border-color:var(--err);color:var(--err)}
-.cert h2{font-family:var(--serif);font-weight:500;font-size:26px;line-height:1.15}
-.code{font-family:var(--mono);font-size:24px;letter-spacing:.06em;color:var(--gold2);margin:14px 0 4px}
-dl{display:grid;grid-template-columns:minmax(120px,170px) 1fr;gap:5px 12px;font-size:14px;margin-top:12px}
-dt{color:var(--mut);font-size:13px}dd{font-family:var(--mono);font-size:13px;word-break:break-all}
-.how{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:8px 0 18px}@media(max-width:640px){.how{grid-template-columns:1fr}}
-.how div{border-top:1px solid var(--line);padding-top:10px}.how b{font-family:var(--mono);font-size:12px;color:var(--gold);letter-spacing:.06em}.how p{color:var(--mut);font-size:14px;margin-top:4px}
-footer{border-top:1px solid var(--line);margin-top:30px;padding:20px 0;font-size:12.5px;color:var(--mut)}
-footer a{color:var(--gold);text-decoration:none}
-</style>"""
+306 lines, 19901 bytes
 
-KEYS_PAGE = _HEAD + r"""
-<title>Human Keys · proof a human typed it</title>
-<meta name="description" content="Type it here and get a sealed code that proves a human typed it, live, not pasted or generated. 50p a month, unlimited proofs. Checking is free.">
-</head><body>
-<div class="top"><div class="wrap"><a class="brand" href="https://sebbi.pro/">AI<b>Leash</b> · Human Keys</a><a class="l" href="https://sebbi.pro/k/">Check a code</a></div></div>
-<div class="wrap">
-<div class="hero"><div class="kick">HUMAN KEYS</div>
-<h1>Proof a human <em>typed it.</em></h1>
-<p>Type below. We read the rhythm of your typing, never your words. Seal it and you get one short code that proves a person typed this, live, not pasted and not generated. Anyone can check it, free, forever.</p></div>
+```python
+"""
+modules/homelink.py  v1.13.0
+Adds the "Auditors", "Cinema", "Deep Run", "Agent Room", "Machine readable" and "Agent Passport" buttons to the sebbi.pro homepage without
+editing index.html or server.py.
 
-<div class="how">
-<div><b>01 · TYPE</b><p>Write it here, by hand. Your words stay on your phone.</p></div>
-<div><b>02 · SEAL</b><p>The rhythm is scored and sealed with a public clock nobody can predict. 50p a month, as many proofs as you like.</p></div>
-<div><b>03 · SHARE</b><p>Put the code or badge under your post, essay, review or sign-off.</p></div>
-</div>
+1.10.0: adds a fourth bubble along the bottom, "plug in", between tools and
+Monop Studio. It opens the plug-in menu: /plugin (keep your system, add the
+proof), get your key, the adapter download, your account and bill,
+pricing and check a receipt - all served by plugin.py.
 
-<div class="card">
-<textarea id="t" placeholder="Start typing…" autocomplete="off" autocorrect="on" spellcheck="true"></textarea>
-<canvas id="cv" width="800" height="64"></canvas>
-<div class="stats">
-<div class="st"><b id="sk">0</b><span>keystrokes</span></div>
-<div class="st"><b id="sc">0</b><span>corrections</span></div>
-<div class="st"><b id="sp">0</b><span>thinking pauses</span></div>
-<div class="st"><b id="sv">0</b><span>pasted characters</span></div>
-</div>
-<input id="em" type="email" placeholder="Email me my ownership backup code (optional)" style="margin-top:12px;font-family:var(--sans)" autocomplete="email">
-<div class="btns"><button class="btn" id="seal" disabled>Seal it</button><span class="wallet" id="wallet">Wallet: …</span><a class="btn g" id="topup" href="https://sebbi.pro/credits" style="display:none">Top up</a></div>
-<div class="msg" id="msg"></div>
-<p class="wallet" style="margin-top:12px">Your phone holds a private key that signs every proof, so only you can prove a proof is yours. <a href="#" id="rst" style="color:var(--gold)">Restore my key from a backup code</a></p>
-<div id="rbox" style="display:none;margin-top:10px"><textarea id="rcode" style="min-height:90px;font-family:var(--mono);font-size:12px" placeholder="Paste your backup code"></textarea><div class="btns"><button class="btn g" id="rgo">Restore</button></div></div>
-</div>
-<div id="out"></div>
-</div>
-<footer><div class="wrap">Monop Content · <a href="https://sebbi.pro/x/humankeys/spec">How the proof works</a> · <a href="https://sebbi.pro/k/">Check a code</a></div></footer>
-<script>
-const HK={
- db(){return new Promise((res,rej)=>{const r=indexedDB.open('sebbi-hk',1);r.onupgradeneeded=()=>r.result.createObjectStore('keys');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})},
- async get(){try{const d=await HK.db();return await new Promise(res=>{const q=d.transaction('keys').objectStore('keys').get('device');q.onsuccess=()=>res(q.result||null);q.onerror=()=>res(null)})}catch(e){return null}},
- async put(v){const d=await HK.db();return new Promise(res=>{const t=d.transaction('keys','readwrite');t.objectStore('keys').put(v,'device');t.oncomplete=()=>res(true)})},
- b64(buf){return btoa(String.fromCharCode(...new Uint8Array(buf)))},
- b64u(buf){return HK.b64(buf).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')},
- unb64(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))},
- alg:{name:'ECDSA',namedCurve:'P-256'},sig:{name:'ECDSA',hash:'SHA-256'},
- async ensure(){let k=await HK.get();if(k)return {k,fresh:false};
-  const pair=await crypto.subtle.generateKey(HK.alg,true,['sign','verify']);k={privateKey:pair.privateKey,publicKey:pair.publicKey};await HK.put(k);return {k,fresh:true}},
- async pub(k){return HK.b64(await crypto.subtle.exportKey('spki',k.publicKey))},
- async backup(k){return HK.b64u(await crypto.subtle.exportKey('pkcs8',k.privateKey))},
- async sign(k,text){return HK.b64(await crypto.subtle.sign(HK.sig,k.privateKey,new TextEncoder().encode(text)))},
- async verify(pubB64,sigB64,text){try{const key=await crypto.subtle.importKey('spki',HK.unb64(pubB64),HK.alg,false,['verify']);return await crypto.subtle.verify(HK.sig,key,HK.unb64(sigB64),new TextEncoder().encode(text))}catch(e){return false}},
- async restore(code){const priv=await crypto.subtle.importKey('pkcs8',HK.unb64(code.trim()),HK.alg,true,['sign']);
-  const jwk=await crypto.subtle.exportKey('jwk',priv);const pubJwk={kty:jwk.kty,crv:jwk.crv,x:jwk.x,y:jwk.y,ext:true};
-  const pub=await crypto.subtle.importKey('jwk',pubJwk,HK.alg,true,['verify']);await HK.put({privateKey:priv,publicKey:pub});return true}
-};
+1.9.0: adds a "My earnings" button (top right, mirroring START HERE) and a
+"My earnings & withdraw" link at the top of the Monop Studio bubble. Both go
+to /earn, served by earnpage.py.
 
-(function(){
-const $=s=>document.querySelector(s);
-const t=$('#t'),cv=$('#cv'),cx=cv.getContext('2d');
-let ch=null,iv=[],last=0,n={inserts:0,deletes:0,multi_inserts:0,multi_chars:0,paste_events:0,paste_chars:0,blurs:0,typed_chars:0},pauses=0;
-let viewer=null;try{viewer=localStorage.getItem('sebbi.viewer')}catch(e){}
-if(!viewer){viewer=Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');try{localStorage.setItem('sebbi.viewer',viewer)}catch(e){}}
-function msg(x,c){const m=$('#msg');m.textContent=x;m.className='msg '+(c||'')}
-async function start(){try{const r=await fetch('/x/humankeys/challenge');ch=await r.json()}catch(e){msg('Could not reach sebbi.pro. Check your connection.','err')}}
-async function wallet(){try{await fetch('/c/hello?viewer='+viewer);const r=await fetch('/x/humankeys/pass?viewer='+viewer);const d=await r.json();const b=d.balance_pence||0;
- if(d.active){$('#wallet').textContent='Unlimited proofs until '+d.until_uk;$('#topup').style.display='none'}
- else{$('#wallet').textContent='50p a month, unlimited proofs · wallet £'+(b/100).toFixed(2);$('#topup').style.display=b<50?'inline-block':'none'}
- return b}catch(e){$('#wallet').textContent='50p a month, unlimited proofs';return 0}}
-start();wallet();
-function tick(){const now=performance.now();if(last){const g=now-last;iv.push(Math.round(g));if(g>2000)pauses++}last=now;if(iv.length>6000)iv.shift();draw();stats()}
-let comp=0;
-t.addEventListener('compositionstart',()=>{comp=0});
-t.addEventListener('compositionend',()=>{comp=0});
-t.addEventListener('beforeinput',e=>{
- const ty=e.inputType||'';
- if(ty==='insertFromPaste'||ty==='insertFromDrop'){return}
- if(ty.startsWith('delete')){n.deletes++;tick();return}
- if(ty==='insertCompositionText'){
-  const d=(e.data||'').length;const delta=d-comp;comp=d;
-  if(delta<0){n.deletes++}else if(delta===1){n.inserts++;n.typed_chars++}else if(delta>1){n.multi_inserts++;n.multi_chars+=delta}
-  tick();return}
- if(ty==='insertText'||ty==='insertReplacementText'||ty==='insertLineBreak'||ty==='insertParagraph'){
-  const d=(e.data||'');const len=(ty==='insertLineBreak'||ty==='insertParagraph')?1:Math.max(1,d.length);
-  if(len>1){n.multi_inserts++;n.multi_chars+=len}else{n.inserts++;n.typed_chars++}
-  tick()}
-});
-t.addEventListener('paste',e=>{const d=(e.clipboardData&&e.clipboardData.getData('text'))||'';n.paste_events++;n.paste_chars+=d.length;stats()});
-t.addEventListener('drop',e=>{n.paste_events++;n.paste_chars+=((e.dataTransfer&&e.dataTransfer.getData('text'))||'').length;stats()});
-window.addEventListener('blur',()=>{n.blurs++});
-function stats(){$('#sk').textContent=n.typed_chars+n.multi_inserts;$('#sc').textContent=n.deletes;$('#sp').textContent=pauses;$('#sv').textContent=n.paste_chars;
- $('#seal').disabled=(n.typed_chars+n.multi_inserts<30)}
-function draw(){const W=cv.width,H=cv.height;cx.clearRect(0,0,W,H);const sl=iv.slice(-120);const bw=W/120;
- sl.forEach((g,i)=>{const v=Math.min(g,1200)/1200;const h=Math.max(2,v*(H-6));cx.fillStyle=g>2000?'#f0d78a':(g<12?'#ff8a80':'#c9a84c');cx.globalAlpha=.35+.65*(i/sl.length);
-  cx.fillRect(i*bw+1,H-h,bw-2,h)});cx.globalAlpha=1}
-draw();
-function norm(s){return s.normalize('NFC').replace(/\r\n?/g,'\n').trim()}
-async function sha(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('')}
-$('#rst').onclick=e=>{e.preventDefault();const b=$('#rbox');b.style.display=b.style.display==='none'?'block':'none'};
-$('#rgo').onclick=async()=>{try{await HK.restore($('#rcode').value);msg('Key restored. Your proofs are yours on this phone again.','ok');$('#rbox').style.display='none'}catch(e){msg('That backup code did not work. Check it was copied in full.','err')}};
-$('#seal').onclick=async()=>{
- const btn=$('#seal');btn.disabled=true;btn.textContent='Sealing…';msg('');
- if(!ch||!ch.sig){await start();if(!ch||!ch.sig){btn.disabled=false;btn.textContent='Seal it';return}}
- const text=norm(t.value);const h=await sha(text);
- const body={challenge:ch.challenge,sig:ch.sig,text_hash:h,intervals:iv,counts:Object.assign({final_length:text.length},n),viewer:viewer};
- let backup=null;
- try{const r=await HK.ensure();body.pubkey=await HK.pub(r.k);body.owner_sig=await HK.sign(r.k,h);
-  if(r.fresh){backup=await HK.backup(r.k);const em=$('#em').value.trim();if(em){body.backup_email=em;body.backup_code=backup}}}catch(e){}
- try{const r=await fetch('/x/humankeys/seal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();
-  if(r.status===402){msg(d.message||'Human Keys is 50p a month for unlimited proofs. Top up first.','err');$('#topup').style.display='inline-block';btn.disabled=false;btn.textContent='Seal it';return}
-  if(!r.ok||!d.sealed){msg(d.message||d.error||'Could not seal it.','err');btn.disabled=false;btn.textContent='Seal it';return}
-  d._backup=backup;render(d);wallet();btn.textContent='Sealed';
- }catch(e){msg('Could not reach sebbi.pro.','err');btn.disabled=false;btn.textContent='Seal it'}};
-function render(d){const cls=d.verdict==='HUMAN_TYPED'?'':(d.verdict==='HUMAN_TYPED_PART_PASTED'?'part':'bad');const s=d.summary||{};
- const share='✓ Human typed · check it: '+d.check;
- $('#out').innerHTML='<div class="cert '+cls+'"><div class="seal"><div class="ring">'+(cls==='bad'?'!':'✓')+'</div><h2>'+d.verdict_text+'</h2></div>'+
- '<div class="code">'+d.code+'</div><div class="wallet">Sealed '+d.sealed_uk+' · block '+d.block_index+'</div>'+
- '<dl><dt>Keystrokes</dt><dd>'+s.keystrokes+'</dd><dt>Corrections</dt><dd>'+s.corrections+'</dd><dt>Thinking pauses</dt><dd>'+s.thinking_pauses+'</dd><dt>Typing time</dt><dd>'+s.typing_minutes+' min</dd><dt>Composition</dt><dd>'+s.composition_signals+'</dd><dt>Pasted</dt><dd>'+s.pasted_characters+' characters</dd></dl>'+
- '<div class="btns"><button class="btn" id="cp">Copy the proof line</button><a class="btn g" href="'+d.check+'">Open the check page</a>'+(navigator.share?'<button class="btn g" id="sh">Share</button>':'')+'</div>'+
- '<p class="wallet" style="margin-top:10px">Badge for websites: '+d.badge+'</p>'+
- (d.owner_signed?'<p class="wallet" style="margin-top:6px;color:var(--ok2)">✓ Signed by this phone — only you can prove it\'s yours.</p>':'')+
- (d._backup?'<div style="margin-top:14px;border:1px dashed var(--gold);border-radius:8px;padding:12px"><b style="font-family:var(--mono);font-size:12px;color:var(--gold)">YOUR OWNERSHIP BACKUP CODE · SHOWN ONCE</b><p class="wallet" style="margin:6px 0">'+(d.backup_emailed?'We\'ve emailed it to you too. ':'')+'Keep it private. It restores your key on a new phone.</p><div style="font-family:var(--mono);font-size:11px;word-break:break-all;color:#fff">'+d._backup+'</div><div class="btns"><button class="btn g" id="cpb">Copy backup code</button></div></div>':'')+
- '</div>';
- $('#cp').onclick=()=>{navigator.clipboard.writeText(share);$('#cp').textContent='Copied'};
- const cpb=$('#cpb');if(cpb)cpb.onclick=()=>{navigator.clipboard.writeText(d._backup);cpb.textContent='Copied'};
- const sh=$('#sh');if(sh)sh.onclick=()=>navigator.share({title:'Human typed',text:share,url:d.check});
- $('#out').scrollIntoView({behavior:'smooth'})}
-})();
-</script></body></html>"""
+Page module, same family as map.py: a runtime do_GET patch. For the homepage
+only ("/" and "/index.html") it lets the normal handler build the page into a
+buffer, inserts one small fixed button before </body>, corrects the
+Content-Length, and sends it on. If anything about the response is not a plain
+200 HTML page with a </body> tag, the original bytes are sent untouched - the
+homepage can never be broken by this module, only left as it was.
 
-CHECK_PAGE = _HEAD + r"""
-<title>Check a Human Keys proof</title>
-<meta name="description" content="Check whether a text was typed by a human, live. Paste it and compare it with the sealed proof. Free.">
-</head><body>
-<div class="top"><div class="wrap"><a class="brand" href="https://sebbi.pro/">AI<b>Leash</b> · Human Keys</a><a class="l" href="https://sebbi.pro/keys">Make a proof</a></div></div>
-<div class="wrap">
-<div class="hero"><div class="kick">CHECK A PROOF</div><h1>Was it typed by <em>a human?</em></h1>
-<p>Enter the code, then paste the text it came with. The text is checked on your own device. Checking is free.</p></div>
-<div class="card"><input id="code" placeholder="HK-XXXX-XXXX" value="__CODE__" autocapitalize="characters">
-<div class="btns"><button class="btn" id="look">Look it up</button></div><div class="msg" id="msg"></div></div>
-<div id="out"></div>
-</div>
-<footer><div class="wrap">Monop Content · <a href="https://sebbi.pro/x/humankeys/spec">How the proof works</a> · <a href="https://sebbi.pro/keys">Make your own · 50p a month</a></div></footer>
-<script>
-const HK={
- db(){return new Promise((res,rej)=>{const r=indexedDB.open('sebbi-hk',1);r.onupgradeneeded=()=>r.result.createObjectStore('keys');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})},
- async get(){try{const d=await HK.db();return await new Promise(res=>{const q=d.transaction('keys').objectStore('keys').get('device');q.onsuccess=()=>res(q.result||null);q.onerror=()=>res(null)})}catch(e){return null}},
- async put(v){const d=await HK.db();return new Promise(res=>{const t=d.transaction('keys','readwrite');t.objectStore('keys').put(v,'device');t.oncomplete=()=>res(true)})},
- b64(buf){return btoa(String.fromCharCode(...new Uint8Array(buf)))},
- b64u(buf){return HK.b64(buf).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')},
- unb64(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))},
- alg:{name:'ECDSA',namedCurve:'P-256'},sig:{name:'ECDSA',hash:'SHA-256'},
- async ensure(){let k=await HK.get();if(k)return {k,fresh:false};
-  const pair=await crypto.subtle.generateKey(HK.alg,true,['sign','verify']);k={privateKey:pair.privateKey,publicKey:pair.publicKey};await HK.put(k);return {k,fresh:true}},
- async pub(k){return HK.b64(await crypto.subtle.exportKey('spki',k.publicKey))},
- async backup(k){return HK.b64u(await crypto.subtle.exportKey('pkcs8',k.privateKey))},
- async sign(k,text){return HK.b64(await crypto.subtle.sign(HK.sig,k.privateKey,new TextEncoder().encode(text)))},
- async verify(pubB64,sigB64,text){try{const key=await crypto.subtle.importKey('spki',HK.unb64(pubB64),HK.alg,false,['verify']);return await crypto.subtle.verify(HK.sig,key,HK.unb64(sigB64),new TextEncoder().encode(text))}catch(e){return false}},
- async restore(code){const priv=await crypto.subtle.importKey('pkcs8',HK.unb64(code.trim()),HK.alg,true,['sign']);
-  const jwk=await crypto.subtle.exportKey('jwk',priv);const pubJwk={kty:jwk.kty,crv:jwk.crv,x:jwk.x,y:jwk.y,ext:true};
-  const pub=await crypto.subtle.importKey('jwk',pubJwk,HK.alg,true,['verify']);await HK.put({privateKey:priv,publicKey:pub});return true}
-};
+Armed by hitting /x/homelink/status once after each deploy.
 
-(function(){
-const $=s=>document.querySelector(s);
-function msg(x,c){const m=$('#msg');m.textContent=x;m.className='msg '+(c||'')}
-function norm(s){return s.normalize('NFC').replace(/\r\n?/g,'\n').trim()}
-async function sha(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('')}
-const esc=v=>String(v==null?'—':v).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let rec=null;
-async function look(){const code=$('#code').value.trim().toUpperCase();if(!/^HK-[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(code)){msg('Codes look like HK-7Q2M-X9KD.','err');return}
- msg('Looking it up…');try{const r=await fetch('/x/humankeys/check?code='+code);const d=await r.json();if(!r.ok){msg('No proof with that code.','err');$('#out').innerHTML='';return}
- rec=d;msg('');render()}catch(e){msg('Could not reach sebbi.pro.','err')}}
-function render(){const d=rec,s=d.summary||{};const cls=d.verdict==='HUMAN_TYPED'?'':(d.verdict==='HUMAN_TYPED_PART_PASTED'?'part':'bad');
- $('#out').innerHTML='<div class="cert '+cls+'"><div class="seal"><div class="ring">'+(cls==='bad'?'!':'✓')+'</div><h2>'+esc(d.verdict_text)+'</h2></div>'+
- '<div class="code">'+esc(d.code)+'</div><div class="wallet">Sealed '+esc(d.sealed_uk)+' · <a style="color:var(--gold)" href="'+esc(d.verify_block)+'">block '+esc(d.block_index)+'</a></div>'+
- '<dl><dt>Keystrokes</dt><dd>'+esc(s.keystrokes)+'</dd><dt>Corrections</dt><dd>'+esc(s.corrections)+'</dd><dt>Thinking pauses</dt><dd>'+esc(s.thinking_pauses)+'</dd><dt>Typing time</dt><dd>'+esc(s.typing_minutes)+' min</dd><dt>Composition</dt><dd>'+esc(s.composition_signals)+'</dd><dt>Pasted</dt><dd>'+esc(s.pasted_characters)+' characters</dd><dt>Session began</dt><dd>'+esc(d.session_started_utc)+'</dd>'+(d.reference?'<dt>Linked to</dt><dd>'+esc(d.reference)+'</dd>':'')+'</dl>'+
- '<p style="margin-top:16px;color:var(--mut);font-size:14px">Paste the text this code came with:</p><textarea id="txt" style="min-height:140px;margin-top:8px"></textarea>'+
- '<div class="btns"><button class="btn" id="cmp">Check it matches</button></div><div class="msg" id="res"></div>'+
- '<div id="own" style="margin-top:18px;border-top:1px solid var(--line);padding-top:14px"></div></div>';
- ownership();
- $('#cmp').onclick=async()=>{const h=await sha(norm($('#txt').value));const ok=h===d.text_hash;const r=$('#res');
-  r.textContent=ok?'✓ Exact match. This is the text that was typed and sealed.':'✗ Not a match. This is not the text that was sealed — even one changed character shows here.';r.className='msg '+(ok?'ok':'err')}}
-async function ownership(){const d=rec,box=$('#own');if(!box)return;
- if(!d.owner_key){box.innerHTML='<p class="wallet">This proof was sealed before ownership keys existed, so it is not tied to a device.</p>';return}
- const signed=await HK.verify(d.owner_key,d.owner_signature||'',d.text_hash);
- let h='<p class="msg '+(signed?'ok':'err')+'">'+(signed?'✓ Sealed and signed by its owner\'s device.':'✗ The owner signature does not check out.')+'</p>';
- const q=new URLSearchParams(location.search),own=q.get('own'),t=q.get('t');
- if(own&&t){const ok=await HK.verify(d.owner_key,own,'HKOWN|'+d.code+'|'+t);const age=Math.max(0,Math.round(Date.now()/1000-Number(t)));
-  const ago=age<120?age+' seconds ago':(age<7200?Math.round(age/60)+' minutes ago':Math.round(age/3600)+' hours ago');
-  h+=ok?'<div class="cert" style="margin:10px 0 0"><div class="seal"><div class="ring">✓</div><h2>Ownership proven</h2></div><p class="wallet" style="margin-top:8px">The person who sent you this link holds the device that typed it. Signed '+ago+'.</p></div>'
-       :'<p class="msg err">✗ This ownership link is not valid for this proof.</p>'}
- else{h+='<p class="wallet">Someone showing you this proof can prove it is theirs: ask them to open this page on the phone that typed it and tap the button below, then send you the link.</p>'}
- h+='<div class="btns"><button class="btn g" id="mine">Prove this is mine</button></div><div class="msg" id="mres"></div>';
- box.innerHTML=h;
- $('#mine').onclick=async()=>{const r=$('#mres');const k=await HK.get();
-  if(!k){r.textContent='This phone has no Human Keys key. Restore it from your backup code on https://sebbi.pro/keys';r.className='msg err';return}
-  const mine=(await HK.pub(k))===d.owner_key;if(!mine){r.textContent='This phone does not hold the key for this proof.';r.className='msg err';return}
-  const ts=Math.floor(Date.now()/1000);const sg=await HK.sign(k,'HKOWN|'+d.code+'|'+ts);
-  const link=location.origin+'/k/'+d.code+'?own='+encodeURIComponent(sg)+'&t='+ts;
-  try{await navigator.clipboard.writeText(link)}catch(e){}
-  r.innerHTML='Ownership link copied. Send it to whoever needs proof:<br><span style="word-break:break-all;color:#fff">'+link+'</span>';r.className='msg ok';
-  if(navigator.share)navigator.share({title:'Proof this is mine',url:link}).catch(()=>{})}}
-$('#look').onclick=look;if($('#code').value)look();
-})();
-</script></body></html>"""
+1.13.0: the sebbi bubble gains Connect your AI (/connect), Build your own
+rules (/build), Human Keys (/keys), Check a Human Keys proof (/k/), the
+Machine-proof report (/dossier) and
+Featured on AI Business; the plug in bubble gains Connect any AI (/connect).
+Existing buttons unchanged.
+
+1.12.0: arming homelink also arms the modules its bubbles lead to - meter.py
+(the 50p device meter) and plugin.py (the /plugin page and its /p/ routes) -
+so those work even if the router does not list them. If a file is missing,
+homelink still arms and the status says which one.
+"""
+
+import io
+import sys
+
+VERSION = "1.13.0"
+PATHS = ("/", "/index.html")
+MARK = b"<!--sebbi-homelink-->"
+
+BUTTON = (
+    b'<!--sebbi-homelink--><style>@keyframes sbspin{to{transform:rotate(360deg)}}'
+    b'@keyframes sbpulse{0%,100%{box-shadow:0 0 12px rgba(74,163,255,.55),0 5px 18px rgba(0,0,0,.4)}'
+    b'50%{box-shadow:0 0 22px rgba(201,168,76,.8),0 5px 18px rgba(0,0,0,.4)}}'
+    b'@keyframes sbfloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}'
+    b'#sebbi-homelink{position:fixed;right:14px;bottom:calc(14px + env(safe-area-inset-bottom,0px));'
+    b'z-index:2147483000;display:flex;flex-direction:column;align-items:flex-end;gap:8px}'
+    b'#sebbi-homelink a{display:flex;align-items:center;gap:7px;background:#0a0f1e;color:#fff;'
+    b'border-radius:999px;padding:8px 13px;font:500 12px/1 \'IBM Plex Mono\',ui-monospace,monospace;'
+    b'text-decoration:none;box-shadow:0 5px 18px rgba(0,0,0,.35)}'
+    b'#sebbi-homelink .tag{border-radius:999px;padding:3px 6px;font-size:9.5px;letter-spacing:.05em;color:#0a0f1e}'
+    b'#sebbi-homelink .portal{position:relative;border:0;padding:9px 15px 9px 10px;animation:sbpulse 2.4s infinite}'
+    b'#sebbi-homelink .portal:before{content:"";position:absolute;inset:-2px;border-radius:999px;z-index:-1;'
+    b'background:conic-gradient(from 0deg,#c9a84c,#7fe3b0,#4aa3ff,#c9a84c)}'
+    b'#sebbi-homelink .ring{width:18px;height:18px;border-radius:50%;flex:none;'
+    b'background:conic-gradient(#c9a84c,#7fe3b0,#4aa3ff,#c9a84c);animation:sbspin 1.4s linear infinite;'
+    b'-webkit-mask:radial-gradient(circle,transparent 45%,#000 50%);mask:radial-gradient(circle,transparent 45%,#000 50%)}'
+    b'#sebbi-homelink .x{width:30px;height:30px;padding:0;justify-content:center;border:1px solid rgba(255,255,255,.3);'
+    b'font-size:14px;cursor:pointer}'
+    b'#sebbi-bubble{display:none;position:fixed;right:18px;bottom:calc(18px + env(safe-area-inset-bottom,0px));'
+    b'z-index:2147483000;width:62px;height:62px;border-radius:50%;cursor:pointer;animation:sbfloat 3.2s ease-in-out infinite;'
+    b'background:radial-gradient(circle at 32% 28%,rgba(255,255,255,.95) 0,rgba(255,255,255,.35) 12%,rgba(143,208,255,.35) 30%,'
+    b'rgba(201,168,76,.35) 62%,rgba(10,15,30,.55) 100%);'
+    b'box-shadow:inset -8px -10px 18px rgba(10,15,30,.55),inset 6px 6px 14px rgba(255,255,255,.35),'
+    b'0 10px 26px rgba(0,0,0,.45),0 0 24px rgba(143,208,255,.35);border:1px solid rgba(255,255,255,.35);'
+    b'display:none;align-items:center;justify-content:center;font:600 11px \'IBM Plex Mono\',monospace;color:#fff;'
+    b'text-shadow:0 1px 4px rgba(0,0,0,.6)}'
+    b'#sebbi-tools{position:fixed;left:14px;bottom:calc(14px + env(safe-area-inset-bottom,0px));z-index:2147483000;'
+    b'display:none;flex-direction:column;align-items:flex-start;gap:8px}'
+    b'#sebbi-tools a{display:flex;align-items:center;gap:7px;background:#0a0f1e;color:#fff;border-radius:999px;'
+    b'padding:8px 13px;font:500 12px/1 \'IBM Plex Mono\',ui-monospace,monospace;text-decoration:none;'
+    b'box-shadow:0 5px 18px rgba(0,0,0,.35);border:1.5px solid rgba(255,255,255,.2)}'
+    b'#sebbi-tools a.x{width:30px;height:30px;padding:0;justify-content:center;font-size:14px}'
+    b'#sebbi-toolbubble{position:fixed;left:18px;bottom:calc(18px + env(safe-area-inset-bottom,0px));z-index:2147483000;'
+    b'width:62px;height:62px;border-radius:50%;cursor:pointer;animation:sbfloat 3.6s ease-in-out infinite;'
+    b'background:radial-gradient(circle at 32% 28%,rgba(255,255,255,.95) 0,rgba(255,255,255,.35) 12%,rgba(127,227,176,.4) 30%,'
+    b'rgba(213,155,255,.35) 62%,rgba(10,15,30,.55) 100%);'
+    b'box-shadow:inset -8px -10px 18px rgba(10,15,30,.55),inset 6px 6px 14px rgba(255,255,255,.35),'
+    b'0 10px 26px rgba(0,0,0,.45),0 0 24px rgba(127,227,176,.35);border:1px solid rgba(255,255,255,.35);'
+    b'display:flex;align-items:center;justify-content:center;font:600 11px \'IBM Plex Mono\',monospace;color:#fff;'
+    b'text-shadow:0 1px 4px rgba(0,0,0,.6)}'
+    b'#sebbi-studio{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(14px + env(safe-area-inset-bottom,0px));'
+    b'z-index:2147483000;display:none;flex-direction:column;align-items:center;gap:8px}'
+    b'#sebbi-studio a{display:flex;align-items:center;gap:7px;background:#0a0f1e;color:#fff;border-radius:999px;'
+    b'padding:8px 13px;font:500 12px/1 \'IBM Plex Mono\',ui-monospace,monospace;text-decoration:none;'
+    b'box-shadow:0 5px 18px rgba(0,0,0,.35);border:1.5px solid rgba(213,155,255,.55);white-space:nowrap}'
+    b'#sebbi-studio a.x{width:30px;height:30px;padding:0;justify-content:center;font-size:14px;border-color:rgba(255,255,255,.25)}'
+    b'#sebbi-studiobubble{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(18px + env(safe-area-inset-bottom,0px));'
+    b'z-index:2147483000;width:66px;height:66px;border-radius:50%;cursor:pointer;animation:sbfloat 3s ease-in-out infinite;'
+    b'background:radial-gradient(circle at 32% 28%,rgba(255,255,255,.95) 0,rgba(255,255,255,.35) 12%,rgba(213,155,255,.45) 30%,'
+    b'rgba(201,168,76,.4) 62%,rgba(10,15,30,.6) 100%);'
+    b'box-shadow:inset -8px -10px 18px rgba(10,15,30,.55),inset 6px 6px 14px rgba(255,255,255,.35),'
+    b'0 10px 26px rgba(0,0,0,.45),0 0 26px rgba(213,155,255,.45);border:1px solid rgba(255,255,255,.35);'
+    b'display:flex;align-items:center;justify-content:center;font:600 10.5px \'IBM Plex Mono\',monospace;color:#fff;'
+    b'text-shadow:0 1px 4px rgba(0,0,0,.6);text-align:center;line-height:1.15}'
+    b'#sebbi-plug{position:fixed;left:14px;bottom:calc(14px + env(safe-area-inset-bottom,0px));z-index:2147483001;'
+    b'display:none;flex-direction:column;align-items:flex-start;gap:8px}'
+    b'#sebbi-plug a{display:flex;align-items:center;gap:7px;background:#0a0f1e;color:#fff;border-radius:999px;'
+    b'padding:8px 13px;font:500 12px/1 \'IBM Plex Mono\',ui-monospace,monospace;text-decoration:none;'
+    b'box-shadow:0 5px 18px rgba(0,0,0,.35);border:1.5px solid rgba(143,208,255,.55);white-space:nowrap}'
+    b'#sebbi-plug .tag{border-radius:999px;padding:3px 6px;font-size:9.5px;letter-spacing:.05em;color:#0a0f1e}'
+    b'#sebbi-plug a.x{width:30px;height:30px;padding:0;justify-content:center;font-size:14px;border-color:rgba(255,255,255,.25)}'
+    b'#sebbi-plugbubble{position:fixed;left:calc(25% + 10px);bottom:calc(18px + env(safe-area-inset-bottom,0px));z-index:2147483000;'
+    b'width:58px;height:58px;border-radius:50%;cursor:pointer;animation:sbfloat 3.4s ease-in-out infinite;'
+    b'background:radial-gradient(circle at 32% 28%,rgba(255,255,255,.95) 0,rgba(255,255,255,.35) 12%,rgba(143,208,255,.45) 30%,'
+    b'rgba(127,227,176,.35) 62%,rgba(10,15,30,.6) 100%);'
+    b'box-shadow:inset -8px -10px 18px rgba(10,15,30,.55),inset 6px 6px 14px rgba(255,255,255,.35),'
+    b'0 10px 26px rgba(0,0,0,.45),0 0 24px rgba(143,208,255,.45);border:1px solid rgba(255,255,255,.35);'
+    b'display:flex;align-items:center;justify-content:center;font:600 10.5px \'IBM Plex Mono\',monospace;color:#fff;'
+    b'text-shadow:0 1px 4px rgba(0,0,0,.6);text-align:center;line-height:1.15}'
+    b'</style>'
+    b'<div id="sebbi-studiobubble" onclick="this.style.display=\'none\';document.getElementById(\'sebbi-studio\').style.display=\'flex\'">'
+    b'monop<br>studio</div>'
+    b'<div id="sebbi-studio">'
+    b'<a class="x" href="#" aria-label="Close" onclick="event.preventDefault();this.parentNode.style.display=\'none\';'
+    b'document.getElementById(\'sebbi-studiobubble\').style.display=\'flex\'">&times;</a>'
+    b'<a href="/earn" style="border-color:#7fe3b0"><span class="tag" style="background:#7fe3b0">&pound;</span>My earnings &amp; withdraw</a>'
+    b'<a href="/create"><span class="tag" style="background:#d59bff">NEW</span>Monopolise a video</a>'
+    b'<a href="/create#player">Watch the demo lock</a>'
+    b'<a href="/create#how">How creators get paid</a>'
+    b'<a href="/create#price">Pricing &amp; splits</a>'
+    b'<a href="/create#calc">Earnings calculator</a>'
+    b'<a href="/create#centre">Your control centre</a>'
+    b'<a href="/cinema">See it in the cinema</a>'
+    b'</div>'
+    b'<div id="sebbi-plugbubble" onclick="this.style.display=\'none\';document.getElementById(\'sebbi-toolbubble\').style.visibility=\'hidden\';document.getElementById(\'sebbi-plug\').style.display=\'flex\'">'
+    b'plug<br>in</div>'
+    b'<div id="sebbi-plug">'
+    b'<a class="x" href="#" aria-label="Close" onclick="event.preventDefault();this.parentNode.style.display=\'none\';'
+    b'document.getElementById(\'sebbi-toolbubble\').style.visibility=\'visible\';document.getElementById(\'sebbi-plugbubble\').style.display=\'flex\'">&times;</a>'
+    b'<a href="/plugin" style="border-color:#8fd0ff"><span class="tag" style="background:#8fd0ff">NEW</span>Keep your system, add the proof</a>'
+    b'<a href="/connect" style="border-color:#f0d78a"><span class="tag" style="background:#f0d78a">NEW</span>Connect any AI in a minute</a>'
+    b'<a href="/plugin#key" style="border-color:#7fe3b0"><span class="tag" style="background:#7fe3b0">FREE</span>Get your key</a>'
+    b'<a href="/p/sebbi_adapter.py" download>Download the adapter</a>'
+    b'<a href="/plugin#account">Your account &amp; bill</a>'
+    b'<a href="/plugin#price">Pricing: 50p per device</a>'
+    b'<a href="/plugin#check">Check a receipt</a>'
+    b'</div>'
+    b'<div id="sebbi-toolbubble" onclick="this.style.display=\'none\';document.getElementById(\'sebbi-tools\').style.display=\'flex\'">'
+    b'tools</div>'
+    b'<div id="sebbi-tools">'
+    b'<a class="x" href="#" aria-label="Close" onclick="event.preventDefault();this.parentNode.style.display=\'none\';'
+    b'document.getElementById(\'sebbi-toolbubble\').style.display=\'flex\'">&times;</a>'
+    b'<a href="/tools#meter" style="border-color:#7fe3b0"><span class="tag" style="background:#7fe3b0">01</span>Token Meter</a>'
+    b'<a href="/tools#lens" style="border-color:#c9a84c"><span class="tag" style="background:#c9a84c">02</span>Receipt Lens</a>'
+    b'<a href="/tools#shield" style="border-color:#ff8a80"><span class="tag" style="background:#ff8a80">03</span>Prompt Shield</a>'
+    b'<a href="/tools#guard" style="border-color:#8fd0ff"><span class="tag" style="background:#8fd0ff">04</span>Spend Guard</a>'
+    b'<a href="/tools#badge" style="border-color:#d59bff"><span class="tag" style="background:#d59bff">05</span>Proof Badge</a>'
+    b'<a href="/tools" style="border-color:rgba(255,255,255,.35)">All free tools &rarr;</a>'
+    b'</div>'
+    b'<a id="sebbi-start" href="/start" style="position:fixed;left:12px;top:calc(62px + env(safe-area-inset-top,0px));'
+    b'z-index:2147483000;display:flex;align-items:center;gap:7px;background:rgba(10,15,30,.9);color:#fff;'
+    b'border:1.5px solid #c9a84c;border-radius:999px;padding:7px 12px 7px 8px;font:600 11.5px/1 \'IBM Plex Mono\',monospace;'
+    b'text-decoration:none;box-shadow:0 0 18px rgba(201,168,76,.45)">'
+    b'<span style="width:16px;height:16px;border-radius:50%;background:conic-gradient(#c9a84c,#7fe3b0,#4aa3ff,#c9a84c);'
+    b'animation:sbspin 1.4s linear infinite;-webkit-mask:radial-gradient(circle,transparent 42%,#000 48%);'
+    b'mask:radial-gradient(circle,transparent 42%,#000 48%)"></span>START HERE &rarr;</a>'
+    b'<a id="sebbi-earn" href="/earn" style="position:fixed;right:12px;top:calc(62px + env(safe-area-inset-top,0px));'
+    b'z-index:2147483000;display:flex;align-items:center;gap:7px;background:rgba(10,15,30,.9);color:#fff;'
+    b'border:1.5px solid #7fe3b0;border-radius:999px;padding:7px 12px 7px 8px;font:600 11.5px/1 \'IBM Plex Mono\',monospace;'
+    b'text-decoration:none;box-shadow:0 0 18px rgba(127,227,176,.45)">'
+    b'<span style="display:flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;'
+    b'background:#7fe3b0;color:#0a0f1e;font-size:10px;font-weight:700">&pound;</span>MY EARNINGS</a>'
+    b'<div id="sebbi-bubble" onclick="this.style.display=\'none\';document.getElementById(\'sebbi-homelink\').style.display=\'flex\'">'
+    b'sebbi</div>'
+    b'<div id="sebbi-homelink">'
+    b'<a class="x" href="#" aria-label="Close" onclick="event.preventDefault();this.parentNode.style.display=\'none\';'
+    b'var b=document.getElementById(\'sebbi-bubble\');b.style.display=\'flex\'">&times;</a>'
+    b'<a href="/auditors" style="background:#c9a84c;color:#0a0f1e;border:0;font-weight:700;'
+    b'box-shadow:0 0 24px rgba(201,168,76,.5),0 5px 18px rgba(0,0,0,.4)">&#9878; AUDITORS &rarr;</a>'
+    b'<a href="/cinema" style="border:1.5px solid #8fd0ff"><span class="tag" style="background:#8fd0ff">WATCH</span>Cinema &#127916;</a>'
+    b'<a href="/game" style="border:1.5px solid #d59bff"><span class="tag" style="background:#d59bff">PLAY</span>Deep Run &#9654;</a>'
+    b'<a class="portal" href="/room"><span class="ring"></span>Enter the Agent Room &rarr;</a>'
+    b'<a href="/prove" style="border:1.5px solid #7fe3b0"><span class="tag" style="background:#7fe3b0">PROOF</span>Machine readable &rarr;</a>'
+    b'<a href="/passport" style="border:1.5px solid #c9a84c"><span class="tag" style="background:#c9a84c">NEW</span>Agent Passport &rarr;</a>'
+    b'<a href="/connect" style="border:1.5px solid #8fd0ff"><span class="tag" style="background:#8fd0ff">NEW</span>Connect your AI &rarr;</a>'
+    b'<a href="/build" style="border:1.5px solid #7fe3b0"><span class="tag" style="background:#7fe3b0">BUILD</span>Build your own rules &rarr;</a>'
+    b'<a href="/keys" style="border:1.5px solid #f0d78a"><span class="tag" style="background:#f0d78a">HUMAN</span>Human Keys &rarr;</a>'
+    b'<a href="/k/" style="border:1.5px solid #f0d78a"><span class="tag" style="background:#f0d78a">CHECK</span>Check a Human Keys proof &rarr;</a>'
+    b'<a href="/dossier" style="border:1.5px solid #c9a84c"><span class="tag" style="background:#c9a84c">REPORT</span>Machine-proof report &rarr;</a>'
+    b'<a href="https://aibusiness.vc/startups/sebbi-aileash-justin-dobson-seal-every-ai-decision" style="border:1.5px solid rgba(255,255,255,.45)"><span class="tag" style="background:#fff">PRESS</span>Featured on AI Business &rarr;</a>'
+    b'</div>'
+)
+
+_patched = False
+
+
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        s = f.f_locals.get("self")
+        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
+            return type(s)
+        f = f.f_back
+    return None
+
+
+def _inject(raw):
+    """Return modified response bytes, or None to send the original."""
+    head, sep, body = raw.partition(b"\r\n\r\n")
+    if not sep:
+        return None
+    lines = head.split(b"\r\n")
+    if not lines or b" 200" not in lines[0]:
+        return None
+    lower = head.lower()
+    if b"text/html" not in lower or b"content-encoding" in lower or b"chunked" in lower:
+        return None
+    if MARK in body:
+        return None
+    at = body.rfind(b"</body>")
+    if at < 0:
+        return None
+    new_body = body[:at] + BUTTON + body[at:]
+    out = []
+    for ln in lines:
+        if ln.lower().startswith(b"content-length:"):
+            ln = b"Content-Length: " + str(len(new_body)).encode()
+        out.append(ln)
+    return b"\r\n".join(out) + b"\r\n\r\n" + new_body
+
+
+def _install(ctx):
+    global _patched
+    if _patched:
+        return True
+    cls = _find_handler_class(ctx)
+    if cls is None:
+        return False
+    if getattr(cls, "_homelink_patched", False):
+        _patched = True
+        return True
+
+    original_do_GET = cls.do_GET
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path not in PATHS:
+            return original_do_GET(self)
+        real = self.wfile
+        buf = io.BytesIO()
+        self.wfile = buf
+        try:
+            original_do_GET(self)
+            if hasattr(self, "_headers_buffer") and self._headers_buffer:
+                self.flush_headers()
+        finally:
+            self.wfile = real
+        raw = buf.getvalue()
+        try:
+            changed = _inject(raw)
+        except Exception:
+            changed = None
+        real.write(changed if changed is not None else raw)
+
+    cls.do_GET = do_GET
+    cls._homelink_patched = True
+    _patched = True
+    return True
+
+
+COMPANIONS = ("meter", "plugin", "public_proof_adapter")
+
+
+def _arm_companions(ctx):
+    import importlib
+    out = {}
+    pkg = __package__ or ""
+    for name in COMPANIONS:
+        try:
+            mod = importlib.import_module(pkg + "." + name if pkg else name)
+        except ImportError:
+            continue
+        except Exception as e:
+            out[name] = "error: " + str(e)[:120]
+            continue
+        try:
+            res = mod.handle("GET", "status", {}, None, ctx)
+            body = res[0] if isinstance(res, tuple) else res
+            out[name] = "armed %s" % (body.get("version", "") if isinstance(body, dict) else "")
+        except Exception as e:
+            out[name] = "error: " + str(e)[:120]
+    return out
+
+
+def handle(method, action, data, api_key, ctx):
+    companions = _arm_companions(ctx)
+    armed = _install(ctx)
+    return ({"module": "homelink", "version": VERSION, "armed": armed,
+             "adds": "Plug in bubble (/plugin, bottom, between tools and studio), My earnings (/earn, top right), Monop Studio bubble (/create, bottom centre, with My earnings & withdraw at the top), Free tools bubble (/tools, bottom left), Start here (/start, top left), Auditors (/auditors), Cinema (/cinema), Deep Run (/game), Agent Room (/room), Machine readable (/prove), Agent Passport (/passport), Connect your AI (/connect), Build your own rules (/build), Human Keys (/keys), Check a Human Keys proof (/k/), Machine-proof report (/dossier) and Featured on AI Business buttons",
+             "also_armed": companions,
+             "safe": "any response that is not a plain 200 HTML page is sent untouched"}, 200)
+
+
+PUBLIC = {("GET", "status"), ("GET", "spec")}
 
 ```
