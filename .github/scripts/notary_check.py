@@ -198,19 +198,21 @@ try:
         "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (hk_code, hk_hash, "HUMAN_TYPED", 0.9, "{}", "{}", time.time(), None, None, "test", None))
 
     # pages
-    for path in ("/notary", "/forever", "/n/", "/n/NT-AAAA-BBBB"):
+    for path in ("/bitcoin", "/forever", "/n/", "/n/NT-AAAA-BBBB"):
         st, body, hd = http_("GET", path, raw=True)
         chk("page %s" % path, st == 200 and b"</html>" in body and b"__MAGIC__" not in body, st)
     st, body, hd = http_("GET", "/forever-verify.py", raw=True)
     chk("verifier download", st == 200 and b"def check(" in body and "attachment" in (hd.get("Content-Disposition") or ""), st)
+    st, old, _ = http_("GET", "/notary", raw=True)
+    chk("existing /notary page still served by server.py", st == 200 and b"/x/notary/" not in old and b"Prove it existed" not in old, old[:200])
     st, disc, _ = http_("GET", "/.well-known/sebbi-notary.json")
     chk("discovery document", st == 200 and disc.get("proof_format") == "sebbi-forever-proof/1", disc)
     st, home, _ = http_("GET", "/", raw=True)
     i_ntx, i_sbx = home.find(b'class="ntx"'), home.find(b'class="sbx"')
     chk("homepage Bitcoin strip", i_ntx > 0 and home.count(b'class="ntx"') == 1, i_ntx)
     chk("homepage feature strip still there, below", i_sbx < 0 or i_sbx > i_ntx, (i_ntx, i_sbx))
-    chk("homepage buttons: Bitcoin Notary and Forever Proof", home.count(b'href="/notary" style=') == 1 and b'href="/forever" style=' in home
-        and home.find(b'href="/notary" style=') < home.find(b'<a href="/dossier" style='), home.count(b'href="/notary"'))
+    chk("homepage buttons: Bitcoin Notary and Forever Proof", home.count(b'href="/bitcoin" style=') == 1 and b'href="/forever" style=' in home
+        and home.find(b'href="/bitcoin" style=') < home.find(b'<a href="/dossier" style='), home.count(b'href="/bitcoin"'))
     st, kp, _ = http_("GET", "/k/" + hk_code, raw=True)
     chk("Human Keys page shows the Bitcoin panel", st == 200 and b'id="ntxhk"' in kp, st)
     st, kp2, _ = http_("GET", "/keys", raw=True)

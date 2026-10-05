@@ -2,7 +2,7 @@
 modules/notary.py  v1.0.0  -  Bitcoin Notary, Forever Proofs, Human Keys in Bitcoin
 
     Arm:       https://sebbi.pro/x/arm/status
-    Notary:    https://sebbi.pro/notary
+    Notary:    https://sebbi.pro/bitcoin   (/notary is the existing profile notary, left alone)
     Receipt:   https://sebbi.pro/n/<code>
     Forever:   https://sebbi.pro/forever
     Verifier:  https://sebbi.pro/forever-verify.py
@@ -694,7 +694,7 @@ def status():
             return None
     nb = _state.get("next_batch_at")
     return {"module": "notary", "version": VERSION, "armed": _state["pages"],
-            "pages": {"notary": SITE + "/notary", "forever": SITE + "/forever", "verifier": SITE + "/forever-verify.py"},
+            "pages": {"notary": SITE + "/bitcoin", "forever": SITE + "/forever", "verifier": SITE + "/forever-verify.py"},
             "fingerprints": cnt("SELECT COUNT(*) FROM notary_leaf WHERE kind='hash'"),
             "human_keys_anchored": cnt("SELECT COUNT(*) FROM notary_leaf WHERE kind='humankeys' AND batch_id IS NOT NULL"),
             "waiting_for_next_batch": cnt("SELECT COUNT(*) FROM notary_leaf WHERE batch_id IS NULL"),
@@ -930,9 +930,9 @@ footer{border-top:1px solid var(--line);margin-top:34px;padding:22px 0 30px;font
 </style>"""
 
 _TOP = r"""<header class="top"><div class="wrap"><a class="brand" href="/">sebbi<b>.pro</b></a>
-<nav><a href="/notary">Notary</a><a href="/forever">Forever Proof</a><a href="/keys">Human Keys</a><a href="/connect">Connect</a></nav></div></header>"""
+<nav><a href="/bitcoin">Notary</a><a href="/forever">Forever Proof</a><a href="/keys">Human Keys</a><a href="/connect">Connect</a></nav></div></header>"""
 
-_FOOT = r"""<footer><div class="wrap"><a href="/notary">Bitcoin Notary</a><a href="/forever">Forever Proof</a><a href="/forever-verify.py">Verifier</a><a href="/x/notary/spec">Spec</a><a href="/terms">Terms</a>
+_FOOT = r"""<footer><div class="wrap"><a href="/bitcoin">Bitcoin Notary</a><a href="/forever">Forever Proof</a><a href="/forever-verify.py">Verifier</a><a href="/x/notary/spec">Spec</a><a href="/terms">Terms</a>
 <p style="margin-top:12px">&copy; 2026 Monop Content &middot; sebbi.pro</p></div></footer>"""
 
 # The browser verifier. It is the same algorithm as forever_verify.py, written
@@ -1119,7 +1119,7 @@ function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','
 const fmt=t=>t?new Date(t).toLocaleString('en-GB',{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}):'';
 let rec=null;
 async function load(){
- if(!/^(NT|HK)-[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(CODE)){$('#hd').textContent='Find a receipt';$('#hp').innerHTML='Receipt codes look like NT-7Q2M-X9KD. <a href="/notary">Notarise a file</a>.';return}
+ if(!/^(NT|HK)-[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(CODE)){$('#hd').textContent='Find a receipt';$('#hp').innerHTML='Receipt codes look like NT-7Q2M-X9KD. <a href="/bitcoin">Notarise a file</a>.';return}
  const r=await fetch('/x/notary/receipt?code='+CODE);rec=await r.json();
  if(!r.ok){$('#hd').textContent='Not found';$('#hp').textContent='No receipt with that code.';return}
  const s=rec.subject,b=rec.batch||{},st=rec.state;$('#cert').hidden=false;$('#emb').hidden=false;$('#cmp').hidden=s.kind!=='hash';
@@ -1240,7 +1240,7 @@ HOME_STRIP = r"""<section class="ntx" aria-label="Bitcoin Notary">
 <h3>Proof that <em>outlives us.</em></h3>
 <p class="l">Every decision sealed here is written into Bitcoin every hour. Anyone can now timestamp anything in Bitcoin for free — and check it without trusting us.</p>
 <div class="ntx-g">
-<a href="/notary"><b>Bitcoin Notary</b><span>Drop any file. Get a receipt written into Bitcoin. Free for everyone, open to every AI company.</span><em>sebbi.pro/notary →</em></a>
+<a href="/bitcoin"><b>Bitcoin Notary</b><span>Drop any file. Get a receipt written into Bitcoin. Free for everyone, open to every AI company.</span><em>sebbi.pro/bitcoin →</em></a>
 <a href="/forever"><b>Forever Proof</b><span>Check any sealed decision against Bitcoin itself, in your own browser. No account, no trust.</span><em>sebbi.pro/forever →</em></a>
 <a href="/keys"><b>Human Keys, in Bitcoin</b><span>Proof a human typed it — now dated by Bitcoin, so the original always comes first.</span><em>sebbi.pro/keys →</em></a>
 </div></div></section>"""
@@ -1258,7 +1258,7 @@ var b=j.batch&&j.batch.bitcoin;s.textContent=j.state==='confirmed'?('In Bitcoin 
 var a=document.getElementById('ntxhk-v');a.href='/forever?code='+c;document.getElementById('ntxhk-a').style.display='block'}).catch(function(){})})();</script>"""
 
 # two buttons added to the homepage button list, just above the machine-proof report
-HOME_BUTTONS_B = (b'<a href="/notary" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">BITCOIN</span>Bitcoin Notary &rarr;</a>'
+HOME_BUTTONS_B = (b'<a href="/bitcoin" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">BITCOIN</span>Bitcoin Notary &rarr;</a>'
                   b'<a href="/forever" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">FOREVER</span>Forever Proof &rarr;</a>')
 HOME_BUTTONS_AT = b'<a href="/dossier" style='
 HOME_STRIP_B = HOME_STRIP.encode("utf-8")
@@ -1283,7 +1283,7 @@ def _install_pages():
     def do_GET(self):
         p = self.path.split("?")[0].rstrip("/") or "/"
         try:
-            if p == "/notary":
+            if p == "/bitcoin":
                 return _send(self, _page(NOTARY_PAGE), "text/html; charset=utf-8")
             if p == "/forever":
                 return _send(self, _page(FOREVER_PAGE), "text/html; charset=utf-8")
@@ -1374,7 +1374,7 @@ class _Out(object):
                 at = body.rfind(b"</body>")
             if at >= 0:
                 body = body[:at] + HOME_STRIP_B + body[at:]
-            if b'href="/notary" style=' not in body:
+            if b'href="/bitcoin" style=' not in body:
                 bt = body.find(HOME_BUTTONS_AT)
                 if bt >= 0:
                     body = body[:bt] + HOME_BUTTONS_B + body[bt:]

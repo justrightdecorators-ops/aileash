@@ -41,7 +41,7 @@ jobs:
       - name: Check the live notary pages
         run: |
           fail=0
-          for u in https://sebbi.pro/notary https://sebbi.pro/forever https://sebbi.pro/forever-verify.py \
+          for u in https://sebbi.pro/bitcoin https://sebbi.pro/notary https://sebbi.pro/forever https://sebbi.pro/forever-verify.py \
                    https://sebbi.pro/x/notary/status https://sebbi.pro/x/notary/spec https://sebbi.pro/x/notary/checkpoints \
                    https://sebbi.pro/.well-known/sebbi-notary.json; do
             code=$(curl -s -m 30 -o /dev/null -w "%{http_code}" "$u")
