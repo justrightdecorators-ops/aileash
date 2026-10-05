@@ -1,0 +1,51 @@
+name: Bitcoin Notary checks
+
+# Runs on every push and every morning. The push job boots a throwaway copy of
+# the site with no outside network and a stand-in Bitcoin calendar, then
+# checks the whole notary, Forever Proof and Human Keys in Bitcoin path - and
+# that the chain is never written to. The live job only reads the real site.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install -r requirements.txt
+      - run: python3 -m py_compile modules/notary.py forever_verify.py
+      - name: Notary end to end (no outside network)
+        run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/notary_check.py
+
+  live:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the live notary pages
+        run: |
+          fail=0
+          for u in https://sebbi.pro/notary https://sebbi.pro/forever https://sebbi.pro/forever-verify.py \
+                   https://sebbi.pro/x/notary/status https://sebbi.pro/x/notary/spec https://sebbi.pro/x/notary/checkpoints \
+                   https://sebbi.pro/.well-known/sebbi-notary.json; do
+            code=$(curl -s -m 30 -o /dev/null -w "%{http_code}" "$u")
+            if [ "$code" = "200" ]; then echo "ok   $u"; else echo "FAIL $code $u"; echo "::error title=$code $u::arm the site at https://sebbi.pro/x/arm/status"; fail=1; fi
+          done
+          curl -s -m 30 https://sebbi.pro/x/notary/status | head -c 1200; echo
+          exit $fail
