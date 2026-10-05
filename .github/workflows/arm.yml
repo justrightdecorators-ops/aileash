@@ -1,0 +1,53 @@
+name: Arm after deploy
+
+# Every push makes Railway redeploy, and a fresh deploy starts with its page
+# modules unarmed. This waits for the deploy to finish, taps
+# https://sebbi.pro/x/arm/status once, then checks the pages came up - so you
+# never have to arm by hand. If they did not, it waits and taps again.
+#
+# It only ever calls the public arm link and reads pages. Nothing else.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm-after-deploy
+  cancel-in-progress: true
+
+jobs:
+  arm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Wait for Railway to finish deploying
+        if: github.event_name == 'push'
+        run: sleep 360
+
+      - name: Arm, then check the pages came up
+        run: |
+          pages="dossier passport self-check witness pack console prove start tools"
+          for attempt in 1 2 3 4; do
+            echo "== attempt $attempt"
+            code=$(curl -s -m 90 -o /tmp/arm.json -w "%{http_code}" https://sebbi.pro/x/arm/status)
+            echo "arm answered $code"
+            python3 -c "import json;d=json.load(open('/tmp/arm.json'));print('arm', d.get('version'), 'armed', d.get('modules_armed'), 'failed', d.get('modules_failed'), 'in', d.get('seconds'), 's');[print('  not armed:', r.get('module'), r.get('error','')) for r in d.get('results',[]) if r.get('armed') is False]" 2>/dev/null || head -c 300 /tmp/arm.json
+            missing=""
+            for p in $pages; do
+              c=$(curl -s -m 30 -o /dev/null -w "%{http_code}" "https://sebbi.pro/$p")
+              [ "$c" = "200" ] || missing="$missing $p($c)"
+            done
+            if [ -z "$missing" ]; then
+              echo "every page is up"
+              exit 0
+            fi
+            echo "still down:$missing"
+            echo "::warning title=pages down after arming (attempt $attempt)::$missing"
+            sleep 120
+          done
+          echo "::error title=pages still down after 4 arms::$missing"
+          exit 1
