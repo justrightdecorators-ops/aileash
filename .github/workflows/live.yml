@@ -26,6 +26,7 @@ jobs:
               echo "ok   $code $1"
             else
               echo "FAIL $code $1 (expected $2)"; head -c 600 /tmp/body; echo; fail=1
+              echo "::error title=$code $1::$(head -c 400 /tmp/body | tr '\n\r' '  ')"
             fi
           }
           check https://sebbi.pro/ 200
