@@ -75,3 +75,7 @@ jobs:
       - name: MCP connector end to end (no outside network)
         run: |
           sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/mcp_check.py
+
+      - name: AI news ticker and terms page end to end (no outside network)
+        run: |
+          sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/ainews_check.py

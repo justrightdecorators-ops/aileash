@@ -71,6 +71,9 @@ PAGES = [
     "/mcp",
     "/x/mcp/status",
     "/x/mcp/terms",
+    "/terms",
+    "/x/ainews/status",
+    "/x/ainews/feed",
 ]
 
 

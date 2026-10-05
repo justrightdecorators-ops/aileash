@@ -64,8 +64,8 @@ TERMS_TEXT = """sebbi.pro (AILeash) by Monop Content - service terms for account
 4. Cancelling. Stop using the key or cancel the Stripe subscription at any time. Nothing further is charged.
 5. Your records. Decisions you send are sealed into a tamper-evident chain that cannot be edited afterwards, by you or by us. Personal details should be sent as pseudonymous identifiers.
 6. Data protection. https://sebbi.pro/data-protection
-7. Legal notices. https://sebbi.pro/legal.txt and https://sebbi.pro/liability.txt
-8. Agreement. Opening an account confirms you have read and accept these terms. The agreement is sealed into the chain with the date, the version of these terms and the AI assistant that arranged it."""
+7. Full terms of service. https://sebbi.pro/terms - these points summarise them; the full terms apply.
+8. Agreement. Opening an account confirms you have read and accept these terms and the full terms of service. The agreement is sealed into the chain with the date, the version of these terms and the AI assistant that arranged it."""
 
 TERMS_VERSION = hashlib.sha256(TERMS_TEXT.encode("utf-8")).hexdigest()[:16]
 
