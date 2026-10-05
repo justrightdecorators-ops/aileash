@@ -1,5 +1,5 @@
 """
-modules/humankeys.py  v1.1.0  -  Human Keys: proof a human typed it
+modules/humankeys.py  v1.2.0  -  Human Keys: proof a human typed it
 
     Page:    https://sebbi.pro/keys
     Check:   https://sebbi.pro/k/<code>
@@ -34,6 +34,21 @@ rhythm, and was not pasted or inserted by a program. It cannot see what is
 on the typist's screen, so it does not prove the words were their own; the
 "composition" signals (corrections, thinking pauses) are reported so a
 reader can judge.
+
+OWNERSHIP - SO NOBODY CAN PINCH IT
+----------------------------------
+The first time someone seals, their phone makes its own signing key (ECDSA
+P-256) and keeps it on the device. Every proof is signed with it and the
+public half is sealed with the proof. Later the owner taps "Prove this is
+mine" on the check page; their phone signs a fresh, timestamped message and
+gives them a link. Anyone opening the link sees the signature checked in
+their own browser against the sealed key. Someone who copied the text and
+the code cannot do that.
+
+The private key never comes to sebbi.pro, with one exception the owner
+chooses: they can have a backup code emailed to themselves when the key is
+first made. It passes through to the email and is never stored. The backup
+code restores the key on a new phone from https://sebbi.pro/keys.
 
 PRIVACY
 -------
@@ -82,7 +97,7 @@ try:
 except Exception:
     _UK = None
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PRICE_PENCE = 50
 PASS_DAYS = 30
 CHALLENGE_TTL = 4 * 3600
@@ -94,6 +109,8 @@ PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "challenge"), ("POST", "se
 
 CODE_RE = re.compile(r"^HK-[A-Z2-9]{4}-[A-Z2-9]{4}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+B64 = re.compile(r"^[A-Za-z0-9+/=_-]{40,400}$")
+EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,24}$")
 VIEWER_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -140,6 +157,11 @@ def _setup():
                         "summary_json TEXT, challenge_json TEXT, sealed_at REAL,"
                         "block_index INTEGER, audit_hash TEXT, payer TEXT, reference TEXT)")
         s._conn.execute("CREATE INDEX IF NOT EXISTS idx_hk_hash ON humankeys_proof(text_hash)")
+        for col in ("pubkey TEXT", "owner_sig TEXT"):
+            try:
+                s._conn.execute("ALTER TABLE humankeys_proof ADD COLUMN " + col)
+            except Exception:
+                pass
         s._conn.execute("CREATE TABLE IF NOT EXISTS humankeys_pass("
                         "viewer TEXT PRIMARY KEY, paid_at REAL, expires REAL, months INTEGER DEFAULT 0)")
         s._conn.commit()
@@ -392,6 +414,10 @@ def _seal(data, api_key):
         return {"sealed": False, "verdict": verdict, "message": summary.get("reason"), "summary": summary}, 422
 
     reference = str(data.get("reference", ""))[:120] or None
+    pubkey = str(data.get("pubkey", "") or "").strip()
+    owner_sig = str(data.get("owner_sig", "") or "").strip()
+    if not (B64.match(pubkey) and B64.match(owner_sig)):
+        pubkey, owner_sig = None, None
     viewer = str(data.get("viewer", "")).strip()
     expires = None
     if api_key and s.get_key(api_key):
@@ -424,7 +450,10 @@ def _seal(data, api_key):
               "beacon": (ch.get("beacon") or {}).get("round"),
               "beacon_value": (ch.get("beacon") or {}).get("value"),
               "chain_tip_at_start": (ch.get("beacon") or {}).get("chain_tip"),
-              "reference": reference, "pass_purchased": bool(paid)}
+              "reference": reference, "pass_purchased": bool(paid),
+              "owner_key": pubkey,
+              "owner_key_fingerprint": hashlib.sha256(pubkey.encode()).hexdigest()[:16] if pubkey else None,
+              "owner_signature": owner_sig}
     try:
         out = s.seal(event, result, ts)
         h, idx = out[0], out[1]
@@ -433,9 +462,11 @@ def _seal(data, api_key):
             _refund_pass(viewer)
         return {"error": "seal_failed", "detail": str(e)[:160]}, 500
     with s._db_lock:
-        s._conn.execute("INSERT INTO humankeys_proof VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        s._conn.execute("INSERT INTO humankeys_proof(code,text_hash,verdict,score,summary_json,"
+                        "challenge_json,sealed_at,block_index,audit_hash,payer,reference,pubkey,owner_sig) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (code, text_hash, verdict, sc, json.dumps(summary), json.dumps(ch), ts,
-                         idx, h, payer, reference))
+                         idx, h, payer, reference, pubkey, owner_sig))
         s._conn.commit()
     _state["sealed"] += 1
     out = {"sealed": True, "code": code, "verdict": verdict, "verdict_text": VERDICT_TEXT.get(verdict),
@@ -447,14 +478,44 @@ def _seal(data, api_key):
     if expires:
         out["pass_until_uk"] = _uk(expires)
         out["pass_purchased_now"] = bool(paid)
+    out["owner_signed"] = bool(pubkey)
+    email = str(data.get("backup_email", "") or "").strip()
+    backup = str(data.get("backup_code", "") or "").strip()
+    if pubkey and email and backup and EMAIL_RE.match(email) and re.match(r"^[A-Za-z0-9_-]{100,600}$", backup):
+        threading.Thread(target=_email_backup, args=(email, backup, code), daemon=True).start()
+        out["backup_emailed"] = True
     return out, 200
+
+
+def _email_backup(email, backup, code):
+    """Send the owner their backup code. Passed through, never stored."""
+    try:
+        html = ("<html><body style='font-family:Arial,sans-serif;background:#f5f7fa;padding:20px'>"
+                "<div style='max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden'>"
+                "<div style='background:#0a0f1e;padding:28px;border-bottom:4px solid #c9a84c'>"
+                "<div style='font-size:22px;color:#fff;font-family:Georgia,serif'>Human <span style='color:#c9a84c'>Keys</span></div></div>"
+                "<div style='padding:30px;color:#1a1f2e;font-size:15px;line-height:1.6'>"
+                "<p><b>Your ownership key backup.</b></p>"
+                "<p>Your phone holds the key that proves your Human Keys proofs are yours - starting with "
+                "<b>%s</b>. If you lose or change your phone, this code puts the key back.</p>"
+                "<p style='font-family:monospace;font-size:12px;word-break:break-all;background:#f3f1ea;"
+                "border:1px solid #e2d9bd;padding:14px;border-radius:6px'>%s</p>"
+                "<p>To restore it, open <a href='https://sebbi.pro/keys'>https://sebbi.pro/keys</a> on the new phone "
+                "and tap <b>Restore my key</b>.</p>"
+                "<p style='color:#666;font-size:13px'>Keep this email private. Anyone with this code can prove "
+                "ownership as you. sebbi.pro does not keep a copy.</p>"
+                "<p>Check any proof: <a href='https://sebbi.pro/k/%s'>https://sebbi.pro/k/%s</a></p>"
+                "</div></div></body></html>") % (code, backup, code, code)
+        _srv().send_email(email, "", "Your Human Keys backup code", html)
+    except Exception as e:
+        _state["last_error"] = "backup email: %s" % e
 
 
 def _record(code):
     s = _srv()
     with s._db_lock:
         r = s._conn.execute("SELECT code,text_hash,verdict,score,summary_json,challenge_json,sealed_at,"
-                            "block_index,audit_hash,reference FROM humankeys_proof WHERE code=?",
+                            "block_index,audit_hash,reference,pubkey,owner_sig FROM humankeys_proof WHERE code=?",
                             (code,)).fetchone()
     if not r:
         return None
@@ -464,6 +525,7 @@ def _record(code):
             "session_started_utc": _iso(ch.get("issued")), "sealed_utc": _iso(r[6]), "sealed_uk": _uk(r[6]),
             "beacon": ch.get("beacon"), "block_index": r[7], "audit_hash": r[8], "reference": r[9],
             "verify_block": "https://sebbi.pro/x/walk/block?index=%s" % r[7],
+            "owner_key": r[10], "owner_signature": r[11],
             "check": "https://sebbi.pro/k/" + r[0]}
 
 
@@ -670,13 +732,35 @@ KEYS_PAGE = _HEAD + r"""
 <div class="st"><b id="sp">0</b><span>thinking pauses</span></div>
 <div class="st"><b id="sv">0</b><span>pasted characters</span></div>
 </div>
+<input id="em" type="email" placeholder="Email me my ownership backup code (optional)" style="margin-top:12px;font-family:var(--sans)" autocomplete="email">
 <div class="btns"><button class="btn" id="seal" disabled>Seal it</button><span class="wallet" id="wallet">Wallet: …</span><a class="btn g" id="topup" href="https://sebbi.pro/credits" style="display:none">Top up</a></div>
 <div class="msg" id="msg"></div>
+<p class="wallet" style="margin-top:12px">Your phone holds a private key that signs every proof, so only you can prove a proof is yours. <a href="#" id="rst" style="color:var(--gold)">Restore my key from a backup code</a></p>
+<div id="rbox" style="display:none;margin-top:10px"><textarea id="rcode" style="min-height:90px;font-family:var(--mono);font-size:12px" placeholder="Paste your backup code"></textarea><div class="btns"><button class="btn g" id="rgo">Restore</button></div></div>
 </div>
 <div id="out"></div>
 </div>
 <footer><div class="wrap">Monop Content · <a href="https://sebbi.pro/x/humankeys/spec">How the proof works</a> · <a href="https://sebbi.pro/k/">Check a code</a></div></footer>
 <script>
+const HK={
+ db(){return new Promise((res,rej)=>{const r=indexedDB.open('sebbi-hk',1);r.onupgradeneeded=()=>r.result.createObjectStore('keys');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})},
+ async get(){try{const d=await HK.db();return await new Promise(res=>{const q=d.transaction('keys').objectStore('keys').get('device');q.onsuccess=()=>res(q.result||null);q.onerror=()=>res(null)})}catch(e){return null}},
+ async put(v){const d=await HK.db();return new Promise(res=>{const t=d.transaction('keys','readwrite');t.objectStore('keys').put(v,'device');t.oncomplete=()=>res(true)})},
+ b64(buf){return btoa(String.fromCharCode(...new Uint8Array(buf)))},
+ b64u(buf){return HK.b64(buf).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')},
+ unb64(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))},
+ alg:{name:'ECDSA',namedCurve:'P-256'},sig:{name:'ECDSA',hash:'SHA-256'},
+ async ensure(){let k=await HK.get();if(k)return {k,fresh:false};
+  const pair=await crypto.subtle.generateKey(HK.alg,true,['sign','verify']);k={privateKey:pair.privateKey,publicKey:pair.publicKey};await HK.put(k);return {k,fresh:true}},
+ async pub(k){return HK.b64(await crypto.subtle.exportKey('spki',k.publicKey))},
+ async backup(k){return HK.b64u(await crypto.subtle.exportKey('pkcs8',k.privateKey))},
+ async sign(k,text){return HK.b64(await crypto.subtle.sign(HK.sig,k.privateKey,new TextEncoder().encode(text)))},
+ async verify(pubB64,sigB64,text){try{const key=await crypto.subtle.importKey('spki',HK.unb64(pubB64),HK.alg,false,['verify']);return await crypto.subtle.verify(HK.sig,key,HK.unb64(sigB64),new TextEncoder().encode(text))}catch(e){return false}},
+ async restore(code){const priv=await crypto.subtle.importKey('pkcs8',HK.unb64(code.trim()),HK.alg,true,['sign']);
+  const jwk=await crypto.subtle.exportKey('jwk',priv);const pubJwk={kty:jwk.kty,crv:jwk.crv,x:jwk.x,y:jwk.y,ext:true};
+  const pub=await crypto.subtle.importKey('jwk',pubJwk,HK.alg,true,['verify']);await HK.put({privateKey:priv,publicKey:pub});return true}
+};
+
 (function(){
 const $=s=>document.querySelector(s);
 const t=$('#t'),cv=$('#cv'),cx=cv.getContext('2d');
@@ -718,15 +802,20 @@ function draw(){const W=cv.width,H=cv.height;cx.clearRect(0,0,W,H);const sl=iv.s
 draw();
 function norm(s){return s.normalize('NFC').replace(/\r\n?/g,'\n').trim()}
 async function sha(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('')}
+$('#rst').onclick=e=>{e.preventDefault();const b=$('#rbox');b.style.display=b.style.display==='none'?'block':'none'};
+$('#rgo').onclick=async()=>{try{await HK.restore($('#rcode').value);msg('Key restored. Your proofs are yours on this phone again.','ok');$('#rbox').style.display='none'}catch(e){msg('That backup code did not work. Check it was copied in full.','err')}};
 $('#seal').onclick=async()=>{
  const btn=$('#seal');btn.disabled=true;btn.textContent='Sealing…';msg('');
  if(!ch||!ch.sig){await start();if(!ch||!ch.sig){btn.disabled=false;btn.textContent='Seal it';return}}
  const text=norm(t.value);const h=await sha(text);
  const body={challenge:ch.challenge,sig:ch.sig,text_hash:h,intervals:iv,counts:Object.assign({final_length:text.length},n),viewer:viewer};
+ let backup=null;
+ try{const r=await HK.ensure();body.pubkey=await HK.pub(r.k);body.owner_sig=await HK.sign(r.k,h);
+  if(r.fresh){backup=await HK.backup(r.k);const em=$('#em').value.trim();if(em){body.backup_email=em;body.backup_code=backup}}}catch(e){}
  try{const r=await fetch('/x/humankeys/seal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();
   if(r.status===402){msg(d.message||'Human Keys is 50p a month for unlimited proofs. Top up first.','err');$('#topup').style.display='inline-block';btn.disabled=false;btn.textContent='Seal it';return}
   if(!r.ok||!d.sealed){msg(d.message||d.error||'Could not seal it.','err');btn.disabled=false;btn.textContent='Seal it';return}
-  render(d);wallet();btn.textContent='Sealed';
+  d._backup=backup;render(d);wallet();btn.textContent='Sealed';
  }catch(e){msg('Could not reach sebbi.pro.','err');btn.disabled=false;btn.textContent='Seal it'}};
 function render(d){const cls=d.verdict==='HUMAN_TYPED'?'':(d.verdict==='HUMAN_TYPED_PART_PASTED'?'part':'bad');const s=d.summary||{};
  const share='✓ Human typed · check it: '+d.check;
@@ -734,8 +823,12 @@ function render(d){const cls=d.verdict==='HUMAN_TYPED'?'':(d.verdict==='HUMAN_TY
  '<div class="code">'+d.code+'</div><div class="wallet">Sealed '+d.sealed_uk+' · block '+d.block_index+'</div>'+
  '<dl><dt>Keystrokes</dt><dd>'+s.keystrokes+'</dd><dt>Corrections</dt><dd>'+s.corrections+'</dd><dt>Thinking pauses</dt><dd>'+s.thinking_pauses+'</dd><dt>Typing time</dt><dd>'+s.typing_minutes+' min</dd><dt>Composition</dt><dd>'+s.composition_signals+'</dd><dt>Pasted</dt><dd>'+s.pasted_characters+' characters</dd></dl>'+
  '<div class="btns"><button class="btn" id="cp">Copy the proof line</button><a class="btn g" href="'+d.check+'">Open the check page</a>'+(navigator.share?'<button class="btn g" id="sh">Share</button>':'')+'</div>'+
- '<p class="wallet" style="margin-top:10px">Badge for websites: '+d.badge+'</p></div>';
+ '<p class="wallet" style="margin-top:10px">Badge for websites: '+d.badge+'</p>'+
+ (d.owner_signed?'<p class="wallet" style="margin-top:6px;color:var(--ok2)">✓ Signed by this phone — only you can prove it\'s yours.</p>':'')+
+ (d._backup?'<div style="margin-top:14px;border:1px dashed var(--gold);border-radius:8px;padding:12px"><b style="font-family:var(--mono);font-size:12px;color:var(--gold)">YOUR OWNERSHIP BACKUP CODE · SHOWN ONCE</b><p class="wallet" style="margin:6px 0">'+(d.backup_emailed?'We\'ve emailed it to you too. ':'')+'Keep it private. It restores your key on a new phone.</p><div style="font-family:var(--mono);font-size:11px;word-break:break-all;color:#fff">'+d._backup+'</div><div class="btns"><button class="btn g" id="cpb">Copy backup code</button></div></div>':'')+
+ '</div>';
  $('#cp').onclick=()=>{navigator.clipboard.writeText(share);$('#cp').textContent='Copied'};
+ const cpb=$('#cpb');if(cpb)cpb.onclick=()=>{navigator.clipboard.writeText(d._backup);cpb.textContent='Copied'};
  const sh=$('#sh');if(sh)sh.onclick=()=>navigator.share({title:'Human typed',text:share,url:d.check});
  $('#out').scrollIntoView({behavior:'smooth'})}
 })();
@@ -755,6 +848,25 @@ CHECK_PAGE = _HEAD + r"""
 </div>
 <footer><div class="wrap">Monop Content · <a href="https://sebbi.pro/x/humankeys/spec">How the proof works</a> · <a href="https://sebbi.pro/keys">Make your own · 50p a month</a></div></footer>
 <script>
+const HK={
+ db(){return new Promise((res,rej)=>{const r=indexedDB.open('sebbi-hk',1);r.onupgradeneeded=()=>r.result.createObjectStore('keys');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})},
+ async get(){try{const d=await HK.db();return await new Promise(res=>{const q=d.transaction('keys').objectStore('keys').get('device');q.onsuccess=()=>res(q.result||null);q.onerror=()=>res(null)})}catch(e){return null}},
+ async put(v){const d=await HK.db();return new Promise(res=>{const t=d.transaction('keys','readwrite');t.objectStore('keys').put(v,'device');t.oncomplete=()=>res(true)})},
+ b64(buf){return btoa(String.fromCharCode(...new Uint8Array(buf)))},
+ b64u(buf){return HK.b64(buf).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')},
+ unb64(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))},
+ alg:{name:'ECDSA',namedCurve:'P-256'},sig:{name:'ECDSA',hash:'SHA-256'},
+ async ensure(){let k=await HK.get();if(k)return {k,fresh:false};
+  const pair=await crypto.subtle.generateKey(HK.alg,true,['sign','verify']);k={privateKey:pair.privateKey,publicKey:pair.publicKey};await HK.put(k);return {k,fresh:true}},
+ async pub(k){return HK.b64(await crypto.subtle.exportKey('spki',k.publicKey))},
+ async backup(k){return HK.b64u(await crypto.subtle.exportKey('pkcs8',k.privateKey))},
+ async sign(k,text){return HK.b64(await crypto.subtle.sign(HK.sig,k.privateKey,new TextEncoder().encode(text)))},
+ async verify(pubB64,sigB64,text){try{const key=await crypto.subtle.importKey('spki',HK.unb64(pubB64),HK.alg,false,['verify']);return await crypto.subtle.verify(HK.sig,key,HK.unb64(sigB64),new TextEncoder().encode(text))}catch(e){return false}},
+ async restore(code){const priv=await crypto.subtle.importKey('pkcs8',HK.unb64(code.trim()),HK.alg,true,['sign']);
+  const jwk=await crypto.subtle.exportKey('jwk',priv);const pubJwk={kty:jwk.kty,crv:jwk.crv,x:jwk.x,y:jwk.y,ext:true};
+  const pub=await crypto.subtle.importKey('jwk',pubJwk,HK.alg,true,['verify']);await HK.put({privateKey:priv,publicKey:pub});return true}
+};
+
 (function(){
 const $=s=>document.querySelector(s);
 function msg(x,c){const m=$('#msg');m.textContent=x;m.className='msg '+(c||'')}
@@ -770,9 +882,31 @@ function render(){const d=rec,s=d.summary||{};const cls=d.verdict==='HUMAN_TYPED
  '<div class="code">'+esc(d.code)+'</div><div class="wallet">Sealed '+esc(d.sealed_uk)+' · <a style="color:var(--gold)" href="'+esc(d.verify_block)+'">block '+esc(d.block_index)+'</a></div>'+
  '<dl><dt>Keystrokes</dt><dd>'+esc(s.keystrokes)+'</dd><dt>Corrections</dt><dd>'+esc(s.corrections)+'</dd><dt>Thinking pauses</dt><dd>'+esc(s.thinking_pauses)+'</dd><dt>Typing time</dt><dd>'+esc(s.typing_minutes)+' min</dd><dt>Composition</dt><dd>'+esc(s.composition_signals)+'</dd><dt>Pasted</dt><dd>'+esc(s.pasted_characters)+' characters</dd><dt>Session began</dt><dd>'+esc(d.session_started_utc)+'</dd>'+(d.reference?'<dt>Linked to</dt><dd>'+esc(d.reference)+'</dd>':'')+'</dl>'+
  '<p style="margin-top:16px;color:var(--mut);font-size:14px">Paste the text this code came with:</p><textarea id="txt" style="min-height:140px;margin-top:8px"></textarea>'+
- '<div class="btns"><button class="btn" id="cmp">Check it matches</button></div><div class="msg" id="res"></div></div>';
+ '<div class="btns"><button class="btn" id="cmp">Check it matches</button></div><div class="msg" id="res"></div>'+
+ '<div id="own" style="margin-top:18px;border-top:1px solid var(--line);padding-top:14px"></div></div>';
+ ownership();
  $('#cmp').onclick=async()=>{const h=await sha(norm($('#txt').value));const ok=h===d.text_hash;const r=$('#res');
   r.textContent=ok?'✓ Exact match. This is the text that was typed and sealed.':'✗ Not a match. This is not the text that was sealed — even one changed character shows here.';r.className='msg '+(ok?'ok':'err')}}
+async function ownership(){const d=rec,box=$('#own');if(!box)return;
+ if(!d.owner_key){box.innerHTML='<p class="wallet">This proof was sealed before ownership keys existed, so it is not tied to a device.</p>';return}
+ const signed=await HK.verify(d.owner_key,d.owner_signature||'',d.text_hash);
+ let h='<p class="msg '+(signed?'ok':'err')+'">'+(signed?'✓ Sealed and signed by its owner\'s device.':'✗ The owner signature does not check out.')+'</p>';
+ const q=new URLSearchParams(location.search),own=q.get('own'),t=q.get('t');
+ if(own&&t){const ok=await HK.verify(d.owner_key,own,'HKOWN|'+d.code+'|'+t);const age=Math.max(0,Math.round(Date.now()/1000-Number(t)));
+  const ago=age<120?age+' seconds ago':(age<7200?Math.round(age/60)+' minutes ago':Math.round(age/3600)+' hours ago');
+  h+=ok?'<div class="cert" style="margin:10px 0 0"><div class="seal"><div class="ring">✓</div><h2>Ownership proven</h2></div><p class="wallet" style="margin-top:8px">The person who sent you this link holds the device that typed it. Signed '+ago+'.</p></div>'
+       :'<p class="msg err">✗ This ownership link is not valid for this proof.</p>'}
+ else{h+='<p class="wallet">Someone showing you this proof can prove it is theirs: ask them to open this page on the phone that typed it and tap the button below, then send you the link.</p>'}
+ h+='<div class="btns"><button class="btn g" id="mine">Prove this is mine</button></div><div class="msg" id="mres"></div>';
+ box.innerHTML=h;
+ $('#mine').onclick=async()=>{const r=$('#mres');const k=await HK.get();
+  if(!k){r.textContent='This phone has no Human Keys key. Restore it from your backup code on https://sebbi.pro/keys';r.className='msg err';return}
+  const mine=(await HK.pub(k))===d.owner_key;if(!mine){r.textContent='This phone does not hold the key for this proof.';r.className='msg err';return}
+  const ts=Math.floor(Date.now()/1000);const sg=await HK.sign(k,'HKOWN|'+d.code+'|'+ts);
+  const link=location.origin+'/k/'+d.code+'?own='+encodeURIComponent(sg)+'&t='+ts;
+  try{await navigator.clipboard.writeText(link)}catch(e){}
+  r.innerHTML='Ownership link copied. Send it to whoever needs proof:<br><span style="word-break:break-all;color:#fff">'+link+'</span>';r.className='msg ok';
+  if(navigator.share)navigator.share({title:'Proof this is mine',url:link}).catch(()=>{})}}
 $('#look').onclick=look;if($('#code').value)look();
 })();
 </script></body></html>"""

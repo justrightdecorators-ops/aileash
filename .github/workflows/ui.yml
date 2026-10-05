@@ -1,0 +1,33 @@
+name: Page checks in Chrome
+
+# Clicks through /build, /connect and the Human Keys pages in real Chrome,
+# against a throwaway local copy of the site with outside network cut off.
+# Fails on any script error.
+
+on:
+  push:
+    branches: [main, ui-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          cd .github/scripts && npm init -y >/dev/null && npm i puppeteer-core@23 >/dev/null
+      - name: Click through the pages in Chrome
+        run: |
+          sudo -E env "PATH=$PATH" CHROME="$(which google-chrome)" unshare -n bash -c 'python3 -c "import socket,fcntl,struct;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);fcntl.ioctl(s,0x8914,struct.pack(\"16sH14s\",b\"lo\",0x49,b\"\"))" && node .github/scripts/ui_check.mjs'

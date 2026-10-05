@@ -67,3 +67,7 @@ jobs:
       - name: Human Keys end to end (no outside network)
         run: |
           sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/humankeys_check.py
+
+      - name: Connect, build and homepage strip end to end (no outside network)
+        run: |
+          sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/connect_check.py

@@ -65,6 +65,9 @@ PAGES = [
     "/x/humankeys/spec",
     "/x/humankeys/challenge",
     "/x/brand/status",
+    "/connect",
+    "/build",
+    "/x/connect/status",
 ]
 
 

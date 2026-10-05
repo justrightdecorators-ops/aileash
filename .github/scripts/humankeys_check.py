@@ -81,13 +81,24 @@ try:
     chk("verdict human typed", d.get("verdict") == "HUMAN_TYPED", d.get("verdict"))
     chk("first proof buys the 50p monthly pass", d.get("pass_purchased_now") is True and d.get("balance_pence") == 50, d)
     code = d.get("code", "")
+
+    pk, sg, bk = "A" * 120, "B" * 88, "C" * 184
+    ch = session(human)
+    st, dk, _ = req("POST", "/x/humankeys/seal", {"challenge": ch["challenge"], "sig": ch["sig"], "text_hash": th,
+                                                   "intervals": human, "counts": counts, "viewer": viewer,
+                                                   "pubkey": pk, "owner_sig": sg, "backup_email": "owner@example.org", "backup_code": bk})
+    chk("proof carries the owner's device key", st == 200 and dk.get("owner_signed") is True, dk)
+    chk("backup code sent to the owner's email", dk.get("backup_emailed") is True, dk)
+    st, rk, _ = req("GET", "/x/humankeys/check?code=" + dk.get("code", ""))
+    chk("check returns the sealed owner key", rk.get("owner_key") == pk and rk.get("owner_signature") == sg, rk)
+    chk("backup code never stored", bk not in json.dumps(rk) and "owner@example.org" not in json.dumps(rk))
     st, ps, _ = req("GET", "/x/humankeys/pass?viewer=" + viewer)
     chk("pass now active", ps.get("active") is True and ps.get("until_uk"), ps)
 
     ch = session(human)
     st, d2, _ = req("POST", "/x/humankeys/seal", {"challenge": ch["challenge"], "sig": ch["sig"], "text_hash": th,
                                                    "intervals": human, "counts": counts, "viewer": viewer})
-    chk("second proof in the month is free", st == 200 and d2.get("pass_purchased_now") is False and d2.get("balance_pence") == 50, d2)
+    chk("later proofs in the month are free", st == 200 and d2.get("pass_purchased_now") is False and d2.get("balance_pence") == 50, d2)
 
     st, ch2, _ = req("GET", "/x/humankeys/challenge")
     time.sleep(1)
