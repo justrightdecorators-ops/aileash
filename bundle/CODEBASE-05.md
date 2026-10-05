@@ -1,9 +1,9 @@
-# Codebase — part 5 of 45
+# Codebase — part 5 of 47
 
 Contains:
 - `modules/conformance.py`
+- `modules/connect.py`
 - `modules/consistency.py`
-- `modules/console.py`
 
 
 ## `modules/conformance.py`
@@ -348,6 +348,804 @@ def handle(method, action, data, api_key, ctx):
                     "declaration_strength": d,
                     "note": "These are measurements, not enforcement. Nothing here compels good behaviour - it only makes the alternative visible."}, 200
     return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/connect.py`
+
+790 lines, 56954 bytes
+
+```python
+"""
+modules/connect.py  v1.0.0  -  plug your AI in, build your own rules
+
+    Pages:  https://sebbi.pro/connect   hook any AI up to sebbi.pro
+            https://sebbi.pro/build     build a Signal Pack, rule by rule
+    Arm:    https://sebbi.pro/x/arm/status
+
+/connect
+    Get a key (or paste one), pick how you build - Python, Node, cURL, an
+    OpenAI or Anthropic app, LangChain, Lovable, Bolt, Replit, Cursor, v0,
+    Zapier, Make, n8n - and get the exact snippet or prompt with your key
+    in it. Then fire a real decision from the page and watch it land in the
+    chain, with links to its block and its machine-proof report.
+
+/build
+    A Signal Pack builder that speaks English. Every signal is explained in
+    plain words, every rule is shown as the sentence it means, and the pack
+    is checked against the real validator as you type. A test bench runs
+    the rules in the browser so you can see what a request would get before
+    you publish. Publishing seals it into the library at /packs.html.
+
+HOMEPAGE
+    Adds a strip above the homepage footer: the AI Business feature and the
+    new tools. Done the same way as the brand module - the page is rewritten
+    as it is served; index.html is not edited.
+
+No existing file is changed. Everything here talks to routes that already
+exist: /signup, /api/govern, /x/packs/validate, /x/packs/publish.
+"""
+
+import sys
+import threading
+
+VERSION = "1.0.0"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
+
+FEATURE_ARTICLE = "https://aibusiness.vc/startups/sebbi-aileash-justin-dobson-seal-every-ai-decision"
+FEATURE_EXPERT = "https://aibusiness.vc/experts/justin-dobson"
+
+_state = {"pages": False, "strip": False, "injected": 0, "last_error": None}
+_lock = threading.Lock()
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if not hasattr(m, "Handler"):
+        m = sys.modules.get("server")
+    return m
+
+
+def _send(h, body, ctype="text/html; charset=utf-8"):
+    b = body.encode("utf-8")
+    h.send_response(200)
+    h.send_header("Content-Type", ctype)
+    h.send_header("Content-Length", str(len(b)))
+    h.send_header("Cache-Control", "public, max-age=120")
+    h.end_headers()
+    h.wfile.write(b)
+
+
+# ---------------------------------------------------------------------
+# homepage strip, injected as the page is served
+# ---------------------------------------------------------------------
+
+STRIP = """
+<section class="sbx" aria-label="Featured and new">
+<style>
+.sbx{background:#0a0f1e;border-top:1px solid rgba(201,168,76,.25);border-bottom:1px solid rgba(201,168,76,.25);padding:56px 16px;color:#fff;font-family:'IBM Plex Sans',system-ui,sans-serif}
+.sbx *{box-sizing:border-box}
+.sbx-in{max-width:1080px;margin:0 auto;display:grid;grid-template-columns:1fr 1.35fr;gap:48px;align-items:start}
+@media(max-width:820px){.sbx-in{grid-template-columns:1fr;gap:34px}}
+.sbx-feat a{color:inherit;text-decoration:none}
+.sbx-feat .src{font-size:13px;color:#c9a84c;margin-bottom:12px;display:flex;gap:10px;align-items:center}
+.sbx-feat .src i{display:inline-block;width:26px;height:1px;background:#c9a84c}
+.sbx-feat h3{font-family:'Newsreader',Georgia,serif;font-weight:500;font-size:clamp(26px,3.4vw,36px);line-height:1.12;margin:0 0 14px;color:#fff}
+.sbx-feat p{color:rgba(255,255,255,.66);font-size:15px;line-height:1.6;margin:0 0 18px;max-width:46ch}
+.sbx-feat .lk{display:inline-block;margin-right:18px;color:#f0d78a;font-size:14px;border-bottom:1px solid rgba(240,215,138,.4);padding-bottom:2px}
+.sbx-tools{display:grid;grid-template-columns:1fr 1fr;border:1px solid rgba(201,168,76,.22);border-radius:14px;overflow:hidden}
+@media(max-width:520px){.sbx-tools{grid-template-columns:1fr}}
+.sbx-tools a{display:block;padding:22px 22px 24px;color:#fff;text-decoration:none;background:#0d1426;border-right:1px solid rgba(201,168,76,.14);border-bottom:1px solid rgba(201,168,76,.14);transition:background .2s}
+.sbx-tools a:hover,.sbx-tools a:focus-visible{background:#131d36;outline:none}
+.sbx-tools a:focus-visible{box-shadow:inset 0 0 0 2px #c9a84c}
+.sbx-tools b{display:block;font-family:'Newsreader',Georgia,serif;font-weight:500;font-size:21px;margin-bottom:6px}
+.sbx-tools span{display:block;color:rgba(255,255,255,.6);font-size:14px;line-height:1.5}
+.sbx-tools em{display:block;font-style:normal;color:#c9a84c;font-size:13px;margin-top:12px}
+</style>
+<div class="sbx-in">
+ <div class="sbx-feat">
+  <div class="src"><i></i>Featured on AI Business</div>
+  <h3><a href="__ARTICLE__">sebbi.pro on AI Business: seal every AI decision</a></h3>
+  <p>AI Business put sebbi.pro through an independent review before featuring it, and lists its founder among its AI experts.</p>
+  <a class="lk" href="__ARTICLE__">Read the feature</a><a class="lk" href="__EXPERT__">On the experts page</a>
+ </div>
+ <div class="sbx-tools">
+  <a href="https://sebbi.pro/connect"><b>Connect your AI</b><span>Pick how you build, copy one snippet, and watch your first decision land in the chain.</span><em>Takes about a minute</em></a>
+  <a href="https://sebbi.pro/build"><b>Build your own rules</b><span>Write the rules your AI has to follow in plain English, test them, and publish.</span><em>Free to build and publish</em></a>
+  <a href="https://sebbi.pro/keys"><b>Prove a human typed it</b><span>Type it live and get a sealed code that proves a person wrote it, not a machine.</span><em>50p a month, unlimited</em></a>
+  <a href="https://sebbi.pro/dossier"><b>The machine-proof report</b><span>Every detail of one AI decision, proven unchanged, ready for the auditor.</span><em>Included with your key</em></a>
+ </div>
+</div>
+</section>
+""".replace("__ARTICLE__", FEATURE_ARTICLE).replace("__EXPERT__", FEATURE_EXPERT)
+
+STRIP_B = STRIP.encode("utf-8")
+
+
+class _Out(object):
+    def __init__(self, real):
+        self.real, self.buf, self.mode = real, bytearray(), None
+
+    def write(self, data):
+        if self.mode == "pass":
+            return self.real.write(data)
+        self.buf += data
+        if self.mode is None:
+            end = self.buf.find(b"\r\n\r\n")
+            if end < 0:
+                if len(self.buf) > 65536:
+                    self._go_pass()
+                return len(data)
+            head = bytes(self.buf[:end]).lower()
+            if b"content-type: text/html" in head and b"content-encoding" not in head:
+                self.mode = "html"
+            else:
+                self._go_pass()
+        return len(data)
+
+    def _go_pass(self):
+        self.mode = "pass"
+        if self.buf:
+            self.real.write(bytes(self.buf))
+        self.buf = bytearray()
+
+    def flush(self):
+        if self.mode == "pass":
+            try:
+                self.real.flush()
+            except Exception:
+                pass
+
+    @property
+    def closed(self):
+        return getattr(self.real, "closed", False)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+    def finish(self, inject):
+        if self.mode == "pass" or not self.buf:
+            return
+        raw = bytes(self.buf)
+        self.buf = bytearray()
+        end = raw.find(b"\r\n\r\n")
+        if not inject or self.mode != "html" or end < 0:
+            self.real.write(raw)
+            return
+        head, body = raw[:end], raw[end + 4:]
+        at = body.find(b"<footer")
+        if at < 0:
+            at = body.rfind(b"</body>")
+        if at < 0 or b'class="sbx"' in body:
+            self.real.write(raw)
+            return
+        body = body[:at] + STRIP_B + body[at:]
+        lines = [l for l in head.split(b"\r\n") if not l.lower().startswith(b"content-length:")]
+        lines.append(b"Content-Length: " + str(len(body)).encode())
+        self.real.write(b"\r\n".join(lines) + b"\r\n\r\n" + body)
+        _state["injected"] += 1
+        try:
+            self.real.flush()
+        except Exception:
+            pass
+
+
+def _install_strip():
+    H = getattr(_srv(), "Handler", None)
+    if H is None:
+        return False
+    if getattr(H, "_connect_strip", False):
+        return True
+    original = H.handle_one_request
+
+    def handle_one_request(self):
+        real = self.wfile
+        out = _Out(real)
+        self.wfile = out
+        try:
+            original(self)
+        finally:
+            self.wfile = real
+            try:
+                path = (getattr(self, "path", "") or "").split("?")[0]
+                out.finish(path in ("/", "/index.html") and getattr(self, "command", "") == "GET")
+            except Exception as e:
+                _state["last_error"] = str(e)[:200]
+                try:
+                    if out.buf:
+                        real.write(bytes(out.buf))
+                except Exception:
+                    pass
+
+    H.handle_one_request = handle_one_request
+    H._connect_strip = True
+    return True
+
+
+def _install_pages():
+    H = getattr(_srv(), "Handler", None)
+    if H is None:
+        return False
+    if getattr(H, "_connect_pages", False):
+        return True
+    orig = H.do_GET
+
+    def do_GET(self):
+        p = self.path.split("?")[0].rstrip("/")
+        if p == "/connect":
+            return _send(self, CONNECT_PAGE)
+        if p == "/build":
+            return _send(self, BUILD_PAGE)
+        return orig(self)
+
+    H.do_GET = do_GET
+    H._connect_pages = True
+    return True
+
+
+def arm():
+    with _lock:
+        _state["pages"] = _install_pages()
+        _state["strip"] = _install_strip()
+
+
+def handle(method, action, data, api_key, ctx):
+    try:
+        arm()
+    except Exception as e:
+        _state["last_error"] = "arm: %s" % e
+    if action == "spec":
+        return {"module": "connect", "version": VERSION,
+                "pages": {"connect": "https://sebbi.pro/connect", "build": "https://sebbi.pro/build"},
+                "homepage_strip": "AI Business feature and the new tools, added above the homepage footer as it is served",
+                "uses": ["/signup", "/api/govern", "/x/packs/validate", "/x/packs/publish"]}, 200
+    return {"module": "connect", "version": VERSION, "armed": _state["pages"] and _state["strip"],
+            "pages": ["https://sebbi.pro/connect", "https://sebbi.pro/build"],
+            "homepage_strip_served": _state["injected"], "last_error": _state["last_error"]}, 200
+
+
+# ---------------------------------------------------------------------
+# shared look
+# ---------------------------------------------------------------------
+
+HEAD = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#0a0f1e;--deep:#0d1426;--raise:#131d36;--gold:#c9a84c;--pale:#f0d78a;--parch:#efe6cc;--live:#5fd3c4;--warn:#f0b35a;--stop:#ff8a80;
+--mut:rgba(239,230,204,.62);--line:rgba(201,168,76,.2);--serif:'Newsreader',Georgia,serif;--sans:'IBM Plex Sans',system-ui,sans-serif;--mono:'IBM Plex Mono',ui-monospace,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--ink);color:var(--parch);font-family:var(--sans);font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased;padding-bottom:env(safe-area-inset-bottom,0)}
+a{color:var(--pale)}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.top{border-bottom:1px solid var(--line)}
+.top .in{max-width:1120px;margin:0 auto;padding:15px 16px;display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+.brand{font-family:var(--serif);font-size:19px;color:#fff;text-decoration:none}.brand b{color:var(--gold);font-weight:500}
+.nav a{color:var(--mut);text-decoration:none;font-size:14px;margin-left:18px}.nav a:hover{color:#fff}.nav a.on{color:var(--pale)}
+.wrap{max-width:1120px;margin:0 auto;padding:0 16px}
+h1{font-family:var(--serif);font-weight:400;font-size:clamp(40px,7.4vw,84px);line-height:.98;letter-spacing:-.015em;color:#fff}
+h2{font-family:var(--serif);font-weight:500;font-size:clamp(26px,3.6vw,38px);line-height:1.1;color:#fff}
+h3{font-family:var(--serif);font-weight:500;font-size:22px;color:#fff}
+.lede{font-size:clamp(17px,2vw,19px);color:var(--mut);max-width:58ch;margin-top:18px}
+.step{display:grid;grid-template-columns:64px 1fr;gap:20px;padding:46px 0;border-top:1px solid var(--line)}
+@media(max-width:640px){.step{grid-template-columns:1fr;gap:10px;padding:34px 0}}
+.num{font-family:var(--serif);font-size:44px;line-height:1;color:var(--gold)}
+.step p.hint{color:var(--mut);font-size:15px;margin-top:6px;max-width:62ch}
+input,select,textarea{width:100%;background:var(--deep);border:1px solid var(--line);border-radius:8px;color:#fff;padding:12px 13px;font-family:var(--sans);font-size:15px}
+textarea{font-family:var(--mono);font-size:13px;resize:vertical}
+input:focus,select:focus,textarea:focus{border-color:var(--gold);outline:none}
+label.f{display:block;font-size:13px;color:var(--mut);margin:14px 0 6px}
+.row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}@media(max-width:700px){.row{grid-template-columns:1fr}}
+.btn{display:inline-block;background:var(--gold);color:var(--ink);border:0;border-radius:999px;padding:13px 22px;font-family:var(--sans);font-size:15px;font-weight:600;cursor:pointer;text-decoration:none}
+.btn:hover{background:var(--pale)}.btn.ghost{background:transparent;color:var(--pale);border:1px solid rgba(240,215,138,.45)}.btn[disabled]{opacity:.45;cursor:default}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;align-items:center}
+.msg{font-size:14px;margin-top:12px;min-height:1.2em}.msg.ok{color:var(--live)}.msg.err{color:var(--stop)}
+pre{background:#070b17;border:1px solid var(--line);border-radius:10px;padding:16px;overflow:auto;font-family:var(--mono);font-size:12.5px;line-height:1.65;color:#d9d2bc;white-space:pre}
+.foot{border-top:1px solid var(--line);margin-top:40px;padding:26px 0;color:var(--mut);font-size:14px}
+.foot a{color:var(--pale);text-decoration:none;margin-right:16px}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>"""
+
+NAV = r"""<div class="top"><div class="in"><a class="brand" href="https://sebbi.pro/">sebbi<b>.pro</b></a>
+<nav class="nav"><a href="https://sebbi.pro/connect" class="__C">Connect</a><a href="https://sebbi.pro/build" class="__B">Build</a><a href="https://sebbi.pro/keys">Human Keys</a><a href="https://sebbi.pro/developers">Developers</a></nav></div></div>"""
+
+FOOT = r"""<div class="wrap foot">Monop Content &nbsp; <a href="https://sebbi.pro/developers">Developers</a><a href="https://sebbi.pro/packs.html">Pack library</a><a href="https://sebbi.pro/dossier">Machine-proof report</a><a href="__ARTICLE__">Featured on AI Business</a></div>""".replace("__ARTICLE__", FEATURE_ARTICLE)
+
+
+# ---------------------------------------------------------------------
+# /connect
+# ---------------------------------------------------------------------
+
+CONNECT_PAGE = HEAD + r"""
+<title>Connect your AI · sebbi.pro</title>
+<meta name="description" content="Plug any AI into sebbi.pro in about a minute. Pick how you build, copy one snippet, and watch your first decision get scored and sealed.">
+<style>
+.hero{padding:64px 0 40px}
+.wire{margin-top:44px;border:1px solid var(--line);border-radius:18px;background:radial-gradient(120% 140% at 0% 0%,rgba(201,168,76,.08),transparent 60%),var(--deep);padding:26px}
+.wire-row{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;align-items:center;gap:0}
+@media(max-width:720px){.wire-row{grid-template-columns:1fr;gap:6px}.wire-row .line{height:34px;width:2px;margin:0 auto}}
+.node{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--ink);min-height:92px}
+.node small{display:block;font-size:12.5px;color:var(--mut)}
+.node strong{display:block;font-family:var(--serif);font-weight:500;font-size:21px;color:#fff;margin-top:2px}
+.node .v{font-family:var(--mono);font-size:12.5px;color:var(--mut);margin-top:6px;word-break:break-all}
+.line{height:2px;width:64px;background:rgba(201,168,76,.18);position:relative;overflow:hidden}
+.line i{position:absolute;inset:0;background:linear-gradient(90deg,transparent,var(--pale),transparent);transform:translateX(-100%)}
+.wire.go .line i{animation:pulse .9s ease-out forwards}
+.wire.go .l2 i{animation-delay:.45s}
+@media(max-width:720px){.line i{background:linear-gradient(180deg,transparent,var(--pale),transparent);transform:translateY(-100%)}.wire.go .line i{animation-name:pulsev}}
+@keyframes pulse{to{transform:translateX(100%)}}@keyframes pulsev{to{transform:translateY(100%)}}
+.node.lit{border-color:var(--gold);box-shadow:0 0 0 1px rgba(201,168,76,.35),0 0 40px rgba(201,168,76,.12)}
+.verdict-ALLOW{color:var(--live)!important}.verdict-CHALLENGE{color:var(--warn)!important}.verdict-BLOCK{color:var(--stop)!important}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-top:16px}
+.tab{background:transparent;border:1px solid var(--line);color:var(--mut);border-radius:999px;padding:8px 15px;font-size:14px;cursor:pointer;font-family:var(--sans)}
+.tab.on{background:var(--raise);color:#fff;border-color:var(--gold)}
+.stack{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+.stack button{background:var(--deep);border:1px solid var(--line);color:var(--parch);border-radius:10px;padding:10px 14px;font-size:14.5px;cursor:pointer;font-family:var(--sans)}
+.stack button:hover{border-color:rgba(201,168,76,.5)}
+.stack button.on{background:var(--parch);color:var(--ink);border-color:var(--parch)}
+.group{font-size:13px;color:var(--mut);margin:20px 0 -6px}
+.snip{margin-top:20px}
+.snip .how{color:var(--mut);font-size:15px;margin-bottom:12px;max-width:64ch}
+.snip .tool{display:inline-block;margin:0 0 12px;font-size:14px}
+.keyline{font-family:var(--mono);font-size:13px;color:var(--live);margin-top:10px;word-break:break-all}
+.next{display:grid;grid-template-columns:repeat(3,1fr);gap:0;border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-top:18px}
+@media(max-width:760px){.next{grid-template-columns:1fr}}
+.next a{display:block;padding:20px;text-decoration:none;color:var(--parch);border-right:1px solid var(--line);background:var(--deep)}
+.next a:last-child{border-right:0}.next a:hover{background:var(--raise)}
+.next b{display:block;font-family:var(--serif);font-weight:500;font-size:20px;color:#fff;margin-bottom:4px}.next span{font-size:14px;color:var(--mut)}
+</style></head><body>
+""" + NAV.replace("__C", "on").replace("__B", "") + r"""
+<div class="wrap">
+<section class="hero">
+<h1>Plug your AI into<br>sebbi.pro.</h1>
+<p class="lede">Every decision your AI makes, scored in under 30 milliseconds and sealed into a chain nobody can quietly edit. Pick how you build, copy one snippet, and watch your first decision land.</p>
+<div class="wire" id="wire" aria-live="polite">
+ <div class="wire-row">
+  <div class="node" id="n1"><small>Your AI</small><strong id="n1t">Waiting for a decision</strong><div class="v" id="n1v">refund · £120 · customer-42</div></div>
+  <div class="line l1"><i></i></div>
+  <div class="node" id="n2"><small>sebbi.pro scores it</small><strong id="n2t">Nine signals</strong><div class="v" id="n2v">trust, velocity, amount, device…</div></div>
+  <div class="line l2"><i></i></div>
+  <div class="node" id="n3"><small>Sealed into the chain</small><strong id="n3t">Block —</strong><div class="v" id="n3v">anyone can check it</div></div>
+ </div>
+ <div class="btns"><button class="btn" id="fire">Fire a test decision</button><span class="msg" id="fmsg">Add your key in step one first.</span></div>
+ <div class="btns" id="after" style="display:none"><a class="btn ghost" id="lblock" href="#">Open the block</a><a class="btn ghost" id="lrep" href="#">Machine-proof report</a></div>
+</div>
+</section>
+
+<section class="step"><div class="num">1</div><div>
+<h2>Your key</h2>
+<p class="hint">Free for 90 days, no card. After that 50p per device per month, counted on the real devices that used it.</p>
+<div class="tabs"><button class="tab on" data-t="new">Get a free key</button><button class="tab" data-t="have">I have a key</button></div>
+<div id="t-new">
+ <div class="row"><div><label class="f" for="nm">Your name</label><input id="nm" autocomplete="name"></div>
+ <div><label class="f" for="em">Work email</label><input id="em" type="email" autocomplete="email"></div>
+ <div><label class="f" for="org">Company</label><input id="org" autocomplete="organization"></div></div>
+ <div class="btns"><button class="btn" id="getkey">Get my key</button></div>
+</div>
+<div id="t-have" style="display:none">
+ <label class="f" for="pk">API key</label><input id="pk" placeholder="al_live_…" autocomplete="off">
+ <div class="btns"><button class="btn" id="usekey">Use this key</button></div>
+</div>
+<div class="msg" id="kmsg"></div><div class="keyline" id="kline"></div>
+</div></section>
+
+<section class="step"><div class="num">2</div><div>
+<h2>How do you build?</h2>
+<p class="hint">Your key is written into every snippet for you. Keep it out of code you share; each tool below says where secrets go.</p>
+<div class="group">Code</div>
+<div class="stack" data-g="code"><button data-s="python">Python</button><button data-s="node">Node.js</button><button data-s="curl">cURL</button><button data-s="openai">OpenAI app</button><button data-s="anthropic">Anthropic app</button><button data-s="langchain">LangChain</button></div>
+<div class="group">AI app builders</div>
+<div class="stack" data-g="ai"><button data-s="lovable">Lovable</button><button data-s="bolt">Bolt</button><button data-s="replit">Replit</button><button data-s="cursor">Cursor</button><button data-s="v0">v0</button></div>
+<div class="group">No-code automation</div>
+<div class="stack" data-g="nc"><button data-s="zapier">Zapier</button><button data-s="make">Make</button><button data-s="n8n">n8n</button></div>
+<div class="snip" id="snip"></div>
+</div></section>
+
+<section class="step"><div class="num">3</div><div>
+<h2>Watch it land</h2>
+<p class="hint">Scroll back up and fire a test decision. It is a real call with your key: scored by the live engine, sealed into the production chain, and checkable by anyone at the block it returns.</p>
+<div class="btns"><a class="btn ghost" href="#wire">Back to the wire</a></div>
+</div></section>
+
+<section class="step"><div class="num">4</div><div>
+<h2>Then make it yours</h2>
+<div class="next">
+ <a href="https://sebbi.pro/build"><b>Build your own rules</b><span>Plain-English rules your AI has to follow, tested and published.</span></a>
+ <a href="https://sebbi.pro/keys"><b>Prove a human signed off</b><span>Reviewers type their reason live; a sealed code proves a person wrote it.</span></a>
+ <a href="https://sebbi.pro/dossier"><b>Pull the full report</b><span>Every detail of any decision, proven unchanged, in one document.</span></a>
+</div>
+</div></section>
+</div>
+""" + FOOT + r"""
+<script>
+(function(){
+const $=s=>document.querySelector(s),$$=s=>Array.from(document.querySelectorAll(s));
+let KEY='';try{KEY=sessionStorage.getItem('sebbi.key')||''}catch(e){}
+function setKey(k){KEY=k;try{sessionStorage.setItem('sebbi.key',k)}catch(e){}
+ $('#kline').textContent='Key ready: '+k.slice(0,10)+'…'+k.slice(-4);$('#fmsg').textContent='Ready. Fire it.';$('#fmsg').className='msg';if(cur)show(cur)}
+if(KEY)setKey(KEY);
+$$('.tab').forEach(b=>b.onclick=()=>{$$('.tab').forEach(x=>x.classList.toggle('on',x===b));$('#t-new').style.display=b.dataset.t==='new'?'':'none';$('#t-have').style.display=b.dataset.t==='have'?'':'none'});
+function kmsg(t,c){const m=$('#kmsg');m.textContent=t;m.className='msg '+(c||'')}
+$('#usekey').onclick=()=>{const k=$('#pk').value.trim();if(k.length<16){kmsg('That does not look like a full key.','err');return}setKey(k);kmsg('Using your key.','ok')};
+$('#getkey').onclick=async()=>{const em=$('#em').value.trim();if(!em||em.indexOf('@')<1){kmsg('Add your work email.','err');return}
+ const b=$('#getkey');b.disabled=true;kmsg('Creating your key…');
+ try{const r=await fetch('/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('#nm').value.trim(),email:em,org:$('#org').value.trim(),product:'aileash',devices:1})});
+  const d=await r.json();if(!r.ok||!d.api_key){kmsg(d.message||d.error||'Could not create a key.','err');b.disabled=false;return}
+  setKey(d.api_key);kmsg('Your key is ready and on its way to your inbox with the install guide. Keep it safe.','ok');
+  $('#kline').innerHTML='Your key: <b style="color:#fff">'+d.api_key+'</b>'}catch(e){kmsg('Could not reach sebbi.pro.','err');b.disabled=false}};
+const K=()=>KEY||'YOUR_API_KEY';
+const EV='{"user_id": "customer-42", "action": "refund", "amount": 120, "country": "UK", "device_id": "web-7f3a", "anomaly": 0.1, "device_risk": 0.05}';
+const PROMPT=t=>'Before any important action in this app happens (a payment, refund, account change, approval or anything an AI decides), send it to sebbi.pro to be scored and sealed.\n\n'+
+ '1. Store this secret as SEBBI_API_KEY: '+K()+'\n'+
+ '2. Create a server-side function that POSTs JSON to https://sebbi.pro/api/govern with the header "Authorization: Bearer <SEBBI_API_KEY>" and these fields: user_id (the user\'s id), action (what is happening, e.g. "refund"), amount (number, 0 if none), country (2-letter code), device_id (a stable id for the device or session), anomaly (0 to 1, use 0 if unknown), device_risk (0 to 1, use 0 if unknown).\n'+
+ '3. Read "decision" from the reply. ALLOW: carry on. CHALLENGE: ask the user to confirm or send it to a person. BLOCK: stop the action and show "This action needs review".\n'+
+ '4. Save "audit_hash" and "block_index" from the reply next to the record, so every decision can be proven later.\n'+
+ '5. Never expose the key in the browser; call sebbi.pro only from the server or an edge function.';
+const S={
+ python:{how:'Standard library only, nothing to install. Call it before your code acts on a decision.',code:()=>`import json, urllib.request
+
+def sebbi(event):
+    req = urllib.request.Request(
+        "https://sebbi.pro/api/govern",
+        data=json.dumps(event).encode(),
+        headers={"Authorization": "Bearer ${K()}", "Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=5))
+
+verdict = sebbi(${EV})
+
+if verdict["decision"] == "BLOCK":
+    raise PermissionError("blocked for review")
+print(verdict["decision"], verdict["block_index"])   # sealed, checkable by anyone`},
+ node:{how:'Works in Node 18+, Deno, Bun and edge functions. Keep the key in an environment variable.',code:()=>`const res = await fetch("https://sebbi.pro/api/govern", {
+  method: "POST",
+  headers: { Authorization: "Bearer ${K()}", "Content-Type": "application/json" },
+  body: JSON.stringify(${EV})
+});
+const verdict = await res.json();
+
+if (verdict.decision === "BLOCK") throw new Error("blocked for review");
+console.log(verdict.decision, verdict.block_index); // sealed into the chain`},
+ curl:{how:'The whole protocol in one command.',code:()=>`curl -s https://sebbi.pro/api/govern \\
+  -H "Authorization: Bearer ${K()}" \\
+  -H "Content-Type: application/json" \\
+  -d '${EV}'`},
+ openai:{how:'Check every action the model chooses before your code carries it out.',code:()=>`from openai import OpenAI
+import json, urllib.request
+
+client = OpenAI()
+
+def sebbi(event):
+    req = urllib.request.Request("https://sebbi.pro/api/govern", data=json.dumps(event).encode(),
+        headers={"Authorization": "Bearer ${K()}", "Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=5))
+
+reply = client.chat.completions.create(model="gpt-4o", messages=messages, tools=tools)
+for call in reply.choices[0].message.tool_calls or []:
+    args = json.loads(call.function.arguments)
+    verdict = sebbi({"user_id": user_id, "action": call.function.name,
+                     "amount": args.get("amount", 0), "country": "UK",
+                     "device_id": session_id, "anomaly": 0, "device_risk": 0})
+    if verdict["decision"] == "ALLOW":
+        run_tool(call, args)
+    else:
+        hold_for_review(call, verdict)   # CHALLENGE or BLOCK, with the sealed block`},
+ anthropic:{how:'Gate every tool Claude asks to use, and keep the sealed receipt with the result.',code:()=>`import anthropic, json, urllib.request
+
+client = anthropic.Anthropic()
+
+def sebbi(event):
+    req = urllib.request.Request("https://sebbi.pro/api/govern", data=json.dumps(event).encode(),
+        headers={"Authorization": "Bearer ${K()}", "Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=5))
+
+msg = client.messages.create(model="claude-sonnet-4-5", max_tokens=1024, tools=tools, messages=messages)
+for block in msg.content:
+    if block.type == "tool_use":
+        verdict = sebbi({"user_id": user_id, "action": block.name,
+                         "amount": block.input.get("amount", 0), "country": "UK",
+                         "device_id": session_id, "anomaly": 0, "device_risk": 0})
+        if verdict["decision"] == "ALLOW":
+            result = run_tool(block)
+        else:
+            result = {"held": verdict["decision"], "block": verdict["block_index"]}`},
+ langchain:{how:'Wrap any tool so it only runs once sebbi.pro allows it.',code:()=>`import json, urllib.request
+from langchain_core.tools import tool
+
+def sebbi(event):
+    req = urllib.request.Request("https://sebbi.pro/api/govern", data=json.dumps(event).encode(),
+        headers={"Authorization": "Bearer ${K()}", "Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=5))
+
+@tool
+def issue_refund(customer_id: str, amount: float) -> str:
+    '''Refund a customer.'''
+    verdict = sebbi({"user_id": customer_id, "action": "refund", "amount": amount,
+                     "country": "UK", "device_id": "agent-1", "anomaly": 0, "device_risk": 0})
+    if verdict["decision"] != "ALLOW":
+        return f"Held for review ({verdict['decision']}, block {verdict['block_index']})"
+    return do_refund(customer_id, amount)`},
+ lovable:{tool:['Open Lovable','https://lovable.dev'],how:'Paste this into the Lovable chat. It builds the edge function, stores the key as a secret and wires every important action through sebbi.pro.',code:()=>PROMPT('Lovable')},
+ bolt:{tool:['Open Bolt','https://bolt.new'],how:'Paste this into Bolt. It adds the server route and wires your actions through it.',code:()=>PROMPT('Bolt')},
+ replit:{tool:['Open Replit','https://replit.com'],how:'Paste this into Replit Agent. Put the key in Replit Secrets as SEBBI_API_KEY.',code:()=>PROMPT('Replit')},
+ cursor:{tool:['Open Cursor','https://cursor.com'],how:'Paste this into Cursor chat with your project open. Add the key to your .env file.',code:()=>PROMPT('Cursor')},
+ v0:{tool:['Open v0','https://v0.dev'],how:'Paste this into v0. It adds a server action that calls sebbi.pro.',code:()=>PROMPT('v0')},
+ zapier:{tool:['Open Zapier','https://zapier.com'],how:'Add a "Webhooks by Zapier" step, choose Custom Request, and fill it in like this. Add a Filter after it so the Zap only continues when the decision is ALLOW.',code:()=>`Method:   POST
+URL:      https://sebbi.pro/api/govern
+Data pass-through: no
+Data:     ${EV}
+Headers:
+  Authorization   Bearer ${K()}
+  Content-Type    application/json
+
+Next step:  Filter  ->  Only continue if  decision  (Text) Exactly matches  ALLOW`},
+ make:{tool:['Open Make','https://www.make.com'],how:'Add the HTTP module "Make a request", then a filter on the next route.',code:()=>`URL:            https://sebbi.pro/api/govern
+Method:         POST
+Headers:        Authorization = Bearer ${K()}
+                Content-Type  = application/json
+Body type:      Raw  (JSON)
+Request content: ${EV}
+Parse response: Yes
+
+Filter on the next route:  decision  Equal to  ALLOW`},
+ n8n:{tool:['Open n8n','https://n8n.io'],how:'Add an HTTP Request node, then an IF node on the decision.',code:()=>`Method:          POST
+URL:             https://sebbi.pro/api/govern
+Authentication:  Generic Credential Type -> Header Auth
+                 Name:  Authorization
+                 Value: Bearer ${K()}
+Send Body:       JSON
+Body:            ${EV}
+
+IF node:  {{ $json.decision }}  is equal to  ALLOW`}
+};
+let cur=null;
+function esc(t){return t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function show(k){cur=k;$$('.stack button').forEach(b=>b.classList.toggle('on',b.dataset.s===k));const s=S[k];
+ $('#snip').innerHTML='<p class="how">'+s.how+'</p>'+(s.tool?'<a class="tool" href="'+s.tool[1]+'" rel="noopener">'+s.tool[0]+'</a>':'')+'<pre id="code">'+esc(s.code())+'</pre><div class="btns"><button class="btn ghost" id="copy">Copy</button></div>';
+ $('#copy').onclick=()=>{navigator.clipboard.writeText(s.code());$('#copy').textContent='Copied'}}
+$$('.stack button').forEach(b=>b.onclick=()=>show(b.dataset.s));show('python');
+$('#fire').onclick=async()=>{if(!KEY){$('#fmsg').textContent='Add your key in step one first.';$('#fmsg').className='msg err';document.querySelector('#t-new').scrollIntoView({behavior:'smooth'});return}
+ const w=$('#wire'),f=$('#fire');f.disabled=true;w.classList.remove('go');void w.offsetWidth;['n1','n2','n3'].forEach(n=>$('#'+n).classList.remove('lit'));
+ $('#n1t').textContent='Refund, £120';$('#n1').classList.add('lit');$('#fmsg').textContent='Sending…';$('#fmsg').className='msg';
+ const amt=[40,120,480,2200][Math.floor(Math.random()*4)];$('#n1t').textContent='Refund, £'+amt;$('#n1v').textContent='refund · £'+amt+' · customer-42';
+ try{const t0=performance.now();const r=await fetch('/api/govern',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+KEY},
+   body:JSON.stringify({user_id:'customer-42',action:'refund',amount:amt,country:'UK',device_id:'sebbi-connect-test',anomaly:0.1,device_risk:0.05})});
+  const d=await r.json();const ms=Math.round(performance.now()-t0);
+  if(!r.ok){$('#fmsg').textContent=d.message||d.error||('Error '+r.status);$('#fmsg').className='msg err';f.disabled=false;return}
+  w.classList.add('go');
+  setTimeout(()=>{$('#n2').classList.add('lit');$('#n2t').innerHTML='<span class="verdict-'+d.decision+'">'+d.decision+'</span> · score '+d.score;$('#n2v').textContent=(d.reasons&&d.reasons.length?d.reasons.join(', '):'no risk reasons')+' · '+ms+' ms round trip'},450);
+  setTimeout(()=>{$('#n3').classList.add('lit');$('#n3t').textContent='Block '+d.block_index;$('#n3v').textContent=(d.audit_hash||'').slice(0,24)+'…';
+   $('#fmsg').textContent='Sealed. That decision is now permanent and checkable by anyone.';$('#fmsg').className='msg ok';
+   $('#lblock').href='https://sebbi.pro/x/walk/block?index='+d.block_index;$('#lrep').href='https://sebbi.pro/dossier?block='+d.block_index;$('#after').style.display='flex';f.disabled=false;f.textContent='Fire another'},950);
+ }catch(e){$('#fmsg').textContent='Could not reach sebbi.pro.';$('#fmsg').className='msg err';f.disabled=false}};
+})();
+</script></body></html>"""
+
+
+# ---------------------------------------------------------------------
+# /build
+# ---------------------------------------------------------------------
+
+BUILD_PAGE = HEAD + r"""
+<title>Build your own rules · sebbi.pro</title>
+<meta name="description" content="Write the rules your AI has to follow, in plain English. Test them against a sample request, then publish them to the sebbi.pro pack library, sealed and dated.">
+<style>
+.hero{padding:60px 0 26px}
+.sentence{margin-top:30px;font-family:var(--serif);font-size:clamp(26px,3.8vw,44px);line-height:1.2;color:#fff;min-height:2.4em;max-width:30ch}
+.sentence .k{color:var(--pale);border-bottom:1px solid rgba(240,215,138,.35)}
+.sentence .then-allow{color:var(--live)}.sentence .then-downgrade{color:#9fc6ff}.sentence .then-challenge{color:var(--warn)}.sentence .then-block{color:var(--stop)}
+.cols{display:grid;grid-template-columns:1.25fr 1fr;gap:28px;margin-top:34px;align-items:start}
+@media(max-width:900px){.cols{grid-template-columns:1fr}}
+.panel{border:1px solid var(--line);border-radius:16px;background:var(--deep);padding:22px}
+.panel+.panel{margin-top:18px}
+.sticky{position:sticky;top:14px}
+@media(max-width:900px){.sticky{position:static}}
+.tpl{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.tpl button{background:transparent;border:1px solid var(--line);color:var(--parch);border-radius:999px;padding:8px 14px;font-size:14px;cursor:pointer}
+.tpl button:hover{border-color:var(--gold)}
+.rule{border:1px solid var(--line);border-radius:12px;padding:16px;margin-top:14px;background:var(--ink)}
+.rule.sel{border-color:var(--gold)}
+.rule-h{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.rule-h b{font-family:var(--serif);font-weight:500;font-size:19px;color:#fff}
+.ic{background:transparent;border:1px solid var(--line);color:var(--mut);border-radius:8px;width:34px;height:34px;cursor:pointer;font-size:15px}
+.ic:hover{color:#fff;border-color:var(--gold)}
+.cond{display:grid;grid-template-columns:1.4fr 1fr 1fr 34px;gap:8px;margin-top:10px;align-items:center}
+@media(max-width:560px){.cond{grid-template-columns:1fr 1fr;}.cond .vbox{grid-column:1/2}.cond .ic{grid-column:2/3;justify-self:end}}
+.meaning{font-size:13px;color:var(--mut);margin-top:4px;grid-column:1/-1}
+.join{display:flex;gap:6px;margin-top:12px;font-size:14px;color:var(--mut);align-items:center}
+.join button{background:transparent;border:1px solid var(--line);color:var(--mut);border-radius:999px;padding:5px 12px;cursor:pointer;font-size:13px}
+.join button.on{background:var(--raise);color:#fff;border-color:var(--gold)}
+.verdicts{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:12px}
+@media(max-width:560px){.verdicts{grid-template-columns:1fr 1fr}}
+.verdicts button{background:var(--deep);border:1px solid var(--line);color:var(--parch);border-radius:10px;padding:10px 8px;cursor:pointer;font-size:13.5px;text-align:left}
+.verdicts button small{display:block;color:var(--mut);font-size:11.5px;margin-top:2px;line-height:1.35}
+.verdicts button.on{border-color:var(--gold);background:var(--raise);color:#fff}
+.add{margin-top:10px;background:transparent;border:1px dashed var(--line);color:var(--pale);border-radius:10px;padding:10px;width:100%;cursor:pointer;font-size:14px}
+.add:hover{border-color:var(--gold)}
+.stat{display:flex;gap:10px;align-items:center;font-size:14px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mut);flex:none}.dot.ok{background:var(--live)}.dot.err{background:var(--stop)}
+.bench label{display:flex;justify-content:space-between;font-size:13.5px;color:var(--mut);margin-top:12px}
+.bench label b{color:#fff;font-weight:500;font-family:var(--mono);font-size:12.5px}
+input[type=range]{padding:0;border:0;background:transparent;accent-color:var(--gold);height:28px}
+.outcome{font-family:var(--serif);font-size:24px;color:#fff;margin-top:14px;line-height:1.25}
+.outcome small{display:block;font-family:var(--sans);font-size:14px;color:var(--mut);margin-top:6px}
+details summary{cursor:pointer;color:var(--pale);font-size:14px;margin-top:14px}
+.check{display:flex;gap:8px;align-items:center;font-size:14px;color:var(--parch);margin-top:12px}
+.check input{width:auto}
+</style></head><body>
+""" + NAV.replace("__C", "").replace("__B", "on") + r"""
+<div class="wrap">
+<section class="hero">
+<h1>Write the rules<br>your AI must follow.</h1>
+<p class="lede">No code. Pick what to watch, say when it matters and what should happen, and the rule is written out as the sentence it means. Test it, then publish it: sealed, dated and yours.</p>
+<div class="sentence" id="sentence" aria-live="polite"></div>
+</section>
+
+<div class="cols">
+<div>
+ <div class="panel">
+  <h3>Start from</h3>
+  <div class="tpl"><button data-t="runaway">Stop runaway agents</button><button data-t="budget">Guard the budget</button><button data-t="unattended">Careful when nobody's watching</button><button data-t="blank">A blank pack</button></div>
+ </div>
+ <div class="panel">
+  <h3>Your rules</h3>
+  <p class="hint" style="color:var(--mut);font-size:14.5px;margin-top:4px">Rules are checked from the top. The first one that matches decides. A pack can only make the engine stricter, never looser.</p>
+  <div id="rules"></div>
+  <button class="add" id="addrule">Add a rule</button>
+  <label class="f" for="def">When no rule matches</label>
+  <select id="def"><option value="allow">Let it through</option><option value="downgrade">Use the cheaper model</option><option value="challenge">Hold it for a person</option><option value="block">Block it</option></select>
+ </div>
+ <div class="panel">
+  <h3>About the pack</h3>
+  <div class="row" style="grid-template-columns:1fr 1fr"><div><label class="f" for="pn">Pack name</label><input id="pn" maxlength="80"></div><div><label class="f" for="pa">Your name or company</label><input id="pa" maxlength="80"></div></div>
+  <div class="row" style="grid-template-columns:1fr 1fr"><div><label class="f" for="pv">Industry</label><select id="pv"></select></div><div><label class="f" for="pver">Version</label><input id="pver" value="1.0.0"></div></div>
+  <label class="f" for="ps">One line a buyer would understand</label><input id="ps" maxlength="240">
+ </div>
+</div>
+
+<div class="sticky">
+ <div class="panel">
+  <div class="stat"><span class="dot" id="vdot"></span><span id="vtext">Checking your pack…</span></div>
+  <div class="btns"><button class="btn" id="pub" disabled>Publish to the library</button></div>
+  <div class="msg" id="pmsg"></div>
+ </div>
+ <div class="panel bench">
+  <h3>Try it on a request</h3>
+  <p style="color:var(--mut);font-size:14px;margin-top:4px">Move the sliders to describe a request. The answer updates as you go.</p>
+  <div id="bench"></div>
+  <div class="check"><input type="checkbox" id="b_unattended"><label for="b_unattended">Nobody is watching this system</label></div>
+  <div class="check"><input type="checkbox" id="b_deterministic" checked><label for="b_deterministic">The same question always gets the same answer</label></div>
+  <div class="outcome" id="outcome"></div>
+ </div>
+ <div class="panel">
+  <h3>What you're publishing</h3>
+  <details><summary>See the pack as data</summary><pre id="json" style="margin-top:10px;max-height:340px"></pre></details>
+ </div>
+</div>
+</div>
+</div>
+""" + FOOT + r"""
+<script>
+(function(){
+const $=s=>document.querySelector(s);
+const F={
+ loop:{name:'the same request repeating',kind:'signal',hint:'0 means never seen before; 1 means the identical request keeps coming back — an agent going round in circles.'},
+ burst:{name:'requests in the last minute',kind:'signal',hint:'How hard the last sixty seconds were. Near 1 is a burst — often a script or a stuck loop.'},
+ grind:{name:'requests in the last hour',kind:'signal',hint:'Steady volume over the hour. Near 1 means it has been running flat out.'},
+ exposure:{name:'spend against the budget left',kind:'signal',hint:'The worst this request could cost, compared with what is left in the budget. Near 1 means it could eat the lot.'},
+ size:{name:'how big the prompt is',kind:'signal',hint:'Prompt length on a curve. Near 1 is a very large prompt.'},
+ ask:{name:'how long an answer it may write',kind:'signal',hint:'The output ceiling the caller allowed. Near 1 is a very long answer.'},
+ depth:{name:'how long the conversation is',kind:'signal',hint:'Turns in the thread. Near 1 means the whole history is re-sent every time.'},
+ tools:{name:'how many tools are attached',kind:'signal',hint:'Tool definitions sent with the request. Near 1 is a lot of them.'},
+ novelty:{name:'how unfamiliar the request is',kind:'signal',hint:'1 means this shape of request has never been seen before.'},
+ score:{name:'the engine\'s overall risk score',kind:'signal',hint:'The engine\'s own 0-to-1 score from all nine signals.'},
+ loop_count:{name:'times the same request was sent',kind:'count',max:20,hint:'A plain count of identical requests in a row.'},
+ burst_count:{name:'requests this minute',kind:'count',max:200,hint:'A plain count over the last sixty seconds.'},
+ grind_count:{name:'requests this hour',kind:'count',max:3000,hint:'A plain count over the last hour.'},
+ turns:{name:'conversation turns',kind:'count',max:100,hint:'Messages in the thread so far.'},
+ tool_count:{name:'tools attached',kind:'count',max:40,hint:'Number of tool definitions sent.'},
+ max_tokens:{name:'answer length allowed (tokens)',kind:'count',max:32000,hint:'The output ceiling, in tokens.'},
+ chars:{name:'prompt length (characters)',kind:'count',max:200000,hint:'Characters in the prompt.'},
+ unattended:{name:'nobody is watching',kind:'flag',hint:'The caller said no human is supervising this system.'},
+ deterministic:{name:'the answer is repeatable',kind:'flag',hint:'Temperature is zero, so the same question gets the same answer.'}
+};
+const OPS={'>=':'is at least','>':'is above','<=':'is at most','<':'is below','==':'is exactly'};
+const V={allow:['Let it through','send it to the model as asked'],downgrade:['Use the cheaper model','small and simple enough for a cheaper model'],challenge:['Hold it for a person','wait for a human before spending'],block:['Block it','refuse; it never reaches the model']};
+const VERB={allow:'let it through',downgrade:'switch to the cheaper model',challenge:'hold it for a person',block:'block it'};
+const VERTS=['general','coding','support','legal','medical','finance','retail','ecommerce','education','research','translation','moderation','sales','recruitment','logistics','gaming','media','security','insurance','property','public-sector'];
+$('#pv').innerHTML=VERTS.map(v=>'<option>'+v+'</option>').join('');
+const T={
+ runaway:{name:'Stop runaway agents',summary:'Catches AI agents stuck in loops before they run up the bill.',def:'allow',rules:[
+  {join:'and',conds:[{f:'loop_count',op:'>=',v:3},{f:'unattended',op:'is',v:true}],then:'block',why:'An unattended agent sending the same request three times is stuck. Stop it before it spends more.'},
+  {join:'and',conds:[{f:'loop_count',op:'>=',v:3}],then:'challenge',why:'The same request three times usually means a loop. A person should look before it continues.'},
+  {join:'or',conds:[{f:'burst',op:'>=',v:0.8}],then:'challenge',why:'A sudden burst of requests looks like a script out of control.'}]},
+ budget:{name:'Guard the budget',summary:'Holds expensive requests for a person and moves simple ones to a cheaper model.',def:'allow',rules:[
+  {join:'and',conds:[{f:'exposure',op:'>=',v:0.7}],then:'challenge',why:'This one request could use most of what is left in the budget.'},
+  {join:'and',conds:[{f:'size',op:'<',v:0.2},{f:'tools',op:'==',v:0},{f:'deterministic',op:'is',v:true}],then:'downgrade',why:'Short, simple, repeatable requests do not need the most expensive model.'}]},
+ unattended:{name:'Careful when nobody\'s watching',summary:'Stricter rules for AI that runs without a person supervising it.',def:'allow',rules:[
+  {join:'and',conds:[{f:'unattended',op:'is',v:true},{f:'score',op:'>=',v:0.6}],then:'block',why:'High risk with nobody watching: refuse rather than hope.'},
+  {join:'and',conds:[{f:'unattended',op:'is',v:true},{f:'novelty',op:'>=',v:0.8}],then:'challenge',why:'Something it has never seen before, and no one supervising. A person should see it first.'}]},
+ blank:{name:'',summary:'',def:'allow',rules:[{join:'and',conds:[{f:'loop',op:'>=',v:0.6}],then:'challenge',why:''}]}
+};
+let P=JSON.parse(JSON.stringify(T.runaway)),sel=0;
+function fmtv(f,v){const d=F[f];if(d.kind==='flag')return v?'yes':'no';return d.kind==='signal'?Number(v).toFixed(2):String(v)}
+function condText(c){const d=F[c.f];if(d.kind==='flag')return (c.v?'':'not ')+'<span class="k">'+d.name+'</span>';
+ return '<span class="k">'+d.name+'</span> '+OPS[c.op]+' <span class="k">'+fmtv(c.f,c.v)+'</span>'}
+function ruleSentence(r){if(!r)return'';const parts=r.conds.map(condText);
+ return 'If '+parts.join(r.join==='and'?', and ':', or ')+', <span class="then-'+r.then+'">'+VERB[r.then]+'</span>'+(r.why?' — '+r.why.replace(/[<>]/g,'').replace(/\.$/,'')+'.':'.')}
+function expr(c){const d=F[c.f];if(d.kind==='flag')return (c.v?'':'not ')+c.f;return c.f+' '+c.op+' '+(d.kind==='signal'?Number(c.v).toFixed(2).replace(/0+$/,'').replace(/\.$/,''):Math.round(c.v))}
+function manifest(){return{name:$('#pn').value.trim(),author:$('#pa').value.trim(),version:$('#pver').value.trim()||'1.0.0',vertical:$('#pv').value,summary:$('#ps').value.trim(),
+ rules:P.rules.map(r=>({when:r.conds.map(expr).join(' '+r.join+' '),then:r.then,why:r.why.trim()})),default:$('#def').value}}
+function fieldOptions(cur){const g={signal:'Signals, 0 to 1',count:'Counts',flag:'Yes or no'};let h='';
+ ['signal','count','flag'].forEach(k=>{h+='<optgroup label="'+g[k]+'">';Object.keys(F).filter(f=>F[f].kind===k).forEach(f=>{h+='<option value="'+f+'"'+(f===cur?' selected':'')+'>'+F[f].name+'</option>'});h+='</optgroup>'});return h}
+function renderRules(){const box=$('#rules');box.innerHTML='';
+ P.rules.forEach((r,i)=>{const el=document.createElement('div');el.className='rule'+(i===sel?' sel':'');
+  let h='<div class="rule-h"><b>Rule '+(i+1)+'</b><span><button class="ic" data-a="up" title="Move up" aria-label="Move rule up">↑</button> <button class="ic" data-a="down" title="Move down" aria-label="Move rule down">↓</button> <button class="ic" data-a="del" title="Remove rule" aria-label="Remove rule">×</button></span></div>';
+  r.conds.forEach((c,j)=>{const d=F[c.f];let op,val;
+   if(d.kind==='flag'){op='<select data-c="'+j+'" data-k="v"><option value="1"'+(c.v?' selected':'')+'>is true</option><option value="0"'+(!c.v?' selected':'')+'>is not</option></select>';val='<span></span>'}
+   else{op='<select data-c="'+j+'" data-k="op">'+Object.keys(OPS).map(o=>'<option value="'+o+'"'+(o===c.op?' selected':'')+'>'+OPS[o]+'</option>').join('')+'</select>';
+    val=d.kind==='signal'?'<div class="vbox"><input type="number" min="0" max="1" step="0.05" data-c="'+j+'" data-k="v" value="'+c.v+'"></div>':'<div class="vbox"><input type="number" min="0" max="'+d.max+'" step="1" data-c="'+j+'" data-k="v" value="'+c.v+'"></div>'}
+   h+='<div class="cond"><select data-c="'+j+'" data-k="f">'+fieldOptions(c.f)+'</select>'+op+val+'<button class="ic" data-a="delc" data-c="'+j+'" aria-label="Remove condition">×</button><div class="meaning">'+d.hint+'</div></div>'});
+  h+='<div class="join"><button data-a="addc">Add a condition</button>'+(r.conds.length>1?'<span>Match</span><button data-a="and" class="'+(r.join==='and'?'on':'')+'">all of them</button><button data-a="or" class="'+(r.join==='or'?'on':'')+'">any of them</button>':'')+'</div>';
+  h+='<div class="verdicts">'+Object.keys(V).map(v=>'<button data-a="then" data-v="'+v+'" class="'+(r.then===v?'on':'')+'">'+V[v][0]+'<small>'+V[v][1]+'</small></button>').join('')+'</div>';
+  h+='<label class="f">Why — shown with every decision this rule makes</label><input data-k="why" value="'+(r.why||'').replace(/"/g,'&quot;')+'" maxlength="300" placeholder="In plain words, why this rule exists">';
+  el.innerHTML=h;
+  el.addEventListener('focusin',()=>{if(sel!==i){sel=i;document.querySelectorAll('.rule').forEach((x,k)=>x.classList.toggle('sel',k===i));update(false)}});
+  el.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const a=b.dataset.a;sel=i;
+   if(a==='up'&&i>0){[P.rules[i-1],P.rules[i]]=[P.rules[i],P.rules[i-1]];sel=i-1}
+   else if(a==='down'&&i<P.rules.length-1){[P.rules[i+1],P.rules[i]]=[P.rules[i],P.rules[i+1]];sel=i+1}
+   else if(a==='del'){P.rules.splice(i,1);if(!P.rules.length)P.rules.push({join:'and',conds:[{f:'loop',op:'>=',v:0.6}],then:'challenge',why:''});sel=Math.max(0,i-1)}
+   else if(a==='addc'){r.conds.push({f:'burst',op:'>=',v:0.8})}
+   else if(a==='delc'){if(r.conds.length>1)r.conds.splice(+b.dataset.c,1)}
+   else if(a==='and'||a==='or'){r.join=a}
+   else if(a==='then'){r.then=b.dataset.v}
+   else return;renderRules();update(true)});
+  el.addEventListener('input',e=>{const t=e.target;if(t.dataset.k==='why'){r.why=t.value;update(true);return}
+   const j=t.dataset.c;if(j===undefined)return;const c=r.conds[+j];
+   if(t.dataset.k==='f'){c.f=t.value;const d=F[c.f];c.v=d.kind==='flag'?true:(d.kind==='signal'?0.6:Math.min(3,d.max));c.op='>=';renderRules()}
+   else if(t.dataset.k==='op'){c.op=t.value}
+   else if(t.dataset.k==='v'){c.v=F[c.f].kind==='flag'?t.value==='1':Number(t.value)}
+   update(true)});
+  box.appendChild(el)})}
+// bench
+const BENCH=['loop','burst','exposure','score','novelty','loop_count','tool_count','turns'];
+let B={loop:0.1,burst:0.2,exposure:0.3,score:0.3,novelty:0.4,loop_count:1,tool_count:2,turns:4,size:0.3,ask:0.3,depth:0.2,tools:0.2,grind:0.2,burst_count:3,grind_count:40,max_tokens:1000,chars:4000};
+function benchFields(){const used=new Set(BENCH);P.rules.forEach(r=>r.conds.forEach(c=>{if(F[c.f].kind!=='flag')used.add(c.f)}));return Array.from(used)}
+function renderBench(){$('#bench').innerHTML=benchFields().map(f=>{const d=F[f],mx=d.kind==='signal'?1:d.max,st=d.kind==='signal'?0.01:1;
+ return '<label for="b_'+f+'">'+d.name+'<b id="bv_'+f+'">'+fmtv(f,B[f]||0)+'</b></label><input type="range" id="b_'+f+'" data-f="'+f+'" min="0" max="'+mx+'" step="'+st+'" value="'+(B[f]||0)+'">'}).join('');
+ document.querySelectorAll('#bench input').forEach(i=>i.oninput=()=>{B[i.dataset.f]=Number(i.value);$('#bv_'+i.dataset.f).textContent=fmtv(i.dataset.f,B[i.dataset.f]);evaluate()})}
+$('#b_unattended').onchange=evaluate;$('#b_deterministic').onchange=evaluate;
+function holds(c){const d=F[c.f];if(d.kind==='flag'){const x=$('#b_'+c.f).checked;return c.v?x:!x}
+ const x=B[c.f]||0,v=Number(c.v);return c.op==='>='?x>=v:c.op==='>'?x>v:c.op==='<='?x<=v:c.op==='<'?x<v:x===v}
+function evaluate(){let hit=-1;for(let i=0;i<P.rules.length;i++){const r=P.rules[i];const ok=r.join==='and'?r.conds.every(holds):r.conds.some(holds);if(ok){hit=i;break}}
+ const v=hit>=0?P.rules[hit].then:$('#def').value;
+ $('#outcome').innerHTML='<span class="then-'+v+'" style="color:'+({allow:'var(--live)',downgrade:'#9fc6ff',challenge:'var(--warn)',block:'var(--stop)'}[v])+'">'+V[v][0]+'</span>'+
+  '<small>'+(hit>=0?'Rule '+(hit+1)+' decided it'+(P.rules[hit].why?': '+P.rules[hit].why.replace(/[<>]/g,''):'.'):'No rule matched, so the default decided.')+'</small>'}
+// validation
+let vt=null;
+function update(changed){$('#sentence').innerHTML=ruleSentence(P.rules[sel]);const m=manifest();$('#json').textContent=JSON.stringify(m,null,2);renderBenchIfNeeded();evaluate();
+ if(changed!==false){clearTimeout(vt);vt=setTimeout(validate,450)}}
+let lastBench='';function renderBenchIfNeeded(){const k=benchFields().join(',');if(k!==lastBench){lastBench=k;renderBench()}}
+async function validate(){const m=manifest();
+ const local=!m.name?'Give the pack a name.':!m.author?'Add your name or company as the author.':m.rules.some(r=>!r.why)?'Every rule needs a why — it is shown with every decision.':null;
+ if(local){$('#vdot').className='dot err';$('#vtext').textContent=local;$('#pub').disabled=true;return}
+ try{const r=await fetch('/x/packs/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pack:m})});const d=await r.json();
+  const ok=r.ok&&d.ok!==false&&!d.error;$('#vdot').className='dot '+(ok?'ok':'err');$('#vtext').textContent=ok?'Ready to publish. The engine has checked every rule.':(d.detail||d.error||'The engine could not read this pack.');$('#pub').disabled=!ok}
+ catch(e){$('#vdot').className='dot err';$('#vtext').textContent='Could not reach sebbi.pro to check the pack.';$('#pub').disabled=true}}
+$('#pub').onclick=async()=>{const b=$('#pub');b.disabled=true;const pm=$('#pmsg');pm.textContent='Publishing…';pm.className='msg';
+ try{const r=await fetch('/x/packs/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pack:manifest()})});const d=await r.json();
+  if(!r.ok||d.ok===false){pm.textContent=d.detail||d.error||'Could not publish.';pm.className='msg err';b.disabled=false;return}
+  const id=d.pack_id||d.id||(d.pack&&d.pack.id)||'';
+  pm.innerHTML='Published and sealed'+(d.block_index?' in block '+d.block_index:'')+'. '+(id?'<a href="https://sebbi.pro/x/packs/get?id='+encodeURIComponent(id)+'">See your pack</a> · ':'')+'<a href="https://sebbi.pro/packs.html">Open the library</a>';pm.className='msg ok'}
+ catch(e){pm.textContent='Could not reach sebbi.pro.';pm.className='msg err';b.disabled=false}};
+function load(t){P=JSON.parse(JSON.stringify(T[t]));sel=0;$('#pn').value=P.name;$('#ps').value=P.summary;$('#def').value=P.def;renderRules();update(true)}
+document.querySelectorAll('.tpl button').forEach(b=>b.onclick=()=>load(b.dataset.t));
+['#pn','#pa','#pv','#pver','#ps','#def'].forEach(s=>$(s).addEventListener('input',()=>update(true)));
+$('#addrule').onclick=()=>{P.rules.push({join:'and',conds:[{f:'exposure',op:'>=',v:0.7}],then:'challenge',why:''});sel=P.rules.length-1;renderRules();update(true);document.querySelectorAll('.rule')[sel].scrollIntoView({behavior:'smooth',block:'center'})};
+load('runaway');
+})();
+</script></body></html>"""
 
 ```
 
@@ -817,972 +1615,5 @@ def handle(method, action, data, api_key, ctx):
     return {"error": "unknown_action", "action": action,
             "GET": ["spec", "root", "ancestor", "proof"],
             "POST": ["verify", "checkpoint"]}, 404
-
-```
-
-
-## `modules/console.py`
-
-959 lines, 40895 bytes
-
-```python
-"""
-modules/console.py  -  the operator console at /console
-
-WHY IT EXISTS
--------------
-Half the useful routes are keyed POSTs. A browser address bar can only issue
-GETs without a header, so from a phone those routes are unreachable - which is
-most of the time, for this operator.
-
-This serves one page that can reach them. The key is typed in, held in a
-variable for that tab, and never written to storage. Close the tab and it is
-gone.
-
-WHAT IT CAN DO
---------------
-  continuity/issue       grant authority, and delegate it onward
-  continuity/exercise    evaluate an action against the whole lineage
-  reconcile/plan         fix the sample before any data is requested
-  reconcile/submit       seal the comparison, mismatches included
-  fingerprint/self       score the 28-vector battery on our own engine
-  fingerprint/probe      fire it at somebody else's endpoint and compare
-  fingerprint/history    past comparisons
-  codebase/seal          hash the tree, seal the manifest with a declaration
-  publish/seal           seal the exact bytes a live page is serving
-
-SAME PATCH AS network.py
-------------------------
-The router hands whatever handle() returns to send_json, so a module cannot
-return HTML through it. This patches do_GET at runtime, adds one path, and
-leaves every other path alone. Idempotent, in memory, reverts on restart.
-
-And the same catch: after every deploy, one /x/ request has to arrive before
-/console exists. Opening /x/console/status does it.
-
-NOT LINKED FROM ANYWHERE
-------------------------
-No link on the site, noindex on the page. It holds no secrets - every route it
-calls checks the key itself - but there is no reason to advertise it either.
-
-v1.5 - SIBLINGS now includes praxis, roster, mutual and witness. Those four
-were missing, which is why /praxis and the roster routes went 404 after every
-single deploy and had to be woken by hand. One healthcheck arms them all now.
-"""
-
-import importlib
-import sys
-
-VERSION = "1.5"
-
-PUBLIC = {("GET", "status")}
-
-PAGE_PATHS = ("/console", "/console.html")
-
-_patched = [False]
-
-# Every page on this deployment is served by a runtime patch, and a module is
-# only imported when a request reaches its own /x/ prefix. So after a deploy,
-# each page stays 404 until somebody remembers to poke it - which is a stupid
-# thing to ask a person to remember, and it has been asked too many times.
-#
-# One touch here arms all of them. Point Railway's healthcheck at
-# /x/console/status and the container arms itself before it ever serves a
-# request.
-SIBLINGS = ("selfcheck", "standard", "savings", "verifier", "network", "publish",
-            "continuity", "praxis", "roster", "mutual", "witness")
-
-_armed = {}
-
-
-def _arm_siblings(ctx):
-    for name in SIBLINGS:
-        if _armed.get(name):
-            continue
-        mod = None
-        for path in ("modules." + name, name):
-            try:
-                mod = importlib.import_module(path)
-                break
-            except Exception:
-                continue
-        if mod is None or not hasattr(mod, "handle"):
-            _armed[name] = "not found"
-            continue
-        try:
-            mod.handle("GET", "status", {}, None, ctx)
-            _armed[name] = "armed"
-            print("CONSOLE: armed " + name, flush=True)
-        except Exception as exc:
-            _armed[name] = "failed: " + str(exc)[:80]
-
-
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
-<title>Console — AILeash</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,900&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --ink:#0a0f1e; --panel:#131b2e; --panel2:#1a2338; --edge:rgba(201,168,76,.22);
-  --gold:#c9a84c; --gold-dim:#8a7233;
-  --text:#f2efe6; --mute:rgba(242,239,230,.42);
-  --allow:#1a9e6e; --challenge:#c07a1d; --block:#c8362b; --ok:#7fe3b0;
-  --disp:Fraunces,Georgia,serif; --body:'Space Grotesk',system-ui,sans-serif;
-  --mono:'IBM Plex Mono',monospace;
-}
-body{background:var(--ink);color:var(--text);font-family:var(--body);
-  font-size:16px;line-height:1.6;padding:0 0 60px;
-  background-image:repeating-linear-gradient(90deg,transparent 0 39px,rgba(201,168,76,.05) 39px 40px)}
-.wrap{max-width:640px;margin:0 auto;padding:0 18px}
-
-header{padding:34px 0 22px;border-bottom:1px solid var(--edge);margin-bottom:26px}
-.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.24em;
-  text-transform:uppercase;color:var(--gold);margin-bottom:10px}
-h1{font-family:var(--disp);font-weight:900;font-size:clamp(30px,8vw,44px);
-  line-height:1;letter-spacing:-.02em}
-h1 span{color:var(--gold)}
-.sub{color:var(--mute);font-size:14.5px;margin-top:12px;max-width:44ch}
-
-label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
-  text-transform:uppercase;color:var(--mute);margin-bottom:7px}
-input,textarea{width:100%;background:var(--panel);border:1px solid var(--edge);
-  color:var(--text);font-family:var(--mono);font-size:13px;padding:12px 13px;
-  border-radius:4px;outline:none}
-input:focus,textarea:focus{border-color:var(--gold)}
-textarea{resize:vertical;min-height:70px;font-family:var(--body);font-size:14px}
-
-.keybar{background:var(--panel2);border:1px solid var(--edge);border-radius:6px;
-  padding:16px;margin-bottom:26px}
-.keynote{font-size:12px;color:var(--mute);margin-top:9px;line-height:1.55}
-
-.op{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
-  margin-bottom:14px;overflow:hidden}
-.op-head{display:flex;align-items:baseline;gap:10px;padding:15px 16px;cursor:pointer;
-  user-select:none}
-.op-head:hover{background:var(--panel2)}
-.op-n{font-family:var(--mono);font-size:10px;color:var(--gold-dim);letter-spacing:.1em}
-.op-t{font-family:var(--disp);font-weight:600;font-size:18px;letter-spacing:-.01em}
-.op-r{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--mute)}
-.op-body{padding:0 16px 16px;display:none}
-.op.open .op-body{display:block}
-.op-why{font-size:13.5px;color:var(--mute);margin-bottom:14px;line-height:1.6}
-.field{margin-bottom:12px}
-
-button{width:100%;background:var(--gold);color:var(--ink);border:none;border-radius:4px;
-  padding:14px;font-family:var(--body);font-weight:700;font-size:14.5px;cursor:pointer;
-  transition:background .15s}
-button:hover:not(:disabled){background:#dbbd63}
-button:disabled{opacity:.45;cursor:default}
-button.quiet{background:transparent;color:var(--mute);border:1px solid var(--edge)}
-button.quiet:hover:not(:disabled){color:var(--text);border-color:var(--gold)}
-
-/* ---- the readout: this is the thing worth building ---- */
-#out{margin-top:26px}
-.verdict{border:1px solid var(--edge);border-radius:6px;background:var(--panel);
-  overflow:hidden;margin-bottom:14px}
-.v-head{padding:22px 18px;border-bottom:1px solid var(--edge)}
-.v-word{font-family:var(--disp);font-weight:900;font-size:clamp(28px,9vw,42px);
-  line-height:1;letter-spacing:-.02em}
-.v-IDENTICAL,.v-err{color:var(--block)}
-.v-DERIVED{color:var(--challenge)}
-.v-SAME.SHAPE,.v-SIMILAR{color:var(--gold)}
-.v-UNRELATED,.v-ok{color:var(--allow)}
-.v-INCONCLUSIVE{color:var(--mute)}
-.v-ALLOW{color:var(--allow)}
-.v-CHALLENGE{color:var(--challenge)}
-.v-BLOCK{color:var(--block)}
-.lin{padding:16px 18px;border-bottom:1px solid var(--edge)}
-.lin-hop{display:flex;gap:10px;align-items:baseline;padding:8px 0;
-  border-bottom:1px solid rgba(201,168,76,.10)}
-.lin-hop:last-child{border-bottom:none}
-.lin-d{font-family:var(--mono);font-size:10px;color:var(--gold-dim);min-width:24px}
-.lin-g{font-family:var(--mono);font-size:12px;color:var(--gold)}
-.lin-s{font-size:12.5px;color:var(--mute)}
-.lin-bad{color:var(--block)}
-.v-stats{display:flex;flex-wrap:wrap;gap:18px;padding:14px 18px;
-  border-bottom:1px solid var(--edge);font-family:var(--mono);font-size:11px}
-.v-stats b{display:block;font-family:var(--disp);font-size:19px;color:var(--text);
-  font-weight:600;margin-top:3px}
-.v-stats span{color:var(--mute);letter-spacing:.1em;text-transform:uppercase}
-
-/* paired bars: ours above, theirs below, one column per vector */
-.strip{padding:18px}
-.strip-l{font-family:var(--mono);font-size:10px;letter-spacing:.16em;
-  text-transform:uppercase;color:var(--gold);margin-bottom:14px}
-.bars{display:flex;gap:2px;align-items:stretch;height:96px}
-.bar{flex:1;display:flex;flex-direction:column;justify-content:center;gap:2px;min-width:0}
-.bar i{display:block;border-radius:1px;transition:height .35s ease}
-.bar .mine{background:var(--gold);align-self:flex-end;width:100%}
-.bar .theirs{background:rgba(242,239,230,.35);width:100%}
-.bar.match .theirs{background:var(--block)}
-.bar-key{display:flex;gap:16px;margin-top:12px;font-family:var(--mono);font-size:10px;
-  color:var(--mute);flex-wrap:wrap}
-.dot{display:inline-block;width:8px;height:8px;border-radius:1px;margin-right:6px;
-  vertical-align:middle}
-
-pre{font-family:var(--mono);font-size:11.5px;line-height:1.65;background:#080c16;
-  color:var(--ok);padding:15px;border-radius:5px;overflow-x:auto;
-  border:1px solid var(--edge);max-height:340px}
-.msg{font-family:var(--mono);font-size:12.5px;padding:13px 15px;border-radius:5px;
-  border:1px solid var(--edge);color:var(--mute);margin-bottom:14px}
-.msg.bad{color:#ffb4ad;border-color:rgba(200,54,43,.5);background:rgba(200,54,43,.08)}
-.msg.good{color:var(--ok);border-color:rgba(127,227,176,.35);background:rgba(26,158,110,.08)}
-.working{font-family:var(--mono);font-size:12px;color:var(--gold)}
-.working:after{content:'';animation:dots 1.2s steps(4,end) infinite}
-@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
-footer{margin-top:34px;padding-top:18px;border-top:1px solid var(--edge);
-  font-family:var(--mono);font-size:10.5px;color:var(--mute);line-height:1.8}
-a{color:var(--gold)}
-:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
-@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
-</style>
-</head>
-<body>
-<div class="wrap">
-
-<header>
-  <p class="eyebrow">AILeash · operator console</p>
-  <h1>Keyed <span>routes</span></h1>
-  <p class="sub">The endpoints a browser cannot reach on its own. Your key stays in this tab and is never stored.</p>
-</header>
-
-<div class="keybar">
-  <label for="key">API key</label>
-  <input id="key" type="password" placeholder="al_live_…" autocomplete="off" spellcheck="false">
-  <p class="keynote">Held in memory for this tab only. Close it and the key is gone — nothing is written to the device.</p>
-</div>
-
-<div class="op" id="op-self">
-  <div class="op-head" onclick="toggle('op-self')">
-    <span class="op-n">01</span><span class="op-t">Baseline</span>
-    <span class="op-r">POST /x/fingerprint/self</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">Runs the 28-vector battery through your own engine. Every probe is measured against this. Run it first — if it answers, the module can see your live scorer.</p>
-    <button onclick="run('self')">Score the battery</button>
-  </div>
-</div>
-
-<div class="op" id="op-probe">
-  <div class="op-head" onclick="toggle('op-probe')">
-    <span class="op-n">02</span><span class="op-t">Probe a target</span>
-    <span class="op-r">POST /x/fingerprint/probe</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">Fires the same battery at somebody else's scoring endpoint and compares the two sets of numbers. One request per vector with a gap between them.</p>
-    <div class="field">
-      <label for="t-url">Their scoring endpoint</label>
-      <input id="t-url" type="url" placeholder="https://example.com/api/score" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="t-fields">Field names, if theirs differ (optional)</label>
-      <input id="t-fields" placeholder='{"amount":"value","trust":"history"}' autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="t-score">Where the score is in their reply (optional)</label>
-      <input id="t-score" placeholder="risk_score" autocomplete="off">
-    </div>
-    <button onclick="run('probe')">Run the comparison</button>
-  </div>
-</div>
-
-<div class="op" id="op-code">
-  <div class="op-head" onclick="toggle('op-code')">
-    <span class="op-n">03</span><span class="op-t">Seal the codebase</span>
-    <span class="op-r">POST /x/codebase/seal</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">Hashes every file, commits one manifest root, seals it with your declaration. Dated evidence of what you held and when.</p>
-    <div class="field">
-      <label for="c-author">Author</label>
-      <input id="c-author" value="Justin Antony Dobson" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="c-entity">Entity</label>
-      <input id="c-entity" value="Monop Content" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="c-stmt">Declaration</label>
-      <textarea id="c-stmt">Scoring engine, weighting and trust decay authored solely by me.</textarea>
-    </div>
-    <button onclick="run('codebase')">Seal it</button>
-  </div>
-</div>
-
-<div class="op" id="op-pub">
-  <div class="op-head" onclick="toggle('op-pub')">
-    <span class="op-n">04</span><span class="op-t">Seal a published page</span>
-    <span class="op-r">POST /x/publish/seal</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">Fetches a live page and seals the exact bytes served. Pins what the world could see on a given date, which is not the same as what was in the repo.</p>
-    <div class="field">
-      <label for="p-url">Page</label>
-      <input id="p-url" type="url" value="https://sebbi.pro/" autocomplete="off">
-    </div>
-    <button onclick="run('publish')">Seal the page</button>
-  </div>
-</div>
-
-<div class="op" id="op-hist">
-  <div class="op-head" onclick="toggle('op-hist')">
-    <span class="op-n">05</span><span class="op-t">Past probes</span>
-    <span class="op-r">GET /x/fingerprint/history</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">Every comparison you have run, with its verdict and receipt.</p>
-    <button class="quiet" onclick="run('history')">Show them</button>
-  </div>
-</div>
-
-<div class="op" id="op-spec">
-  <div class="op-head" onclick="toggle('op-spec')">
-    <span class="op-n">06</span><span class="op-t">Every command</span>
-    <span class="op-r">GET /x/spec</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">Walks every module on the router and reports what each one exposes, and which routes need a key. If you have forgotten what exists, this is the answer.</p>
-    <button class="quiet" onclick="run('spec')">List them</button>
-  </div>
-</div>
-
-
-<div class="op" id="op-auth">
-  <div class="op-head" onclick="toggle('op-auth')">
-    <span class="op-n">07</span><span class="op-t">Grant authority</span>
-    <span class="op-r">POST /x/continuity/issue</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">A root grant. It must be issued by a human, it must state a purpose, and it must expire. Whoever is named as accepting the risk is the person an incident lands on.</p>
-    <div class="field">
-      <label for="a-issuer">Issued by (human)</label>
-      <input id="a-issuer" value="justin@monopcontent.com" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="a-subject">Granted to</label>
-      <input id="a-subject" value="orchestrator" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="a-scope">Scope, comma separated</label>
-      <input id="a-scope" value="payments.refund, payments.read" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="a-max">Maximum amount</label>
-      <input id="a-max" value="5000" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="a-purpose">Purpose</label>
-      <input id="a-purpose" value="resolve customer refund complaints" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="a-tags">Purpose tags, comma separated</label>
-      <input id="a-tags" value="refunds, support" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="a-hours">Valid for (hours)</label>
-      <input id="a-hours" value="24" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="a-deleg">Onward delegations allowed</label>
-      <input id="a-deleg" value="2" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="a-risk">Risk accepted by (leave blank to use the issuer)</label>
-      <input id="a-risk" placeholder="risk.officer@example.com" autocomplete="off">
-    </div>
-    <button onclick="run('issue')">Issue the grant</button>
-  </div>
-</div>
-
-<div class="op" id="op-deleg">
-  <div class="op-head" onclick="toggle('op-deleg')">
-    <span class="op-n">08</span><span class="op-t">Delegate it onward</span>
-    <span class="op-r">POST /x/continuity/issue</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">A child can narrow, never widen. Try raising the amount above the parent's and watch it refuse. A child that can delegate again must name its own risk acceptor.</p>
-    <div class="field">
-      <label for="d-parent">Parent grant id</label>
-      <input id="d-parent" placeholder="g_…" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-issuer">Issued by</label>
-      <input id="d-issuer" value="orchestrator" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-subject">Granted to</label>
-      <input id="d-subject" value="refund-agent" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-scope">Scope, comma separated</label>
-      <input id="d-scope" value="payments.refund" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-max">Maximum amount</label>
-      <input id="d-max" value="200" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-purpose">Purpose</label>
-      <input id="d-purpose" value="issue small refunds" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-tags">Purpose tags</label>
-      <input id="d-tags" value="refunds" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-hours">Valid for (hours, must fit inside the parent)</label>
-      <input id="d-hours" value="6" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-deleg">Onward delegations allowed</label>
-      <input id="d-deleg" value="0" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="d-risk">Risk accepted by (required if delegations above is not 0)</label>
-      <input id="d-risk" placeholder="head.of.ops@example.com" autocomplete="off">
-    </div>
-    <button onclick="run('delegate')">Delegate</button>
-  </div>
-</div>
-
-<div class="op" id="op-ex">
-  <div class="op-head" onclick="toggle('op-ex')">
-    <span class="op-n">09</span><span class="op-t">Exercise authority</span>
-    <span class="op-r">POST /x/continuity/exercise</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">The whole chain is re-derived at this moment, not trusted from when it was issued. Ask for more than the lineage allows and it names the grant and the invariant that broke.</p>
-    <div class="field">
-      <label for="e-grant">Grant id</label>
-      <input id="e-grant" placeholder="g_…" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="e-action">Action</label>
-      <input id="e-action" value="payments.refund" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="e-params">Parameters</label>
-      <input id="e-params" value='{"amount": 150}' autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="e-tag">Declared purpose tag</label>
-      <input id="e-tag" value="refunds" autocomplete="off">
-    </div>
-    <button onclick="run('exercise')">Evaluate it</button>
-  </div>
-</div>
-
-<div class="op" id="op-plan">
-  <div class="op-head" onclick="toggle('op-plan')">
-    <span class="op-n">10</span><span class="op-t">Plan a reconciliation</span>
-    <span class="op-r">POST /x/reconcile/plan</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">Seals which records will be tested before any data is fetched. Once this runs you cannot choose a kinder sample, and an abandoned plan stays visible forever.</p>
-    <div class="field">
-      <label for="r-size">Sample size</label>
-      <input id="r-size" value="10" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="r-field">Field to reconcile</label>
-      <input id="r-field" value="decision" autocomplete="off">
-    </div>
-    <button onclick="run('plan')">Fix the sample</button>
-  </div>
-</div>
-
-<div class="op" id="op-sub">
-  <div class="op-head" onclick="toggle('op-sub')">
-    <span class="op-n">11</span><span class="op-t">Submit the comparison</span>
-    <span class="op-r">POST /x/reconcile/submit</span>
-  </div>
-  <div class="op-body">
-    <p class="op-why">The values from your own live system, against the sample that was already sealed. Fill these honestly - a mismatch is sealed as permanently as a match, and that is the only reason any of it means anything.</p>
-    <div class="field">
-      <label for="s-run">Run id</label>
-      <input id="s-run" placeholder="RUN-XXXXXXXX" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="s-results">Results, block index to live value</label>
-      <textarea id="s-results" placeholder='{"41": "ALLOW", "58": "BLOCK"}'></textarea>
-    </div>
-    <button onclick="run('submit')">Seal the comparison</button>
-  </div>
-</div>
-
-<div id="out"></div>
-
-<footer>
-  Public routes need no key and are not listed here.<br>
-  Chain: <a href="/api/verify-chain">/api/verify-chain</a> · Clock: <a href="/api/anchor-status">/api/anchor-status</a> · Network: <a href="/x/witness/peers">/x/witness/peers</a>
-</footer>
-
-</div>
-
-<script>
-(function(){
-  var out = document.getElementById('out');
-  var busy = false;
-
-  window.toggle = function(id){
-    var el = document.getElementById(id);
-    el.classList.toggle('open');
-  };
-  document.getElementById('op-self').classList.add('open');
-
-  function esc(s){
-    return String(s==null?'':s).replace(/[&<>"']/g,function(c){
-      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});
-  }
-  function msg(text, kind){
-    out.innerHTML = '<div class="msg '+(kind||'')+'">'+esc(text)+'</div>';
-  }
-  function raw(obj){
-    return '<pre>'+esc(JSON.stringify(obj,null,2))+'</pre>';
-  }
-
-  function key(){
-    var k = document.getElementById('key').value.trim();
-    if(!k){ msg('Paste your API key at the top first.','bad'); return null; }
-    return k;
-  }
-
-  function parseJSONField(id){
-    var v = document.getElementById(id).value.trim();
-    if(!v) return null;
-    try { return JSON.parse(v); }
-    catch(e){ msg('That field-name map is not valid JSON. Example: {"amount":"value"}','bad'); return undefined; }
-  }
-
-  async function call(path, method, body){
-    var k = key(); if(!k) return null;
-    var opts = { method: method, headers: { 'Authorization':'Bearer '+k } };
-    if(body){ opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(body); }
-    var r = await fetch(path, opts);
-    var d;
-    try { d = await r.json(); } catch(e){ d = {error:'unreadable_response'}; }
-    return { status: r.status, data: d };
-  }
-
-  function bars(perVector){
-    var maxV = 0;
-    perVector.forEach(function(p){
-      maxV = Math.max(maxV, Math.abs(p.ours), Math.abs(p.theirs)); });
-    if(maxV <= 0) maxV = 1;
-    var html = '<div class="strip"><div class="strip-l">Every vector · yours above, theirs below</div><div class="bars">';
-    perVector.forEach(function(p){
-      var a = Math.max(2, Math.round((Math.abs(p.ours)/maxV)*44));
-      var b = Math.max(2, Math.round((Math.abs(p.theirs)/maxV)*44));
-      var match = Math.abs(p.delta) < 0.000001 ? ' match' : '';
-      html += '<div class="bar'+match+'" title="'+esc(p.vector)+': '+p.ours+' vs '+p.theirs+'">'
-           +  '<i class="mine" style="height:'+a+'px"></i>'
-           +  '<i class="theirs" style="height:'+b+'px"></i></div>';
-    });
-    html += '</div><div class="bar-key">'
-         +  '<span><i class="dot" style="background:var(--gold)"></i>yours</span>'
-         +  '<span><i class="dot" style="background:var(--block)"></i>theirs, exact match</span>'
-         +  '<span><i class="dot" style="background:rgba(242,239,230,.35)"></i>theirs, different</span>'
-         +  '</div></div>';
-    return html;
-  }
-
-  function csv(id){
-    return document.getElementById(id).value.split(',')
-      .map(function(x){ return x.trim(); }).filter(Boolean);
-  }
-  function num(id){
-    var v = parseFloat(document.getElementById(id).value.trim());
-    return isNaN(v) ? 0 : v;
-  }
-  function val(id){ return document.getElementById(id).value.trim(); }
-
-  function renderGrant(d){
-    var html = '<div class="verdict"><div class="v-head">'
-      + '<div class="v-word v-ok">GRANTED</div>'
-      + '<div class="v-why">Sealed at block ' + esc(d.block_index)
-      + '. Depth ' + esc(d.depth) + '. Risk accepted by '
-      + esc(d.risk_accepted_by || 'inherited from above') + '.</div></div>'
-      + '<div class="v-stats">'
-      + '<div><span>grant</span><b style="font-family:var(--mono);font-size:12px">'
-      + esc(d.grant) + '</b></div>'
-      + '<div><span>expires</span><b style="font-size:13px">'
-      + esc(String(d.not_after || '').slice(0,16)) + '</b></div>'
-      + '</div></div>';
-    // carry the id forward so the next step does not need copying by hand
-    if(d.grant){
-      var dp = document.getElementById('d-parent');
-      var eg = document.getElementById('e-grant');
-      if(dp && !dp.value) dp.value = d.grant;
-      if(eg) eg.value = d.grant;
-    }
-    return html;
-  }
-
-  function renderExercise(d){
-    var html = '<div class="verdict"><div class="v-head">'
-      + '<div class="v-word v-' + esc(d.verdict) + '">' + esc(d.verdict) + '</div>'
-      + '<div class="v-why">' + esc(d.what_this_means || '') + '</div></div>'
-      + '<div class="v-stats">'
-      + '<div><span>authorised by</span><b style="font-size:13px">' + esc(d.authorised_by) + '</b></div>'
-      + '<div><span>executed by</span><b style="font-size:13px">' + esc(d.executed_by) + '</b></div>'
-      + '<div><span>risk accepted by</span><b style="font-size:13px">' + esc(d.risk_accepted_by) + '</b></div>'
-      + '<div><span>hops</span><b>' + esc(d.delegation_depth) + '</b></div>'
-      + '</div>';
-    if(d.lineage && d.lineage.length){
-      html += '<div class="lin"><div class="strip-l">Authority path, root first</div>';
-      d.lineage.forEach(function(h){
-        var bad = (h.integrity !== 'ok' || h.revoked) ? ' lin-bad' : '';
-        html += '<div class="lin-hop"><span class="lin-d">' + esc(h.depth) + '</span>'
-             +  '<span><span class="lin-g' + bad + '">' + esc(h.grant) + '</span>'
-             +  '<div class="lin-s">' + esc(h.issuer) + ' &rarr; ' + esc(h.subject)
-             +  ' · ' + esc((h.scope || []).join(', ')) + '</div></span></div>';
-      });
-      html += '</div>';
-    }
-    if(d.reasons && d.reasons.length){
-      html += '<div class="lin"><div class="strip-l">'
-           + (d.verdict === 'BLOCK' ? 'What broke' : 'What could not be settled')
-           + '</div>';
-      d.reasons.forEach(function(r){
-        html += '<div class="lin-s" style="padding:5px 0">' + esc(r) + '</div>'; });
-      if(d.broken_at){
-        html += '<div class="lin-s" style="padding-top:8px;color:var(--block)">at grant '
-             + esc(d.broken_at) + ' · ' + esc(d.broken_invariant) + '</div>';
-      }
-      html += '</div>';
-    }
-    html += '</div>';
-    return html;
-  }
-
-  function renderPlan(d){
-    // prefill the submit form with the sealed sample so the next step is typing
-    // values, not transcribing block numbers
-    var skeleton = {};
-    (d.sample || []).forEach(function(s){ skeleton[String(s.block_index)] = ''; });
-    var sr = document.getElementById('s-run');
-    var ss = document.getElementById('s-results');
-    if(sr) sr.value = d.run_id;
-    if(ss) ss.value = JSON.stringify(skeleton, null, 1);
-    document.getElementById('op-sub').classList.add('open');
-    return '<div class="verdict"><div class="v-head">'
-      + '<div class="v-word v-ok">SAMPLE FIXED</div>'
-      + '<div class="v-why">' + esc(d.sample_size) + ' records selected from the chain tip and '
-      + 'sealed at block ' + esc(d.block_index) + ', before any data was requested. '
-      + 'The submit form below has been filled with the block indices.</div></div>'
-      + '<div class="v-stats">'
-      + '<div><span>run</span><b style="font-family:var(--mono);font-size:12px">'
-      + esc(d.run_id) + '</b></div>'
-      + '<div><span>field</span><b style="font-size:13px">' + esc(d.field) + '</b></div>'
-      + '</div></div>';
-  }
-
-  function renderSubmit(d){
-    var clean = (d.mismatched === 0 && d.missing === 0);
-    return '<div class="verdict"><div class="v-head">'
-      + '<div class="v-word ' + (clean ? 'v-ok' : 'v-BLOCK') + '">'
-      + esc(d.match_rate_pct) + '%</div>'
-      + '<div class="v-why">Sealed at block ' + esc(d.block_index)
-      + ' whichever way it went. It cannot be withdrawn.</div></div>'
-      + '<div class="v-stats">'
-      + '<div><span>matched</span><b>' + esc(d.matched) + '</b></div>'
-      + '<div><span>mismatched</span><b>' + esc(d.mismatched) + '</b></div>'
-      + '<div><span>missing</span><b>' + esc(d.missing) + '</b></div>'
-      + '</div></div>';
-  }
-
-  function renderProbe(d){
-    var v = String(d.verdict||'').replace(/ /g,'.');
-    var html = '<div class="verdict"><div class="v-head">'
-      + '<div class="v-word v-'+esc(v)+'">'+esc(d.verdict)+'</div>'
-      + '<div class="v-why">'+esc(d.why||'')+'</div></div>'
-      + '<div class="v-stats">'
-      +   '<div><span>exact</span><b>'+esc(d.exact_matches)+'/'+esc(d.answered)+'</b></div>'
-      +   '<div><span>correlation</span><b>'+esc(d.correlation==null?'—':d.correlation)+'</b></div>'
-      +   '<div><span>same order</span><b>'+esc(d.rank_correlation==null?'—':d.rank_correlation)+'</b></div>'
-      + '</div>';
-    if(d.per_vector && d.per_vector.length) html += bars(d.per_vector);
-    html += '</div>';
-    if(d.sealed) html += '<div class="msg good">Sealed at block '+esc(d.sealed.block_index)
-      + ' · receipt '+esc(String(d.sealed.receipt).slice(0,20))+'…</div>';
-    if(d.failures) html += '<div class="msg bad">'+esc(d.failure_note||'Some vectors were rejected.')+'</div>';
-    html += raw(d);
-    out.innerHTML = html;
-  }
-
-  function renderSpec(d){
-    // the shape varies by version, so find the module list wherever it is
-    var mods = d.modules || d.spec || d;
-    var names = [];
-    if(Array.isArray(mods)){
-      mods.forEach(function(m){
-        names.push(typeof m === 'string' ? {name:m} : m); });
-    } else if(mods && typeof mods === 'object'){
-      Object.keys(mods).forEach(function(k){
-        var v = mods[k];
-        names.push({name:k, detail:(v && typeof v === 'object') ? v : null}); });
-    }
-    if(!names.length) return '<div class="msg">Nothing listed. The raw reply is below.</div>';
-
-    var html = '<div class="verdict"><div class="v-head">'
-      + '<div class="v-word v-ok">' + names.length + ' modules</div>'
-      + '<div class="v-why">Everything currently loaded on the router.</div></div>'
-      + '<div class="strip">';
-    names.forEach(function(m){
-      var routes = '';
-      if(m.detail){
-        ['public','keyed','GET','POST','routes','actions'].forEach(function(k){
-          var v = m.detail[k];
-          if(Array.isArray(v) && v.length){
-            routes += '<div style="color:var(--mute);font-size:11.5px;margin-top:3px">'
-                   + esc(k) + ': ' + esc(v.join(', ')) + '</div>';
-          }
-        });
-      }
-      html += '<div style="padding:11px 0;border-bottom:1px solid var(--edge)">'
-           +  '<span style="font-family:var(--mono);font-size:13px;color:var(--gold)">/x/'
-           +  esc(m.name) + '/</span>' + routes + '</div>';
-    });
-    html += '</div></div>';
-    return html;
-  }
-
-  window.run = async function(what){
-    if(busy) return;
-    var path, method='POST', body=null;
-
-    if(what==='self'){ path='/x/fingerprint/self'; body={}; }
-
-    else if(what==='probe'){
-      var url = document.getElementById('t-url').value.trim();
-      if(!url){ msg('Give the endpoint you want compared.','bad'); return; }
-      var fields = parseJSONField('t-fields');
-      if(fields === undefined) return;
-      body = { url: url };
-      if(fields) body.fields = fields;
-      var sk = document.getElementById('t-score').value.trim();
-      if(sk) body.score_key = sk;
-      path='/x/fingerprint/probe';
-    }
-
-    else if(what==='codebase'){
-      path='/x/codebase/seal';
-      body = { author: document.getElementById('c-author').value.trim(),
-               entity: document.getElementById('c-entity').value.trim(),
-               statement: document.getElementById('c-stmt').value.trim() };
-    }
-
-    else if(what==='publish'){
-      var pu = document.getElementById('p-url').value.trim();
-      if(!pu){ msg('Give the page to seal.','bad'); return; }
-      path='/x/publish/seal'; body={ url: pu };
-    }
-
-    else if(what==='issue' || what==='delegate'){
-      var pre = (what === 'issue') ? 'a-' : 'd-';
-      var hours = num(pre + 'hours') || 1;
-      body = {
-        issuer: val(pre + 'issuer'),
-        issuer_kind: (what === 'issue') ? 'human' : 'agent',
-        subject: val(pre + 'subject'),
-        scope: csv(pre + 'scope'),
-        constraints: { max_amount: num(pre + 'max') },
-        purpose: val(pre + 'purpose'),
-        purpose_tags: csv(pre + 'tags'),
-        not_after: Math.floor(Date.now() / 1000) + Math.round(hours * 3600),
-        delegations_left: Math.round(num(pre + 'deleg'))
-      };
-      var risk = val(pre + 'risk');
-      if(risk) body.risk_accepted_by = risk;
-      if(what === 'delegate'){
-        var par = val('d-parent');
-        if(!par){ msg('Give the parent grant id. Issue a root first if you have none.','bad'); return; }
-        body.parent = par;
-        // a child window must sit inside the parent's, so start it now
-        body.not_before = Math.floor(Date.now() / 1000);
-      }
-      path = '/x/continuity/issue';
-    }
-
-    else if(what==='exercise'){
-      var g = val('e-grant');
-      if(!g){ msg('Give the grant id you are exercising.','bad'); return; }
-      var params = {};
-      var praw = val('e-params');
-      if(praw){
-        try { params = JSON.parse(praw); }
-        catch(e){ msg('Parameters must be JSON. Example: {"amount": 150}','bad'); return; }
-      }
-      body = { grant: g, action: val('e-action'), params: params };
-      var tag = val('e-tag');
-      if(tag) body.purpose_tag = tag;
-      path = '/x/continuity/exercise';
-    }
-
-    else if(what==='plan'){
-      body = { sample_size: Math.round(num('r-size')) || 10, field: val('r-field') || 'decision' };
-      path = '/x/reconcile/plan';
-    }
-
-    else if(what==='submit'){
-      var rid = val('s-run');
-      if(!rid){ msg('Give the run id from the plan step.','bad'); return; }
-      var results;
-      try { results = JSON.parse(val('s-results')); }
-      catch(e){ msg('Results must be JSON: {"block index": "live value"}','bad'); return; }
-      var empties = Object.keys(results).filter(function(k){
-        return String(results[k]).trim() === ''; });
-      if(empties.length){
-        msg('Fill every value first — ' + empties.length + ' left blank. A blank is not a '
-            + 'match, it is a missing record, and it will be sealed as one.','bad');
-        return;
-      }
-      body = { run_id: rid, results: results };
-      path = '/x/reconcile/submit';
-    }
-
-    else if(what==='history'){ path='/x/fingerprint/history'; method='GET'; }
-
-    else if(what==='spec'){ path='/x/spec'; method='GET'; }
-
-    else return;
-
-    busy = true;
-    out.innerHTML = '<div class="msg"><span class="working">'
-      + (what==='probe' ? 'Firing 28 vectors, one at a time' : 'Working') + '</span></div>';
-
-    try{
-      var res = await call(path, method, body);
-      if(!res){ busy=false; return; }
-
-      if(res.status === 401){
-        msg('That key was refused. Check it and try again.','bad');
-      } else if(res.status === 404 && res.data && res.data.error === 'unknown_module'){
-        msg('That module is not deployed yet.','bad');
-      } else if(res.status === 429){
-        msg('Rate limited. Give it a minute.','bad');
-      } else if(res.status >= 400){
-        out.innerHTML = '<div class="msg bad">'
-          + esc((res.data && (res.data.message || res.data.error)) || ('HTTP '+res.status))
-          + '</div>' + raw(res.data);
-      } else if(what === 'probe' && res.data.verdict){
-        renderProbe(res.data);
-      } else if(what === 'self' && res.data.scores){
-        out.innerHTML = '<div class="msg good">Baseline read from '
-          + esc(res.data.source) + ' · ' + esc(res.data.vectors) + ' vectors</div>' + raw(res.data);
-      } else if((what === 'issue' || what === 'delegate') && res.data.grant){
-        out.innerHTML = renderGrant(res.data) + raw(res.data);
-      } else if(what === 'exercise' && res.data.verdict){
-        out.innerHTML = renderExercise(res.data) + raw(res.data);
-      } else if(what === 'plan' && res.data.run_id){
-        out.innerHTML = renderPlan(res.data) + raw(res.data);
-      } else if(what === 'submit' && res.data.match_rate_pct !== undefined){
-        out.innerHTML = renderSubmit(res.data) + raw(res.data);
-      } else if(what === 'spec'){
-        out.innerHTML = renderSpec(res.data) + raw(res.data);
-      } else {
-        out.innerHTML = '<div class="msg good">Done.</div>' + raw(res.data);
-      }
-    } catch(e){
-      msg('Could not reach the server. That is a real failure, not a staged one.','bad');
-    }
-    busy = false;
-  };
-})();
-</script>
-</body>
-</html>
-"""
-
-
-def _srv():
-    m = sys.modules.get("__main__")
-    if hasattr(m, "get_bearer"):
-        return m
-    return sys.modules.get("server")
-
-
-def _install(s):
-    if _patched[0]:
-        return "already installed"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_console_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path.rstrip("/") or "/"
-        except Exception:
-            p = self.path or "/"
-        if p in PAGE_PATHS:
-            body = PAGE.encode("utf-8")
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("X-Robots-Tag", "noindex, nofollow")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Referrer-Policy", "no-referrer")
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                pass
-            return
-        return original(self)
-
-    H.do_GET = do_GET
-    H._console_patched = True
-    _patched[0] = True
-    print("CONSOLE: /console page installed at runtime", flush=True)
-    return "installed"
-
-
-def handle(method, action, data, api_key, ctx):
-    s = _srv()
-    if s is None:
-        return {"error": "server_not_found"}, 500
-
-    state = "already installed" if _patched[0] else None
-    if not _patched[0]:
-        try:
-            state = _install(s)
-        except Exception as exc:
-            print("CONSOLE: patch failed - " + str(exc), flush=True)
-            state = "failed: " + str(exc)
-
-    try:
-        _arm_siblings(ctx)
-    except Exception as exc:
-        print("CONSOLE: sibling arming failed - " + str(exc)[:120], flush=True)
-
-    if method == "GET" and (action or "") in ("", "status"):
-        return {
-            "page": "/console",
-            "installed": bool(_patched[0]),
-            "install_result": state,
-            "version": VERSION,
-            "armed": dict(_armed),
-            "healthcheck": ("Point Railway at /x/console/status. It runs on every new "
-                            "container before traffic arrives, and arms every page "
-                            "route here in one go."),
-            "note": ("The page holds no credentials. Every route it calls checks "
-                     "the key itself."),
-        }, 200
-
-    return {"error": "unknown_action", "action": action, "GET": ["status"]}, 404
 
 ```

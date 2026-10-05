@@ -1,2079 +1,925 @@
-# Codebase — part 12 of 45
+# Codebase — part 12 of 47
 
 Contains:
-- `modules/investor.py`
-- `modules/lineage.py`
-- `modules/lineagedesk.py`
-- `modules/machine.py`
-- `modules/map.py`
-- `modules/marquee.py`
+- `modules/humankeys.py`
 
 
-## `modules/investor.py`
+## `modules/humankeys.py`
 
-298 lines, 23897 bytes
+913 lines, 53817 bytes
 
 ```python
 """
-modules/investor.py  v1.3.0
-Serves the investor / partner page at /investor-prospectus.
+modules/humankeys.py  v1.2.0  -  Human Keys: proof a human typed it
 
-Page module, same family as map.py / console.py / network.py: a runtime do_GET
-patch puts the page at a clean URL, armed by hitting /x/investor/status once
-after each deploy. server.py is never edited. Page is base64-embedded.
+    Page:    https://sebbi.pro/keys
+    Check:   https://sebbi.pro/k/<code>
+    Arm:     https://sebbi.pro/x/arm/status
 
-v1.3.0 changes, all wording:
-  * "externally anchored" and "anchored to a clock nobody controls" replaced
-    with per-proof timestamping language. Anchoring is a state each individual
-    proof is in, not a property the chain has, and /x/ots/status is where an
-    investor will look it up in front of you.
-  * the /x/ots/status line now says plainly that submitted is not confirmed.
-  * contact address aligned with ai.txt v2.0.
-Founding seats language is unchanged, deliberately.
+WHAT IT DOES
+------------
+Someone types on the Human Keys page. The page records HOW they type - the
+gaps between keystrokes, the corrections, the thinking pauses, whether
+anything was pasted - and never WHAT they type. The text is fingerprinted
+(SHA-256) on their own device and only the fingerprint is sent.
 
-NOTE: investor-prospectus.html also exists at the repo root. Two investor
-pages on two paths will drift. Decide which one is canonical and delete the
-other.
+The rhythm is scored on the server, the fingerprint and the score are sealed
+into the chain, and they get a short code like HK-7Q2M-X9KD. Anyone can open
+https://sebbi.pro/k/HK-7Q2M-X9KD, paste the text, and see whether it matches
+something a human typed, live, on the date shown.
+
+WHY IT CANNOT BE PREPARED IN ADVANCE
+------------------------------------
+A session starts with a challenge from the server: the latest public beacon
+(drand, sealed by the heartbeat module), the current chain tip and a signed
+server timestamp. The seal must carry that challenge, and the time the server
+saw pass between issuing it and the seal must be at least as long as the
+typing the page reports. A typing session cannot claim to be longer than the
+real time that passed, and cannot have started before a beacon nobody could
+know in advance.
+
+WHAT IT PROVES, PRECISELY
+-------------------------
+That the text was typed into this page by hand, live, with a human typing
+rhythm, and was not pasted or inserted by a program. It cannot see what is
+on the typist's screen, so it does not prove the words were their own; the
+"composition" signals (corrections, thinking pauses) are reported so a
+reader can judge.
+
+OWNERSHIP - SO NOBODY CAN PINCH IT
+----------------------------------
+The first time someone seals, their phone makes its own signing key (ECDSA
+P-256) and keeps it on the device. Every proof is signed with it and the
+public half is sealed with the proof. Later the owner taps "Prove this is
+mine" on the check page; their phone signs a fresh, timestamped message and
+gives them a link. Anyone opening the link sees the signature checked in
+their own browser against the sealed key. Someone who copied the text and
+the code cannot do that.
+
+The private key never comes to sebbi.pro, with one exception the owner
+chooses: they can have a backup code emailed to themselves when the key is
+first made. It passes through to the email and is never stored. The backup
+code restores the key on a new phone from https://sebbi.pro/keys.
+
+PRIVACY
+-------
+The text never leaves the device. The raw keystroke timings are scored and
+thrown away; only summary figures are kept. Nothing identifies the typist.
+
+PRICE
+-----
+50p a month, unlimited proofs - the same as everything else on sebbi.pro.
+The first proof takes 50p from the credit wallet (the same wallet as Monop
+Studio, topped up at https://sebbi.pro/credits) and opens a 30-day pass;
+every proof in those 30 days is free. Checking a proof is free, always.
+Businesses seal with their API key instead - included in the 50p per device
+per month they already pay. POST /x/humankeys/seal with "reference" set to
+the decision block or case.
+
+ROUTES
+------
+  GET  /x/humankeys/status            public
+  GET  /x/humankeys/spec              public
+  GET  /x/humankeys/challenge         public - start a typing session
+  POST /x/humankeys/seal              public with a 50p monthly pass, or API key
+  GET  /x/humankeys/pass?viewer=      public - is this wallet's pass active
+  GET  /x/humankeys/check?code=       public - the sealed record
+  POST /x/humankeys/compare           public - {code, text_hash}: does it match
+  GET  /keys                          the keyboard
+  GET  /k/<code>                      the check page
+  GET  /k/<code>.svg                  a badge for the proof
 """
 
-import base64
-import sys
-
-VERSION = "1.3.0"
-PAGE_PATH = "/investor-prospectus"
-
-_B64 = (
-    "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0i"
-    "dmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLjAiPgo8dGl0bGU+c2ViYmkucHJv"
-    "IOKAlCB0aGUgZXZpZGVuY2UgbGF5ZXIgZm9yIEFJLiBQYXJ0bmVyIG9wcG9ydHVuaXR5LjwvdGl0bGU+CjxtZXRhIG5hbWU9ImRl"
-    "c2NyaXB0aW9uIiBjb250ZW50PSJBIGxpdmUsIHB1YmxpY2x5IHZlcmlmaWFibGUgZXZpZGVuY2UgbGF5ZXIgZm9yIEFJIGRlY2lz"
-    "aW9ucy4gQnVpbHQsIHJ1bm5pbmcsIGFuZCBzdHJ1Y3R1cmFsbHkgaW1wb3NzaWJsZSBmb3IgaW5jdW1iZW50cyB0byBjb3B5LiBT"
-    "ZWVraW5nIG9uZSBvcGVyYXRpbmcgcGFydG5lciB0byB0YWtlIGl0IGludG8gcmVndWxhdGVkIGVudGVycHJpc2UuIj4KPGxpbmsg"
-    "cmVsPSJwcmVjb25uZWN0IiBocmVmPSJodHRwczovL2ZvbnRzLmdvb2dsZWFwaXMuY29tIj4KPGxpbmsgaHJlZj0iaHR0cHM6Ly9m"
-    "b250cy5nb29nbGVhcGlzLmNvbS9jc3MyP2ZhbWlseT1OZXdzcmVhZGVyOm9wc3osd2dodEA2Li43Miw0MDA7Ni4uNzIsNTAwOzYu"
-    "LjcyLDYwMDs2Li43Miw3MDAmZmFtaWx5PUlCTStQbGV4K1NhbnM6d2dodEA0MDA7NTAwOzYwMDs3MDAmZmFtaWx5PUlCTStQbGV4"
-    "K01vbm86d2dodEA0MDA7NTAwOzYwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7CiAgLS1w"
-    "YXBlcjojRkFGQUY2Oy0taW5rOiMxNDE3MUM7LS1pbmstc29mdDojNDU0QjU0Oy0tY2hhaW46IzJFNUU0RTsKICAtLWNoYWluLWxp"
-    "Z2h0OiNFNEVDRTg7LS1nb2xkOiM5QTdCMUY7LS1nb2xkLWxpZ2h0OiNGM0VDRDg7LS1saW5lOiNERURCRDE7Cn0KKntib3gtc2l6"
-    "aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGluZzowfQpib2R5e2ZvbnQtZmFtaWx5OidJQk0gUGxleCBTYW5zJyxzYW5zLXNl"
-    "cmlmO2JhY2tncm91bmQ6dmFyKC0tcGFwZXIpO2NvbG9yOnZhcigtLWluayk7bGluZS1oZWlnaHQ6MS42Oy13ZWJraXQtZm9udC1z"
-    "bW9vdGhpbmc6YW50aWFsaWFzZWR9CmgxLGgyLGgzLC5kaXNwbGF5e2ZvbnQtZmFtaWx5OidOZXdzcmVhZGVyJyxzZXJpZjtmb250"
-    "LXdlaWdodDo1MDA7bGV0dGVyLXNwYWNpbmc6LTAuMDFlbX0KLm1vbm97Zm9udC1mYW1pbHk6J0lCTSBQbGV4IE1vbm8nLG1vbm9z"
-    "cGFjZX0KYXtjb2xvcjp2YXIoLS1jaGFpbil9Ci53cmFwe21heC13aWR0aDo3NjBweDttYXJnaW46MCBhdXRvO3BhZGRpbmc6MCAy"
-    "OHB4fQoKaGVhZGVye3BhZGRpbmc6NTZweCAwIDQwcHg7Ym9yZGVyLWJvdHRvbToxcHggc29saWQgdmFyKC0tbGluZSl9Ci5kb2Mt"
-    "bGFiZWx7Zm9udC1mYW1pbHk6J0lCTSBQbGV4IE1vbm8nLG1vbm9zcGFjZTtmb250LXNpemU6MTFweDtsZXR0ZXItc3BhY2luZzow"
-    "LjFlbTt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7Y29sb3I6dmFyKC0taW5rLXNvZnQpO21hcmdpbi1ib3R0b206MjBweDtkaXNw"
-    "bGF5OmZsZXg7anVzdGlmeS1jb250ZW50OnNwYWNlLWJldHdlZW47ZmxleC13cmFwOndyYXA7Z2FwOjhweH0KaDF7Zm9udC1zaXpl"
-    "OmNsYW1wKDM0cHgsNXZ3LDUwcHgpO2xpbmUtaGVpZ2h0OjEuMDg7bWF4LXdpZHRoOjE3Y2g7bWFyZ2luLWJvdHRvbToxOHB4fQou"
-    "dGFnbGluZXtmb250LXNpemU6MThweDtjb2xvcjp2YXIoLS1pbmstc29mdCk7bWF4LXdpZHRoOjU0Y2h9Ci50YWdsaW5lIGJ7Y29s"
-    "b3I6dmFyKC0taW5rKX0KCi5ibG9ja3twb3NpdGlvbjpyZWxhdGl2ZTtwYWRkaW5nOjhweCAwIDQ0cHggMjRweDtib3JkZXItbGVm"
-    "dDoxcHggc29saWQgdmFyKC0tbGluZSk7bWFyZ2luLWxlZnQ6NHB4fQouYmxvY2s6bGFzdC1vZi10eXBle2JvcmRlci1sZWZ0OjFw"
-    "eCBzb2xpZCB0cmFuc3BhcmVudH0KLmJsb2NrLW51bXtmb250LWZhbWlseTonSUJNIFBsZXggTW9ubycsbW9ub3NwYWNlO2ZvbnQt"
-    "c2l6ZToxMXB4O2NvbG9yOnZhcigtLWNoYWluKTtsZXR0ZXItc3BhY2luZzowLjA4ZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNl"
-    "O21hcmdpbi1ib3R0b206MTBweH0KLmJsb2NrIGgye2ZvbnQtc2l6ZToyN3B4O21hcmdpbi1ib3R0b206MTZweDtsaW5lLWhlaWdo"
-    "dDoxLjE1fQouYmxvY2sgaDN7Zm9udC1zaXplOjE3cHg7bWFyZ2luOjIycHggMCA4cHh9Ci5ibG9jayBwe2ZvbnQtc2l6ZToxNS41"
-    "cHg7Y29sb3I6dmFyKC0taW5rLXNvZnQpO21hcmdpbi1ib3R0b206MTRweDttYXgtd2lkdGg6NjBjaH0KLmJsb2NrIHA6bGFzdC1j"
-    "aGlsZHttYXJnaW4tYm90dG9tOjB9Ci5ibG9jayB1bHttYXJnaW46MCAwIDE0cHggMThweH0KLmJsb2NrIGxpe2ZvbnQtc2l6ZTox"
-    "NXB4O2NvbG9yOnZhcigtLWluay1zb2Z0KTttYXJnaW4tYm90dG9tOjhweDttYXgtd2lkdGg6NThjaH0KLmJsb2NrIGxpIGIsLmJs"
-    "b2NrIHAgYntjb2xvcjp2YXIoLS1pbmspfQoKLnByb29mLWdyaWR7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczox"
-    "ZnIgMWZyO2dhcDoxNHB4O21hcmdpbi10b3A6MThweH0KQG1lZGlhKG1heC13aWR0aDo1NjBweCl7LnByb29mLWdyaWR7Z3JpZC10"
-    "ZW1wbGF0ZS1jb2x1bW5zOjFmcn19Ci5wcm9vZntiYWNrZ3JvdW5kOndoaXRlO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7"
-    "cGFkZGluZzoxOHB4IDIwcHg7Ym9yZGVyLXJhZGl1czo0cHh9Ci5wcm9vZi1ue2ZvbnQtZmFtaWx5OidOZXdzcmVhZGVyJyxzZXJp"
-    "Zjtmb250LXNpemU6MjZweDtmb250LXdlaWdodDo2MDA7Y29sb3I6dmFyKC0tY2hhaW4pfQoucHJvb2YtbHtmb250LXNpemU6MTIu"
-    "NXB4O2NvbG9yOnZhcigtLWluay1zb2Z0KTttYXJnaW4tdG9wOjNweH0KLnByb29mLXNyY3tmb250LWZhbWlseTonSUJNIFBsZXgg"
-    "TW9ubycsbW9ub3NwYWNlO2ZvbnQtc2l6ZToxMHB4O2NvbG9yOiM5OTk7bWFyZ2luLXRvcDo2cHh9CgouY291bnRkb3due2JhY2tn"
-    "cm91bmQ6dmFyKC0tZ29sZC1saWdodCk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDE1NCwxMjMsMzEsMC4yNSk7Ym9yZGVyLXJhZGl1"
-    "czo0cHg7cGFkZGluZzoyMHB4IDI0cHg7bWFyZ2luOjIwcHggMH0KLmNvdW50ZG93bi1sYWJlbHtmb250LWZhbWlseTonSUJNIFBs"
-    "ZXggTW9ubycsbW9ub3NwYWNlO2ZvbnQtc2l6ZToxMXB4O2NvbG9yOnZhcigtLWdvbGQpO3RleHQtdHJhbnNmb3JtOnVwcGVyY2Fz"
-    "ZTtsZXR0ZXItc3BhY2luZzowLjA4ZW07bWFyZ2luLWJvdHRvbTo4cHh9Ci5jb3VudGRvd24tZGF5c3tmb250LWZhbWlseTonTmV3"
-    "c3JlYWRlcicsc2VyaWY7Zm9udC1zaXplOjM4cHg7Zm9udC13ZWlnaHQ6NjAwO2NvbG9yOnZhcigtLWdvbGQpO2xpbmUtaGVpZ2h0"
-    "OjF9Ci5jb3VudGRvd24tc3Vie2ZvbnQtc2l6ZToxM3B4O2NvbG9yOnZhcigtLWluay1zb2Z0KTttYXJnaW4tdG9wOjZweDtsaW5l"
-    "LWhlaWdodDoxLjZ9CgoucHVsbHtib3JkZXItbGVmdDozcHggc29saWQgdmFyKC0tY2hhaW4pO3BhZGRpbmc6NnB4IDAgNnB4IDIw"
-    "cHg7bWFyZ2luOjIwcHggMDtmb250LWZhbWlseTonTmV3c3JlYWRlcicsc2VyaWY7Zm9udC1zaXplOjIycHg7bGluZS1oZWlnaHQ6"
-    "MS4zNTtjb2xvcjp2YXIoLS1pbmspfQoKLmFzay1ib3h7YmFja2dyb3VuZDp2YXIoLS1pbmspO2NvbG9yOnZhcigtLXBhcGVyKTti"
-    "b3JkZXItcmFkaXVzOjRweDtwYWRkaW5nOjMycHg7bWFyZ2luLXRvcDoyMHB4fQouYXNrLWFtb3VudHtmb250LWZhbWlseTonTmV3"
-    "c3JlYWRlcicsc2VyaWY7Zm9udC1zaXplOjQ0cHg7Zm9udC13ZWlnaHQ6NjAwO2NvbG9yOndoaXRlO2xpbmUtaGVpZ2h0OjEuMDV9"
-    "Ci5hc2stbGFiZWx7Zm9udC1mYW1pbHk6J0lCTSBQbGV4IE1vbm8nLG1vbm9zcGFjZTtmb250LXNpemU6MTFweDtsZXR0ZXItc3Bh"
-    "Y2luZzowLjA4ZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOiM4RkE4OUM7bWFyZ2luLWJvdHRvbTo2cHh9Ci5hc2st"
-    "Ym94IHB7Zm9udC1zaXplOjE0LjVweDtjb2xvcjojQzdEMkNDO21hcmdpbi10b3A6MTRweDttYXgtd2lkdGg6NTZjaH0KLmFzay1i"
-    "b3ggcCBie2NvbG9yOiNmZmZ9CgoudXNlLW9mLWZ1bmRze21hcmdpbi10b3A6MjJweDtkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rp"
-    "b246Y29sdW1uO2dhcDoxMHB4fQoudWYtcm93e2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGln"
-    "bi1pdGVtczpiYXNlbGluZTtwYWRkaW5nLWJvdHRvbToxMHB4O2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHJnYmEoMjU1LDI1NSwy"
-    "NTUsMC4xMik7Zm9udC1zaXplOjE0cHg7Z2FwOjE2cHh9Ci51Zi1yb3c6bGFzdC1jaGlsZHtib3JkZXItYm90dG9tOm5vbmV9Ci51"
-    "Zi1yb3cgc3BhbjpmaXJzdC1jaGlsZHtjb2xvcjojQzdEMkNDfQoudWYtcGN0e2ZvbnQtZmFtaWx5OidJQk0gUGxleCBNb25vJyxt"
-    "b25vc3BhY2U7Y29sb3I6IzhGQTg5QztmbGV4OjAgMCBhdXRvfQoKLnZlcmlmeS1ib3h7YmFja2dyb3VuZDp2YXIoLS1jaGFpbi1s"
-    "aWdodCk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDQ2LDk0LDc4LDAuMjUpO2JvcmRlci1yYWRpdXM6NHB4O3BhZGRpbmc6MjBweCAy"
-    "NHB4O21hcmdpbi10b3A6MThweH0KLnZlcmlmeS1ib3ggaDR7Zm9udC1zaXplOjE1cHg7bWFyZ2luLWJvdHRvbToxMHB4fQoudmVy"
-    "aWZ5LWJveCBwe2ZvbnQtc2l6ZToxNHB4O21hcmdpbi1ib3R0b206OHB4fQoudmVyaWZ5LWJveCBjb2Rle2ZvbnQtZmFtaWx5OidJ"
-    "Qk0gUGxleCBNb25vJyxtb25vc3BhY2U7Zm9udC1zaXplOjEyLjVweDtiYWNrZ3JvdW5kOndoaXRlO2JvcmRlcjoxcHggc29saWQg"
-    "dmFyKC0tbGluZSk7cGFkZGluZzoycHggN3B4O2JvcmRlci1yYWRpdXM6M3B4O2NvbG9yOnZhcigtLWNoYWluKX0KCi5jb250YWN0"
-    "LWJsb2Nre3BhZGRpbmc6NDRweCAwIDY0cHh9Ci5jb250YWN0LWNhcmR7YmFja2dyb3VuZDp2YXIoLS1jaGFpbi1saWdodCk7Ym9y"
-    "ZGVyOjFweCBzb2xpZCByZ2JhKDQ2LDk0LDc4LDAuMik7Ym9yZGVyLXJhZGl1czo0cHg7cGFkZGluZzoyOHB4fQouY29udGFjdC1j"
-    "YXJkIGgze2ZvbnQtc2l6ZToyMHB4O21hcmdpbi1ib3R0b206MTBweH0KLmNvbnRhY3QtY2FyZCBwe2ZvbnQtc2l6ZToxNC41cHg7"
-    "Y29sb3I6dmFyKC0taW5rLXNvZnQpO21hcmdpbi1ib3R0b206MTZweH0KLmNvbnRhY3QtbGlua3N7ZGlzcGxheTpmbGV4O2ZsZXgt"
-    "ZGlyZWN0aW9uOmNvbHVtbjtnYXA6NnB4O2ZvbnQtZmFtaWx5OidJQk0gUGxleCBNb25vJyxtb25vc3BhY2U7Zm9udC1zaXplOjE0"
-    "cHh9Ci5jb250YWN0LWxpbmtzIGF7Y29sb3I6dmFyKC0tY2hhaW4pO3RleHQtZGVjb3JhdGlvbjpub25lO2ZvbnQtd2VpZ2h0OjUw"
-    "MH0KCmZvb3RlcntwYWRkaW5nOjAgMCA0OHB4fQpmb290ZXIgcHtmb250LWZhbWlseTonSUJNIFBsZXggTW9ubycsbW9ub3NwYWNl"
-    "O2ZvbnQtc2l6ZToxMXB4O2NvbG9yOiM5OTk7bGluZS1oZWlnaHQ6MS44fQoKQG1lZGlhKHByZWZlcnMtcmVkdWNlZC1tb3Rpb246"
-    "cmVkdWNlKXsqe3RyYW5zaXRpb246bm9uZSFpbXBvcnRhbnQ7YW5pbWF0aW9uOm5vbmUhaW1wb3J0YW50fX0KPC9zdHlsZT4KPC9o"
-    "ZWFkPgo8Ym9keT4KCjxkaXYgY2xhc3M9IndyYXAiPgoKPGhlYWRlcj4KICA8ZGl2IGNsYXNzPSJkb2MtbGFiZWwiPgogICAgPHNw"
-    "YW4+UGFydG5lciBPcHBvcnR1bml0eSAmbWlkZG90OyBzZWJiaS5wcm88L3NwYW4+CiAgICA8c3BhbiBpZD0iZG9jLWRhdGUiPiZt"
-    "ZGFzaDs8L3NwYW4+CiAgPC9kaXY+CiAgPGgxPlRoZSBldmlkZW5jZSBsYXllciBmb3IgQUkgaXMgYnVpbHQsIGxpdmUsIGFuZCBs"
-    "b29raW5nIGZvciBvbmUgcGFydG5lci48L2gxPgogIDxwIGNsYXNzPSJ0YWdsaW5lIj5zZWJiaS5wcm8gaXMgYSBwdWJsaWNseSB2"
-    "ZXJpZmlhYmxlIGV2aWRlbmNlIGxheWVyIGZvciBBSSBkZWNpc2lvbnMgJm1kYXNoOyBydW5uaW5nIGluIHByb2R1Y3Rpb24gdG9k"
-    "YXksIGNoZWNrYWJsZSBieSBhbnlvbmUgd2l0aCB0aGUgY29tcGFueSBzd2l0Y2hlZCBvZmYuIDxiPlRoZSBoYXJkIHBhcnQgaXMg"
-    "ZG9uZS4gV2hhdCdzIGxlZnQgaXMgZGlzdHJpYnV0aW9uLjwvYj48L3A+CjwvaGVhZGVyPgoKPGRpdiBjbGFzcz0iYmxvY2siPgog"
-    "IDxkaXYgY2xhc3M9ImJsb2NrLW51bSI+MDEgJm1kYXNoOyBUaGUgb3Bwb3J0dW5pdHk8L2Rpdj4KICA8aDI+RXZlcnkgQUkgZGVj"
-    "aXNpb24gaXMgYWJvdXQgdG8gbmVlZCBldmlkZW5jZS4gQWxtb3N0IG5vdGhpbmcgcHJvZHVjZXMgaXQuPC9oMj4KICA8cD5UaHJl"
-    "ZSByZWd1bGF0b3J5IHJlZ2ltZXMgYXJlIGNvbnZlcmdpbmcgb24gdGhlIHNhbWUgZGVtYW5kOiByZWNvcmRzIHRoYXQgc3Vydml2"
-    "ZSBzY3J1dGlueS4gVGhlIEVVIEFJIEFjdCwgdGhlIFVLIE9ubGluZSBTYWZldHkgQWN0LCBhbmQgdGhlIDIwMjQgUGF5bWVudCBT"
-    "ZXJ2aWNlcyByZWltYnVyc2VtZW50IHJ1bGVzIGFsbCByZXF1aXJlIGFuIG9yZ2FuaXNhdGlvbiB0byBwcm92ZSB3aGF0IGl0cyBz"
-    "eXN0ZW1zIGRpZCAmbWRhc2g7IG5vdCBhc3NlcnQgaXQsIHByb3ZlIGl0LjwvcD4KICA8cD5BbG1vc3QgZXZlcnkgb3JnYW5pc2F0"
-    "aW9uIG1lZXRzIHRoYXQgZGVtYW5kIHdpdGggZGF0YWJhc2UgbG9ncyB0aGVpciBvd24gdGVhbSBjYW4gZWRpdC4gVGhhdCBpcyBu"
-    "b3QgZXZpZGVuY2UsIGFuZCB0aGUgZGF5IGEgcmVndWxhdG9yLCBjb3VydCBvciBjdXN0b21lciBzdG9wcyB0YWtpbmcgdGhlaXIg"
-    "d29yZCBmb3IgaXQsIHRoZXkgZGlzY292ZXIgdGhlIGdhcC4gPGI+VGhlIG1hcmtldCB0aGF0IGNsb3NlcyB0aGF0IGdhcCBkb2Vz"
-    "IG5vdCByZWFsbHkgZXhpc3QgeWV0LjwvYj4gc2ViYmkucHJvIGlzIGFscmVhZHkgaW4gaXQuPC9wPgoKICA8ZGl2IGNsYXNzPSJw"
-    "dWxsIj5BIGxvZyB5b3UgY2FuIGVkaXQgdGVsbHMgcGVvcGxlIHdoYXQgeW91IGN1cnJlbnRseSBjbGFpbSBoYXBwZW5lZC4gSXQg"
-    "Y2Fubm90IHRlbGwgdGhlbSBub2JvZHkgY2hhbmdlZCBpdCBzaW5jZS4gT25seSBvbmUgb2YgdGhvc2UgaXMgd29ydGggYW55dGhp"
-    "bmcgd2hlbiBpdCBtYXR0ZXJzLjwvZGl2PgoKICA8ZGl2IGNsYXNzPSJjb3VudGRvd24iPgogICAgPGRpdiBjbGFzcz0iY291bnRk"
-    "b3duLWxhYmVsIj5VbnRpbCBoaWdoLXJpc2sgQUkgb2JsaWdhdGlvbnMgYXBwbHk8L2Rpdj4KICAgIDxkaXYgY2xhc3M9ImNvdW50"
-    "ZG93bi1kYXlzIG1vbm8iIGlkPSJjb3VudGRvd24tZGF5cyI+Jm1kYXNoOyBkYXlzPC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJjb3Vu"
-    "dGRvd24tc3ViIj5Db3VudGluZyB0byAyIERlY2VtYmVyIDIwMjcuIFRoZSBldmlkZW5jZSB0aGVzZSBvYmxpZ2F0aW9ucyByZXF1"
-    "aXJlIGlzIGhpc3RvcmljYWwgJm1kYXNoOyBpdCBjYW5ub3QgYmUgY3JlYXRlZCBhZnRlciB0aGUgZmFjdC4gRXZlcnkgb3JnYW5p"
-    "c2F0aW9uIG5vdCByZWNvcmRpbmcgbm93IGlzIGFjY3J1aW5nIGEgZ2FwIGl0IGNhbiBuZXZlciBmaWxsLiBUaGF0IGlzIHRoZSBi"
-    "dXlpbmcgcHJlc3N1cmUsIGFuZCBpdCBvbmx5IGdyb3dzLjwvZGl2PgogIDwvZGl2Pgo8L2Rpdj4KCjxkaXYgY2xhc3M9ImJsb2Nr"
-    "Ij4KICA8ZGl2IGNsYXNzPSJibG9jay1udW0iPjAyICZtZGFzaDsgV2hhdCBpcyBhbHJlYWR5IGJ1aWx0PC9kaXY+CiAgPGgyPkxp"
-    "dmUgaW4gcHJvZHVjdGlvbi4gTm90IGEgZGVjaywgbm90IGEgZGVtby48L2gyPgogIDxwPlRoaXMgcnVucyB0b2RheSwgb24gcmVh"
-    "bCBpbmZyYXN0cnVjdHVyZSwgYW5kIGV2ZXJ5IGNsYWltIGJlbG93IGNhbiBiZSB2ZXJpZmllZCBieSBhIHRoaXJkIHBhcnR5IHdp"
-    "dGggbm8gYWNjb3VudCBhbmQgbm8gcGVybWlzc2lvbi4gU2l4IHByb2R1Y3RzIG9uIG9uZSBlbmdpbmUsIG9uZSB0YW1wZXItZXZp"
-    "ZGVudCBjaGFpbiB1bmRlcm5lYXRoIGFsbCBvZiB0aGVtLjwvcD4KCiAgPGRpdiBjbGFzcz0icHJvb2YtZ3JpZCI+CiAgICA8ZGl2"
-    "IGNsYXNzPSJwcm9vZiI+PGRpdiBjbGFzcz0icHJvb2YtbiBtb25vIj42PC9kaXY+PGRpdiBjbGFzcz0icHJvb2YtbCI+UHJvZHVj"
-    "dHMsIG9uZSBlbmdpbmU8L2Rpdj48ZGl2IGNsYXNzPSJwcm9vZi1zcmMiPkFJTGVhc2gsIEd1YXJkaWFuLCBTZW50aW5lbCwgU29u"
-    "aWNCb29tLCBTZWJkb2csIFRva2VuIFNhdmVyPC9kaXY+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJwcm9vZiI+PGRpdiBjbGFzcz0i"
-    "cHJvb2YtbiBtb25vIj5+MjhtczwvZGl2PjxkaXYgY2xhc3M9InByb29mLWwiPk1lZGlhbiBkZWNpc2lvbiB0aW1lPC9kaXY+PGRp"
-    "diBjbGFzcz0icHJvb2Ytc3JjIj5EZXRlcm1pbmlzdGljLCBvbiBsaXZlIHRyYWZmaWM8L2Rpdj48L2Rpdj4KICAgIDxkaXYgY2xh"
-    "c3M9InByb29mIj48ZGl2IGNsYXNzPSJwcm9vZi1uIG1vbm8iPlNIQS0yNTY8L2Rpdj48ZGl2IGNsYXNzPSJwcm9vZi1sIj5IYXNo"
-    "LWNoYWluZWQsIHRpbWVzdGFtcGVkIHBlciBwcm9vZjwvZGl2PjxkaXYgY2xhc3M9InByb29mLXNyYyI+Q3Jvc3Mtd2l0bmVzc2Vk"
-    "IGJ5IGluZGVwZW5kZW50IHN5c3RlbXM8L2Rpdj48L2Rpdj4KICAgIDxkaXYgY2xhc3M9InByb29mIj48ZGl2IGNsYXNzPSJwcm9v"
-    "Zi1uIG1vbm8iPlB1YmxpYzwvZGl2PjxkaXYgY2xhc3M9InByb29mLWwiPlZlcmlmaWFibGUgd2l0aCB0aGUgdmVuZG9yIHN3aXRj"
-    "aGVkIG9mZjwvZGl2PjxkaXYgY2xhc3M9InByb29mLXNyYyI+U3RhbmRhbG9uZSB2ZXJpZmllciwgbm8gYWNjb3VudDwvZGl2Pjwv"
-    "ZGl2PgogIDwvZGl2PgoKICA8cCBzdHlsZT0ibWFyZ2luLXRvcDoxOHB4Ij5UaGUgd2hvbGUgcmFuZ2Ugc2hhcmVzIG9uZSBzcGlu"
-    "ZTogZXZlcnkgZGVjaXNpb24gc2VhbGVkIGFzIGl0IGhhcHBlbnMsIHN1Ym1pdHRlZCBmb3IgZXh0ZXJuYWwgdGltZXN0YW1waW5n"
-    "IHByb29mIGJ5IHByb29mLCBhbmQgd2l0bmVzc2VkIGhvdXJseSBieSBhbiBpbmRlcGVuZGVudCBwbGF0Zm9ybSAmbWRhc2g7IHVu"
-    "YXR0ZW5kZWQsIHJ1bm5pbmcgbm93LiBBIHJlZ3VsYXRvciwgYW4gYXVkaXRvciBvciBhIGN1c3RvbWVyIGNoZWNrcyBhbnkgb2Yg"
-    "aXQgdGhlbXNlbHZlcy4gVGhhdCBpcyB0aGUgcHJvZHVjdCwgYW5kIGl0IGV4aXN0cy48L3A+CjwvZGl2PgoKPGRpdiBjbGFzcz0i"
-    "YmxvY2siPgogIDxkaXYgY2xhc3M9ImJsb2NrLW51bSI+MDMgJm1kYXNoOyBXaHkgaW5jdW1iZW50cyBjYW4ndCBmb2xsb3c8L2Rp"
-    "dj4KICA8aDI+VGhlIG1vYXQgaXMgc3RydWN0dXJhbCwgbm90IGEgaGVhZCBzdGFydC48L2gyPgogIDxwPkV2ZXJ5IGxvZ2dpbmcs"
-    "IG1vbml0b3JpbmcgYW5kIGF1ZGl0IHBsYXRmb3JtIG9uIHRoZSBtYXJrZXQga2VlcHMgYSByZWNvcmQgaXRzIG93biBjdXN0b21l"
-    "ciBjb250cm9scy4gVGhhdCBpcyBub3QgYSBmbGF3IHRoZXkgY2FuIHBhdGNoICZtZGFzaDsgaXQgaXMgdGhlIGZvdW5kYXRpb24g"
-    "dGhlaXIgYnVzaW5lc3Mgc3RhbmRzIG9uLiBUbyBtYXRjaCBzZWJiaS5wcm8gdGhleSB3b3VsZCBoYXZlIHRvIGdpdmUgdGhlIGN1"
-    "c3RvbWVyIGEgcmVjb3JkIHRoZSBjdXN0b21lciBjYW5ub3QgZWRpdCwgd2hpY2ggYnJlYWtzIHRoZSB0aGluZyB0aGV5IHNlbGwu"
-    "PC9wPgogIDx1bD4KICAgIDxsaT48Yj5UaGV5IGNhbid0IGNvcHkgdGhlIHF1ZXN0aW9uLjwvYj4gIkNhbiB0aGUgcGVvcGxlIGJl"
-    "aW5nIGF1ZGl0ZWQgZWRpdCB0aGUgYXVkaXQ/IiBpbmRpY3RzIHRoZWlyIGVudGlyZSBjYXRlZ29yeS4gVGhleSBhbnN3ZXIgbm8g"
-    "YnkgYWRtaXR0aW5nIHRoZWlyIGV2aWRlbmNlIHdhcyBuZXZlciBldmlkZW5jZS48L2xpPgogICAgPGxpPjxiPlRoZXkgY2FuJ3Qg"
-    "Y29weSB0aGUgdGltZS48L2I+IEFuIHVuYnJva2VuLCBleHRlcm5hbGx5IHdpdG5lc3NlZCByZWNvcmQgaXMgdGhlIG9uZSBpbnB1"
-    "dCBub2JvZHkgY2FuIHNob3J0Y3V0LiBUaGUgb25seSB3YXkgdG8gaGF2ZSBsYXN0IHllYXIgY292ZXJlZCB3YXMgdG8gYmUgcmVj"
-    "b3JkaW5nIGxhc3QgeWVhci48L2xpPgogICAgPGxpPjxiPlRoZXkgY2FuJ3QgY29weSB0aGUgaG9uZXN0eS48L2I+IEV2ZXJ5IGNv"
-    "bXBldGl0b3Igb3ZlcmNsYWltcy4gc2ViYmkucHJvIHB1Ymxpc2hlcyBpdHMgb3duIGxpbWl0cyBvbiBldmVyeSBwYWdlIGFuZCBz"
-    "ZWFscyB0aGVtIGludG8gaXRzIG93biBjaGFpbiAmbWRhc2g7IHdoaWNoIGlzIGV4YWN0bHkgdGhlIHByb3BlcnR5IGEgYnV5ZXIg"
-    "b2YgZXZpZGVuY2UgaW5mcmFzdHJ1Y3R1cmUgaXMgcGF5aW5nIGZvci48L2xpPgogIDwvdWw+CgogIDxkaXYgY2xhc3M9InZlcmlm"
-    "eS1ib3giPgogICAgPGg0PlZlcmlmeSBpdCBiZWZvcmUgeW91IHJlYWQgYW5vdGhlciBsaW5lPC9oND4KICAgIDxwPk5vdGhpbmcg"
-    "aGVyZSBhc2tzIHRvIGJlIGJlbGlldmVkLiA8Y29kZT4veC93aXRuZXNzL3RpcDwvY29kZT4gcmV0dXJucyB0aGUgbGl2ZSBjaGFp"
-    "biB0aXAuIDxjb2RlPi94L290cy9zdGF0dXM8L2NvZGU+IHNob3dzIHRoZSBzdGF0ZSBvZiBlYWNoIGV4dGVybmFsIHRpbWVzdGFt"
-    "cCBwcm9vZiAmbWRhc2g7IHN1Ym1pdHRlZCBpcyBub3QgY29uZmlybWVkLCBhbmQgdGhlIHBhZ2Ugc2F5cyB3aGljaCBpcyB3aGlj"
-    "aC4gPGNvZGU+L3gvcm9zdGVyL2xpc3Q8L2NvZGU+IHNob3dzIHRoZSBpbmRlcGVuZGVudCBwbGF0Zm9ybXMgd2l0bmVzc2luZyBp"
-    "dC48L3A+CiAgICA8cCBzdHlsZT0ibWFyZ2luLWJvdHRvbTowIj5BbGwgcHVibGljLCBhbGwgbmVlZCBubyBhY2NvdW50LCBhbGwg"
-    "YW5zd2VyIHRvIGFueW9uZS4gVGhlIG9mZmxpbmUgdmVyaWZpZXIgcmVhY2hlcyBhIHZlcmRpY3Qgd2l0aCB0aGUgd2lmaSBvZmYu"
-    "PC9wPgogIDwvZGl2Pgo8L2Rpdj4KCjxkaXYgY2xhc3M9ImJsb2NrIj4KICA8ZGl2IGNsYXNzPSJibG9jay1udW0iPjA0ICZtZGFz"
-    "aDsgVGhlIGVjb25vbWljczwvZGl2PgogIDxoMj5aZXJvIG1hcmdpbmFsIGNvc3QuIERpc3RyaWJ1dGlvbiBzY2FsZXMgd2l0aG91"
-    "dCBoZWFkY291bnQuPC9oMj4KICA8cD5UaGUgc2FtZSBlbmdpbmUgc2VydmVzIG9uZSBjdXN0b21lciBvciB0ZW4gdGhvdXNhbmQg"
-    "Jm1kYXNoOyBtYXJnaW5hbCBjb3N0IHBlciBhZGRpdGlvbmFsIGRldmljZSBpcyBlZmZlY3RpdmVseSB6ZXJvLiBUaGF0IG1ha2Vz"
-    "IGRpc3RyaWJ1dGlvbiwgbm90IGVuZ2luZWVyaW5nLCB0aGUgZW50aXJlIGdyb3d0aCBsZXZlciwgYW5kIGl0IG1ha2VzIGEgcmVz"
-    "ZWxsZXIgY2hhbm5lbCBwdXJlIG1hcmdpbiByYXRoZXIgdGhhbiBhIGNvc3QgbGluZS48L3A+CiAgPHA+PGI+NTBwIHBlciBhY3Rp"
-    "dmUgZGV2aWNlIHBlciBtb250aDwvYj4sIG1ldGVyZWQgb24gcmVhbCB1c2FnZS4gUGFydG5lcnMgZW1iZWRkaW5nIHRoZSBwbGF0"
-    "Zm9ybSBzZXQgdGhlaXIgb3duIGN1c3RvbWVyIHByaWNlIGFuZCBrZWVwIGV2ZXJ5dGhpbmcgYWJvdmUgdGhlIHBsYXRmb3JtIGZl"
-    "ZS4gVGhlIHdpdG5lc3MgbmV0d29yayBzdGF5cyBmcmVlIGFuZCBvcGVuIGJ5IGRlc2lnbiAmbWRhc2g7IGl0IGlzIHRoZSBtZWNo"
-    "YW5pc20gdGhhdCBtYWtlcyB0aGUgZXZpZGVuY2UgY3JlZGlibGUsIGFuZCBjaGFyZ2luZyBmb3IgaXQgd291bGQgd2Vha2VuIHRo"
-    "ZSB0aGluZyBiZWluZyBzb2xkLjwvcD4KICA8cD5UaGUgcm91dGUgdG8gbWFya2V0IGlzIHRoZSBwbGF0Zm9ybXMsIG5vdCBvbmUg"
-    "Y3VzdG9tZXIgYXQgYSB0aW1lLiBPdGhlciBjb21wbGlhbmNlIHBsYXRmb3JtcyBhbHJlYWR5IGhvbGQgcmVsYXRpb25zaGlwcyB3"
-    "aXRoIHRoZSBleGFjdCBidXllcnMgd2hvIG5lZWQgdGhpcyBhbmQgYXJlIHVuaWZvcm1seSB3ZWFrIG9uIGV2aWRlbmNlLiBUaGUg"
-    "ZW5naW5lIHNpdHMgdW5kZXJuZWF0aCB0aGVpciBwcm9kdWN0IGFzIHRoZSBldmlkZW5jZSBsYXllciB0aGV5IGNhbid0IGJ1aWxk"
-    "IHRoZW1zZWx2ZXMuIEZpdmUgZm91bmRpbmcgc2VhdHM7IGZvdXIgYWxyZWFkeSB0YWtlbi48L3A+CjwvZGl2PgoKPGRpdiBjbGFz"
-    "cz0iYmxvY2siPgogIDxkaXYgY2xhc3M9ImJsb2NrLW51bSI+MDUgJm1kYXNoOyBUaGUgYXNrPC9kaXY+CiAgPGgyPk9uZSBvcGVy"
-    "YXRpbmcgcGFydG5lci4gMzAlIG9mIHRoZSBidXNpbmVzcy48L2gyPgogIDxkaXYgY2xhc3M9ImFzay1ib3giPgogICAgPGRpdiBj"
-    "bGFzcz0iYXNrLWxhYmVsIj5PZmZlcmVkPC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJhc2stYW1vdW50Ij4zMCUgZm9yIHRoZSByaWdo"
-    "dDxicj5vcGVyYXRpbmcgcGFydG5lcjwvZGl2PgogICAgPHA+QnVpbHQgYW5kIHJ1biBhdCBuZWFyLXplcm8gZml4ZWQgY29zdCwg"
-    "bGl2ZSBhbmQgcHJvdmVuLiBFdmVyeXRoaW5nIHRoZSBoYXJkIG1vbmV5IHVzdWFsbHkgZnVuZHMgaXMgYWxyZWFkeSBkb25lLiBU"
-    "aGUgcGFydG5lciB3aG8gY2FuIG9wZW4gcmVndWxhdGVkIGVudGVycHJpc2UgYW5kIGdvdmVybm1lbnQgJm1kYXNoOyA8Yj5kZWZl"
-    "bmNlLCBoZWFsdGhjYXJlLCB0ZWxlY29tbXVuaWNhdGlvbnM8L2I+ICZtZGFzaDsgdGFrZXMgYSBzdWJzdGFudGlhbCBzdGFrZSBp"
-    "biBhIHBsYXRmb3JtIHRoYXQgaXMgcmVhZHkgdG8gc2NhbGUgdGhlIGRheSB0aGV5IHdhbGsgaW4uPC9wPgogICAgPGRpdiBjbGFz"
-    "cz0idXNlLW9mLWZ1bmRzIj4KICAgICAgPGRpdiBjbGFzcz0idWYtcm93Ij48c3Bhbj5SZWd1bGF0ZWQgZW50ZXJwcmlzZSAmYW1w"
-    "OyBnb3Zlcm5tZW50IGNoYW5uZWwgYWNjZXNzPC9zcGFuPjxzcGFuIGNsYXNzPSJ1Zi1wY3QiPmNvcmU8L3NwYW4+PC9kaXY+CiAg"
-    "ICAgIDxkaXYgY2xhc3M9InVmLXJvdyI+PHNwYW4+UmVzZWxsZXIgLyBNU1AgZGlzdHJpYnV0aW9uIGF0IHNjYWxlPC9zcGFuPjxz"
-    "cGFuIGNsYXNzPSJ1Zi1wY3QiPmNvcmU8L3NwYW4+PC9kaXY+CiAgICAgIDxkaXYgY2xhc3M9InVmLXJvdyI+PHNwYW4+RXh0ZXJu"
-    "YWwgc2VjdXJpdHkgYXVkaXQgJmFtcDsgbGVnYWwgcmV2aWV3IG9mIGNsYWltczwvc3Bhbj48c3BhbiBjbGFzcz0idWYtcGN0Ij5m"
-    "dW5kPC9zcGFuPjwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJ1Zi1yb3ciPjxzcGFuPkluZnJhc3RydWN0dXJlIGhhcmRlbmluZyBm"
-    "b3IgZW50ZXJwcmlzZSBsb2FkPC9zcGFuPjxzcGFuIGNsYXNzPSJ1Zi1wY3QiPmZ1bmQ8L3NwYW4+PC9kaXY+CiAgICA8L2Rpdj4K"
-    "ICA8L2Rpdj4KICA8cCBzdHlsZT0ibWFyZ2luLXRvcDoxNnB4Ij5UaGVzZSBhcmUgc2VjdG9ycyB3aGVyZSBldmlkZW5jZSBvYmxp"
-    "Z2F0aW9ucyBhcmUgaGFyZGVzdCwgcHJvY3VyZW1lbnQgcnVucyBlaWdodGVlbiBtb250aHMsIGFuZCBhIGZvdW5kZXIgYWxvbmUg"
-    "ZG9lcyBub3QgZ2V0IGluIHRoZSByb29tLiBUaGUgZWNvbm9taWNzIHN1aXQgZXhhY3RseSB0aGF0OiBoaWdoLXZhbHVlLCBsb25n"
-    "LWN5Y2xlLCBhbmQgc2VydmVkIGJ5IGFuIGVuZ2luZSB0aGF0IGNvc3RzIG5vdGhpbmcgbW9yZSB0byBydW4gYXQgYSB0aG91c2Fu"
-    "ZCBjdXN0b21lcnMgdGhhbiBhdCBvbmUuPC9wPgo8L2Rpdj4KCjwvZGl2PgoKPGRpdiBjbGFzcz0iY29udGFjdC1ibG9jayB3cmFw"
-    "Ij4KICA8ZGl2IGNsYXNzPSJjb250YWN0LWNhcmQiPgogICAgPGgzPlRhbGsgdG8gdGhlIGZvdW5kZXIgZGlyZWN0bHk8L2gzPgog"
-    "ICAgPHA+VGhlIGZ1bGwgdGVjaG5pY2FsIGRlbW9uc3RyYXRpb24gdGFrZXMgZmlmdGVlbiBtaW51dGVzLCBhbmQgZXZlcnkgY2xh"
-    "aW0gb24gdGhpcyBwYWdlIGNhbiBiZSB2ZXJpZmllZCBsaXZlIGR1cmluZyBpdC48L3A+CiAgICA8ZGl2IGNsYXNzPSJjb250YWN0"
-    "LWxpbmtzIj4KICAgICAgPGEgaHJlZj0ibWFpbHRvOmp1c3RyaWdodGRlY29yYXRvcnNAZ21haWwuY29tIj5qdXN0cmlnaHRkZWNv"
-    "cmF0b3JzQGdtYWlsLmNvbTwvYT4KICAgICAgPGEgaHJlZj0iaHR0cHM6Ly9zZWJiaS5wcm8iPnNlYmJpLnBybzwvYT4KICAgICAg"
-    "PGEgaHJlZj0iaHR0cHM6Ly9zZWJiaS5wcm8vbWFwIj5zZWJiaS5wcm8vbWFwICZtZGFzaDsgdGhlIHN5c3RlbSwgbWFwcGVkPC9h"
-    "PgogICAgICA8YSBocmVmPSJodHRwczovL3NlYmJpLnByby93aGl0ZXBhcGVyIj5zZWJiaS5wcm8vd2hpdGVwYXBlcjwvYT4KICAg"
-    "IDwvZGl2PgogIDwvZGl2Pgo8L2Rpdj4KCjxmb290ZXIgY2xhc3M9IndyYXAiPgogIDxwPkp1c3RpbiBBbnRvbnkgRG9ic29uICZt"
-    "aWRkb3Q7IE1vbm9wIENvbnRlbnQgJm1pZGRvdDsgQmx5dGgsIE5vcnRodW1iZXJsYW5kLCBVSzxicj4KICBUaGlzIGRvY3VtZW50"
-    "IGlzIGEgc3VtbWFyeSBmb3IgaW5mb3JtYXRpb24gYW5kIGRvZXMgbm90IGNvbnN0aXR1dGUgYW4gb2ZmZXIgb2Ygc2VjdXJpdGll"
-    "cy4gQWxsIGZpZ3VyZXMgc2hvdWxkIGJlIGluZGVwZW5kZW50bHkgdmVyaWZpZWQgYmVmb3JlIGFueSBpbnZlc3RtZW50IGRlY2lz"
-    "aW9uLiBSZWd1bGF0b3J5IGRhdGVzIGFyZSBzdGF0ZWQgYXMgYW1lbmRlZCBieSB0aGUgQUkgT21uaWJ1cyBhbmQgYXJlIHN1Ympl"
-    "Y3QgdG8gY2hhbmdlLjwvcD4KPC9mb290ZXI+Cgo8c2NyaXB0PgogIGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdkb2MtZGF0ZScp"
-    "LnRleHRDb250ZW50ID0gbmV3IERhdGUoKS50b0xvY2FsZURhdGVTdHJpbmcoJ2VuLUdCJyx7ZGF5OidudW1lcmljJyxtb250aDon"
-    "bG9uZycseWVhcjonbnVtZXJpYyd9KTsKICB2YXIgZGVhZGxpbmUgPSBuZXcgRGF0ZSgnMjAyNy0xMi0wMlQwMDowMDowMFonKTsK"
-    "ICB2YXIgbm93ID0gbmV3IERhdGUoKTsKICB2YXIgZGF5cyA9IE1hdGgubWF4KDAsIE1hdGguY2VpbCgoZGVhZGxpbmUgLSBub3cp"
-    "IC8gKDEwMDAqNjAqNjAqMjQpKSk7CiAgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2NvdW50ZG93bi1kYXlzJykudGV4dENvbnRl"
-    "bnQgPSBkYXlzLnRvTG9jYWxlU3RyaW5nKCkgKyAnIGRheXMnOwo8L3NjcmlwdD4KCjwvYm9keT4KPC9odG1sPgo="
-)
-
-_HTML = base64.b64decode("".join(_B64.split())).decode("utf-8")
-_patched = False
-
-
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
-
-
-def _install_page(ctx):
-    global _patched
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_investor_patched", False):
-        _patched = True
-        return True
-    original_do_GET = cls.do_GET
-
-    def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
-        if path == PAGE_PATH:
-            body = _HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return original_do_GET(self)
-
-    cls.do_GET = do_GET
-    cls._investor_patched = True
-    _patched = True
-    return True
-
-
-def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    if action == "spec":
-        return ({
-            "module": "investor",
-            "version": VERSION,
-            "serves": PAGE_PATH,
-            "public": [["GET", "status"], ["GET", "spec"]],
-            "note": "Hit /x/investor/status once after each deploy to arm " + PAGE_PATH + ".",
-        }, 200)
-    return ({
-        "module": "investor",
-        "version": VERSION,
-        "serves": PAGE_PATH,
-        "armed": armed,
-        "page_bytes": len(_HTML),
-    }, 200)
-
-
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-```
-
-
-## `modules/lineage.py`
-
-498 lines, 22905 bytes
-
-```python
+import hashlib
+import hmac
+import json
+import math
+import os
 import re
-import sqlite3
+import secrets
+import sys
+import threading
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.4"
+try:
+    from zoneinfo import ZoneInfo
+    _UK = ZoneInfo("Europe/London")
+except Exception:
+    _UK = None
+
+VERSION = "1.2.0"
+PRICE_PENCE = 50
+PASS_DAYS = 30
+CHALLENGE_TTL = 4 * 3600
+MIN_KEYS = 30
+MAX_INTERVALS = 6000
+
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "challenge"), ("POST", "seal"),
+          ("GET", "check"), ("POST", "compare"), ("GET", "pass")}
+
+CODE_RE = re.compile(r"^HK-[A-Z2-9]{4}-[A-Z2-9]{4}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+B64 = re.compile(r"^[A-Za-z0-9+/=_-]{40,400}$")
+EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,24}$")
+VIEWER_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-PUBLIC = {("GET", "trace"), ("GET", "impact"), ("GET", "receipt"),
-          ("GET", "spec"), ("GET", "status"), ("GET", "health")}
-
-OUR_CHAIN_NAME = "aileash"
-DEFAULT_BASE = "https://sebbi.pro"
-
-MAX_INPUTS = 50
-DEFAULT_DEPTH = 3
-MAX_DEPTH = 6
-MAX_NODES = 400
-ROLES = ("input", "model", "data", "policy", "document", "upstream-decision",
-         "supplier", "other")
-ACTIONS = ("status", "health", "spec", "trace", "impact", "receipt", "declare")
-
-_ready = False
+_state = {"ready": False, "page": False, "sealed": 0, "last_error": None}
+_lock = threading.Lock()
+_EPHEMERAL = secrets.token_bytes(32)
 
 
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS lineage_edge("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT,api_key TEXT,"
-                  "child_chain TEXT,child_receipt TEXT,"
-                  "parent_chain TEXT,parent_receipt TEXT,parent_base TEXT,"
-                  "role TEXT,note TEXT,declared REAL,"
-                  "audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_child "
-                  "ON lineage_edge(child_receipt)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lin_parent "
-                  "ON lineage_edge(parent_receipt)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lin_unique "
-                  "ON lineage_edge(child_receipt,parent_chain,parent_receipt)")
-        c.commit()
-    _ready = True
+# ---------------------------------------------------------------------
+# plumbing
+# ---------------------------------------------------------------------
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if not hasattr(m, "get_bearer"):
+        m = sys.modules.get("server")
+    return m
 
 
-def _get_base_url(ctx):
-    if isinstance(ctx, dict):
-        base = ctx.get("base_url") or (ctx.get("config") or {}).get("base_url")
-        if base:
-            return str(base).rstrip("/")
-    return DEFAULT_BASE
+def _secret():
+    s = os.environ.get("HUMANKEYS_SECRET") or os.environ.get("LICENCE_SECRET") or ""
+    return s.encode() if s else _EPHEMERAL
 
 
 def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _clean_chain(value):
-    value = str(value or "").strip().lower()
-    return value[:80] if value else ""
-
-
-def _one(value):
-    if isinstance(value, (list, tuple)):
-        return value[0] if value else ""
-    return value
-
-
-def _depth_arg(data):
-    raw = _one((data or {}).get("depth", DEFAULT_DEPTH))
     try:
-        depth = int(str(raw).strip())
+        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
-        depth = DEFAULT_DEPTH
-    if depth < 1:
-        depth = 1
-    if depth > MAX_DEPTH:
-        depth = MAX_DEPTH
-    return depth
+        return None
 
 
-def _receipt_arg(data):
-    return str(_one((data or {}).get("receipt", ""))).strip().lower()
-
-
-def _exists_locally(ctx, receipt):
-    with ctx["lock"]:
-        row = ctx["conn"].execute(
-            "SELECT 1 FROM audit_log WHERE audit_hash=? LIMIT 1",
-            (receipt,)).fetchone()
-    return bool(row)
-
-
-def _parents(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT parent_chain,parent_receipt,parent_base,role,note,declared,audit_hash "
-            "FROM lineage_edge WHERE child_receipt=? ORDER BY id", (receipt,)).fetchall()
-
-
-def _children(ctx, receipt):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT child_chain,child_receipt,role,declared,audit_hash "
-            "FROM lineage_edge WHERE parent_receipt=? ORDER BY id", (receipt,)).fetchall()
-
-
-def _verification_plan(chain, receipt, base=None, our_base=DEFAULT_BASE):
-    root = (base or our_base).rstrip("/") if chain != OUR_CHAIN_NAME else our_base
-    if chain != OUR_CHAIN_NAME and not base:
-        return {
-            "chain": chain, "receipt": receipt,
-            "status": "external, no address declared",
-            "how_to_check": "Ask that chain's operator for their public witness and consistency "
-                            "routes, or look for their name at %s/x/witness/peers - if we have "
-                            "ever witnessed them, the address we fetched from is recorded "
-                            "there." % our_base,
-        }
-    return {
-        "chain": chain, "receipt": receipt, "base": root,
-        "on_their_chain": "%s/x/consistency/ancestor?tip=%s" % (root, receipt),
-        "nothing_was_omitted": "%s/x/complete/periods" % root,
-        "who_witnesses_them": "%s/x/witness/peers" % root,
-        "did_we_witness_them": "%s/x/witness/attest?peer=%s&tip=%s" % (our_base, chain, receipt),
-        "note": "Run these against their host, not ours. If their answers and ours disagree, "
-                "that disagreement is the finding.",
-    }
-
-
-def _declare(ctx, api_key, data):
-    our_base = _get_base_url(ctx)
-    child = str(_one(data.get("receipt", data.get("child", "")))).strip().lower()
-    if not HEX64.match(child):
-        return {"error": "receipt_required",
-                "message": "The audit hash of the decision whose inputs you are declaring."}, 400
-
-    child_chain = _clean_chain(_one(data.get("chain")) or OUR_CHAIN_NAME)
-    inputs = data.get("inputs")
-    if not isinstance(inputs, list) or not inputs:
-        return {"error": "inputs_required",
-                "message": "A list of what fed this decision. Each entry needs a receipt, and a "
-                           "chain if it came from someone else.",
-                "example": {"receipt": "<64 hex>", "inputs": [
-                    {"chain": "supplier-name", "receipt": "<64 hex>", "role": "data",
-                     "base": "https://supplier.example"}]}}, 400
-    if len(inputs) > MAX_INPUTS:
-        return {"error": "too_many_inputs",
-                "message": "at most %d per declaration" % MAX_INPUTS}, 400
-
-    if child_chain == OUR_CHAIN_NAME and not _exists_locally(ctx, child):
-        return {"error": "unknown_receipt",
-                "message": "That receipt is not in this chain. Declaring inputs for a decision "
-                           "we never sealed would put an unverifiable node in the graph."}, 404
-
-    prepared, pairs = [], set()
-    for item in inputs:
-        if not isinstance(item, dict):
-            return {"error": "bad_input", "message": "each input must be an object"}, 400
-        parent = str(item.get("receipt", "")).strip().lower()
-        if not HEX64.match(parent):
-            return {"error": "bad_input_receipt",
-                    "message": "every input needs a 64 character hex receipt"}, 400
-        parent_chain = _clean_chain(item.get("chain") or OUR_CHAIN_NAME)
-        if parent_chain == child_chain and parent == child:
-            return {"error": "self_reference",
-                    "message": "a decision cannot be its own input"}, 400
-        if (parent_chain, parent) in pairs:
-            return {"error": "duplicate_input",
-                    "message": "the same chain and receipt appears twice in one declaration"}, 400
-        pairs.add((parent_chain, parent))
-        role = str(item.get("role", "input")).strip().lower()
-        if role not in ROLES:
-            role = "other"
-        base = str(item.get("base", item.get("url", "")) or "").strip()[:300]
-        note = str(item.get("note", "") or "").strip()[:200]
-        prepared.append((parent_chain, parent, base, role, note))
-
-    now = time.time()
-    summary = ";".join("%s/%s:%s" % (c, r[:12], role) for c, r, _b, role, _n in prepared)
-    ev = {"user_id": "lin:" + child[:16], "action": "lineage_declared", "amount": 0,
-          "country": "UK", "device_id": "lineage", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "LINEAGE_SEALED", "score": 0, "lineage_version": VERSION,
-           "child_chain": child_chain, "child_receipt": child,
-           "input_count": len(prepared),
-           "detail": "child=%s;inputs=%s" % (child, summary)}
-
+def _uk(ts):
     try:
-        audit_hash, block_index, seq = ctx["seal"](ev, res, now, api_key)
-    except Exception as exc:
-        return {"error": "seal_failed", "message": str(exc),
-                "what_happened": "Nothing was written. The declaration is not recorded and the "
-                                 "identical request can be sent again."}, 500
-    if not audit_hash:
-        return {"error": "seal_failed", "message": "seal returned no audit hash",
-                "what_happened": "Nothing was written. The declaration is not recorded and the "
-                                 "identical request can be sent again."}, 500
+        return datetime.fromtimestamp(float(ts), _UK or timezone.utc).strftime("%d %b %Y, %H:%M %Z")
+    except Exception:
+        return None
 
-    written, duplicates = 0, 0
-    with ctx["lock"]:
-        for parent_chain, parent, base, role, note in prepared:
+
+def _setup():
+    s = _srv()
+    with s._db_lock:
+        s._conn.execute("CREATE TABLE IF NOT EXISTS humankeys_proof("
+                        "code TEXT PRIMARY KEY, text_hash TEXT, verdict TEXT, score REAL,"
+                        "summary_json TEXT, challenge_json TEXT, sealed_at REAL,"
+                        "block_index INTEGER, audit_hash TEXT, payer TEXT, reference TEXT)")
+        s._conn.execute("CREATE INDEX IF NOT EXISTS idx_hk_hash ON humankeys_proof(text_hash)")
+        for col in ("pubkey TEXT", "owner_sig TEXT"):
             try:
-                ctx["conn"].execute(
-                    "INSERT INTO lineage_edge(api_key,child_chain,child_receipt,parent_chain,"
-                    "parent_receipt,parent_base,role,note,declared,audit_hash,block_index) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (api_key, child_chain, child, parent_chain, parent, base or None,
-                     role, note or None, now, audit_hash, block_index))
-                written += 1
-            except sqlite3.IntegrityError:
-                duplicates += 1
-            except Exception as exc:
-                ctx["conn"].rollback()
-                return {"error": "edge_write_failed", "message": str(exc),
-                        "sealed_in_chain": audit_hash, "block_index": block_index,
-                        "what_happened": "The declaration was sealed but the edges were not "
-                                         "stored. The seal stands as a dated record of the "
-                                         "attempt; resend to store the edges."}, 500
-        ctx["conn"].commit()
-
-    return {"child_chain": child_chain, "child_receipt": child,
-            "edges_recorded": written, "already_declared": duplicates,
-            "declared_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block_index, "receipt_seq": seq,
-            "lineage_version": VERSION,
-            "already_declared_means": "Refused by the unique index because this exact child, "
-                                      "chain and parent were declared before. Any other write "
-                                      "failure is an error, not a duplicate.",
-            "what_this_does": "The declaration is now a chain entry. It cannot be removed "
-                              "without breaking every block after it, and it cannot be added "
-                              "later without the timestamp showing when.",
-            "trace": "%s/x/lineage/trace?receipt=%s" % (our_base, child),
-            "portable_receipt": "%s/x/lineage/receipt?receipt=%s" % (our_base, child)}, 200
-
-
-def _walk(ctx, start, depth, upstream):
-    our_base = _get_base_url(ctx)
-    seen = {start}
-    nodes, edges, frontier = [], [], []
-    frontier_keys = set()
-    queue = [(start, 0)]
-    truncated = False
-    node_cap_hit = False
-
-    while queue:
-        receipt, level = queue.pop(0)
-        rows = _parents(ctx, receipt) if upstream else _children(ctx, receipt)
-
-        if level >= depth:
-            if rows:
-                truncated = True
-            continue
-        if len(nodes) >= MAX_NODES:
-            if rows:
-                truncated = True
-                node_cap_hit = True
-            continue
-
-        for row in rows:
-            if upstream:
-                chain, other, base, role, note, declared, sealed = row
-            else:
-                chain, other, role, declared, sealed = row
-                base, note = None, None
-
-            edges.append({
-                "from": other if upstream else receipt,
-                "to": receipt if upstream else other,
-                "role": role, "note": note,
-                "declared_at": _iso(declared),
-                "declaration_sealed_as": sealed,
-                "chain": chain,
-            })
-
-            local = (chain == OUR_CHAIN_NAME) and _exists_locally(ctx, other)
-            if not local:
-                if (chain, other) not in frontier_keys:
-                    frontier_keys.add((chain, other))
-                    frontier.append({"chain": chain, "receipt": other, "depth": level + 1,
-                                     "verify": _verification_plan(chain, other, base, our_base)})
-                continue
-
-            if other in seen:
-                continue
-            seen.add(other)
-            if len(nodes) >= MAX_NODES:
-                truncated = True
-                node_cap_hit = True
-                continue
-            nodes.append({"chain": chain, "receipt": other, "depth": level + 1,
-                          "verify": _verification_plan(chain, other, base, our_base)})
-            queue.append((other, level + 1))
-
-    return nodes, edges, frontier, truncated, node_cap_hit
-
-
-def _truncation_note(truncated, node_cap_hit, depth):
-    if not truncated:
-        return None
-    if node_cap_hit:
-        return ("Stopped at the %d node ceiling. More declared hops exist beyond what is "
-                "listed here." % MAX_NODES)
-    return ("Stopped at depth %d. Nodes at that edge have further declared hops that were not "
-            "followed - raise depth (max %d) to see them." % (depth, MAX_DEPTH))
-
-
-def _trace(ctx, data):
-    receipt = _receipt_arg(data)
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-    our_base = _get_base_url(ctx)
-
-    nodes, edges, frontier, truncated, cap = _walk(ctx, receipt, depth, upstream=True)
-    if not edges:
-        return {"receipt": receipt, "direction": "upstream", "nodes": [], "edges": [],
-                "external_frontier": [], "truncated": False,
-                "lineage_version": VERSION,
-                "what_this_means": "No inputs have been declared for this decision. That is not "
-                                   "the same as it having none - it means nobody said. "
-                                   "Undeclared lineage is where a trail goes dark, and the party "
-                                   "who did not declare is the one to ask.",
-                "self": _verification_plan(OUR_CHAIN_NAME, receipt, our_base=our_base)}, 200
-
-    return {"receipt": receipt, "direction": "upstream", "depth_searched": depth,
-            "nodes": nodes, "edges": edges, "external_frontier": frontier,
-            "truncated": truncated,
-            "truncation_note": _truncation_note(truncated, cap, depth),
-            "lineage_version": VERSION,
-            "self": _verification_plan(OUR_CHAIN_NAME, receipt, our_base=our_base),
-            "how_to_verify_this": "Every node carries the routes to check it on its own chain. "
-                                  "Nothing here asks you to take our word for a hop, including "
-                                  "the hops on our own chain.",
-            "what_an_edge_is": "A sealed, dated claim by the declaring party that these inputs "
-                               "fed that decision. Sealing makes it non-repudiable, not true.",
-            "frontier_note": "External entries are named but not resolved here. Run their "
-                             "verification plans against their own hosts - that is what makes "
-                             "the graph checkable without a shared database."}, 200
-
-
-def _impact(ctx, data):
-    receipt = _receipt_arg(data)
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    depth = _depth_arg(data)
-
-    nodes, edges, frontier, truncated, cap = _walk(ctx, receipt, depth, upstream=False)
-    return {"receipt": receipt, "direction": "downstream", "depth_searched": depth,
-            "affected_decisions": len(nodes), "nodes": nodes, "edges": edges,
-            "external_frontier": frontier, "truncated": truncated,
-            "truncation_note": _truncation_note(truncated, cap, depth),
-            "lineage_version": VERSION,
-            "what_this_is_for": "If this input is retracted, wrong, or overturned, these are the "
-                                "decisions that declared a dependency on it. This is the answer "
-                                "to the first question asked after any upstream failure, and it "
-                                "normally takes weeks of email to assemble incompletely.",
-            "corrective_action": "The list is itself sealed and dated, so the scope of a recall "
-                                 "can be shown to have been determined honestly rather than "
-                                 "narrowed to suit.",
-            "limits": "Only covers dependencies that were declared. A downstream party who "
-                      "declared nothing does not appear - which is a fact about them rather "
-                      "than a gap here."}, 200
-
-
-def _portable_receipt(ctx, data):
-    receipt = _receipt_arg(data)
-    if not HEX64.match(receipt):
-        return {"error": "receipt_required"}, 400
-    if not _exists_locally(ctx, receipt):
-        return {"error": "unknown_receipt",
-                "message": "Not a decision sealed in this chain."}, 404
-
-    our_base = _get_base_url(ctx)
-    rows = _parents(ctx, receipt)
-    inputs = [{"chain": r[0], "receipt": r[1], "role": r[3],
-               "declared_at": _iso(r[5]), "declaration_sealed_as": r[6],
-               "verify": _verification_plan(r[0], r[1], r[2], our_base=our_base)} for r in rows]
-
-    return {
-        "format": "aileash-portable-receipt",
-        "lineage_version": VERSION,
-        "chain": OUR_CHAIN_NAME,
-        "receipt": receipt,
-        "inputs": inputs,
-        "verify_this_decision": {
-            "still_on_our_chain": "%s/x/consistency/ancestor?tip=%s" % (our_base, receipt),
-            "our_log_is_append_only": "%s/x/consistency/proof" % our_base,
-            "nothing_was_left_out": "%s/x/complete/periods" % our_base,
-            "who_witnesses_us": "%s/x/witness/peers" % our_base,
-            "our_current_tip": "%s/x/witness/tip" % our_base,
-            "walk_the_whole_chain": "%s/x/walk/status" % our_base,
-            "the_engine_reproduces": "%s/x/replay/spec" % our_base,
-            "trace_upstream": "%s/x/lineage/trace?receipt=%s" % (our_base, receipt),
-        },
-        "offline_verifier": "aileash_verify.py - one file, no dependencies, no network. Save "
-                            "this document and check it on your own machine, today or in four "
-                            "years.",
-        "what_you_can_establish": [
-            "this decision is in a log that has not been rewritten",
-            "that log is witnessed by parties we do not control",
-            "the period it sits in declared its total before anyone asked",
-            "the same inputs still produce the same verdict",
-            "and what fed it, hop by hop, across every company involved",
-        ],
-        "what_you_cannot": "That the decision was right, or that the inputs were honest. "
-                           "Cryptography establishes what happened and when. It does not "
-                           "establish that what happened was correct, and anybody telling you "
-                           "otherwise is selling something.",
-        "send_this_on": "Attach it to the output it describes. Whoever receives it can verify "
-                        "without an account, without contacting us, and without trusting anyone "
-                        "in the chain including the sender.",
-    }, 200
-
-
-def _status(ctx):
-    our_base = _get_base_url(ctx)
-    with ctx["lock"]:
-        edges = ctx["conn"].execute("SELECT COUNT(*) FROM lineage_edge").fetchone()[0]
-        children = ctx["conn"].execute(
-            "SELECT COUNT(DISTINCT child_receipt) FROM lineage_edge").fetchone()[0]
-        external = ctx["conn"].execute(
-            "SELECT COUNT(DISTINCT parent_chain) FROM lineage_edge "
-            "WHERE parent_chain<>?", (OUR_CHAIN_NAME,)).fetchone()[0]
-    return {"module": "lineage", "lineage_version": VERSION, "ok": True,
-            "edges_declared": edges, "decisions_with_inputs": children,
-            "external_chains_referenced": external,
-            "spec": "%s/x/lineage/spec" % our_base}, 200
-
-
-def _spec(ctx):
-    our_base = _get_base_url(ctx)
-    return {
-        "module": "lineage", "lineage_version": VERSION,
-        "what_it_does": "Records, as sealed chain entries, which decisions fed which other "
-                        "decisions - across companies, without a shared database.",
-        "routes": {
-            "GET %s/x/lineage/status" % our_base: "counts, public",
-            "GET %s/x/lineage/spec" % our_base: "this document, public",
-            "GET %s/x/lineage/trace?receipt=<64hex>&depth=3" % our_base:
-                "what fed this decision, public",
-            "GET %s/x/lineage/impact?receipt=<64hex>&depth=3" % our_base:
-                "what this decision fed, public",
-            "GET %s/x/lineage/receipt?receipt=<64hex>" % our_base:
-                "portable receipt for one decision, public",
-            "POST %s/x/lineage/declare" % our_base:
-                "declare inputs, requires an API key",
-        },
-        "declare_body": {"receipt": "<64 hex>", "chain": "aileash (optional)",
-                         "inputs": [{"chain": "supplier-name", "receipt": "<64 hex>",
-                                     "role": "data", "base": "https://supplier.example",
-                                     "note": "optional, 200 chars"}]},
-        "roles": list(ROLES),
-        "limits": {"inputs_per_declaration": MAX_INPUTS, "default_depth": DEFAULT_DEPTH,
-                   "max_depth": MAX_DEPTH, "max_nodes": MAX_NODES},
-        "what_a_declaration_is": "A sealed, dated claim by the declaring party. Sealing makes it "
-                                 "non-repudiable, not true.",
-        "duplicates": "A repeat of the same child, chain and parent is refused by a unique index "
-                      "and reported as already_declared. Any other write failure is an error.",
-    }, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    method = str(method or "GET").upper()
-    action = str(action or "status").strip().lower().strip("/")
-    data = data if isinstance(data, dict) else {}
-
-    if action in ("", "index"):
-        action = "status"
-
-    if (method, action) not in PUBLIC and not api_key:
-        return {"error": "api_key_required",
-                "message": "Declaring lineage needs a key. Reading it never does."}, 401
-
-    if action in ("status", "health"):
-        return _status(ctx)
-    if action == "spec":
-        return _spec(ctx)
-    if action == "trace":
-        return _trace(ctx, data)
-    if action == "impact":
-        return _impact(ctx, data)
-    if action == "receipt":
-        return _portable_receipt(ctx, data)
-    if action == "declare":
-        if method == "GET":
-            return {"error": "post_required",
-                    "message": "Send this as POST with a JSON body and an API key.",
-                    "spec": "%s/x/lineage/spec" % _get_base_url(ctx)}, 405
-        return _declare(ctx, api_key, data)
-
-    return {"error": "unknown_action", "action": action, "method": method,
-            "known_actions": list(ACTIONS),
-            "spec": "%s/x/lineage/spec" % _get_base_url(ctx)}, 404
-
-```
-
-
-## `modules/lineagedesk.py`
-
-215 lines, 7806 bytes
-
-```python
-"""
-Lineage desk - a keyed page at /lineage-desk.
-
-Exists because lineage declare is POST-with-a-key, and a phone browser address
-bar can send neither. Own _lineagedesk_patched attribute so it composes with
-console.py, packconsole.py, peerconsole.py and binddesk.py.
-
-Arm after every deploy by hitting /x/lineagedesk/status.
-"""
-
-VERSION = "1.0"
-
-PUBLIC = {("GET", "status"), ("GET", "health"), ("GET", "spec")}
-
-_patched = [False]
-
-PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lineage desk</title>
-<style>
-body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#f5f5f5;color:#111}
-h1{font-size:20px;margin:0 0 4px}
-p.sub{margin:0 0 16px;color:#555;font-size:14px}
-label{display:block;margin:12px 0 4px;font-size:14px;font-weight:500}
-input,textarea,select{width:100%;padding:10px;font-size:15px;border:1px solid #ccc;
-border-radius:6px;box-sizing:border-box;font-family:inherit}
-textarea{min-height:90px;font-family:ui-monospace,monospace;font-size:13px}
-button{width:100%;padding:12px;margin-top:12px;font-size:15px;font-weight:500;
-border:0;border-radius:6px;background:#1a1a1a;color:#fff}
-button.alt{background:#fff;color:#1a1a1a;border:1px solid #ccc}
-.row{display:flex;gap:8px}
-.row button{flex:1}
-pre{background:#fff;border:1px solid #ddd;border-radius:6px;padding:12px;
-white-space:pre-wrap;word-break:break-all;font-size:12px;margin-top:16px}
-.card{background:#fff;border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:16px}
-small{color:#666;font-size:12px}
-</style>
-</head>
-<body>
-<h1>Lineage desk</h1>
-<p class="sub">Declare what fed a decision, and read it back.</p>
-
-<div class="card">
-<label>API key</label>
-<input id="key" type="password" placeholder="paste your key" autocomplete="off">
-<small>Kept in this page only. Never sent anywhere but sebbi.pro.</small>
-</div>
-
-<div class="card">
-<label>Decision receipt (the child, 64 hex)</label>
-<input id="child" placeholder="audit hash of the decision" autocomplete="off">
-
-<label>Input chain</label>
-<input id="pchain" placeholder="aileash, mir, supplier-name" value="aileash" autocomplete="off">
-
-<label>Input receipt (the parent, 64 hex)</label>
-<input id="parent" placeholder="audit hash of what fed it" autocomplete="off">
-
-<label>Role</label>
-<select id="role">
-<option>input</option><option>model</option><option>data</option>
-<option>policy</option><option>document</option><option>upstream-decision</option>
-<option>supplier</option><option>other</option>
-</select>
-
-<label>Their base address (optional)</label>
-<input id="pbase" placeholder="https://supplier.example" autocomplete="off">
-
-<label>Note (optional)</label>
-<input id="note" placeholder="200 characters" autocomplete="off">
-
-<button onclick="declareOne()">Declare this input</button>
-</div>
-
-<div class="card">
-<label>Or paste a full declaration body</label>
-<textarea id="raw" placeholder='{"receipt":"...","inputs":[{"chain":"mir","receipt":"..."}]}'></textarea>
-<button class="alt" onclick="declareRaw()">Declare from JSON</button>
-</div>
-
-<div class="card">
-<label>Read it back</label>
-<div class="row">
-<button class="alt" onclick="read('trace')">Trace up</button>
-<button class="alt" onclick="read('impact')">Impact down</button>
-</div>
-<button class="alt" onclick="read('receipt')">Portable receipt</button>
-<button class="alt" onclick="status()">Module status</button>
-</div>
-
-<pre id="out">Ready.</pre>
-
-<script>
-function val(id){return document.getElementById(id).value.trim();}
-function show(o){document.getElementById('out').textContent =
-  typeof o === 'string' ? o : JSON.stringify(o, null, 2);}
-
-function post(body){
-  var k = val('key');
-  if(!k){show('Paste your API key first.');return;}
-  show('Sending...');
-  fetch('/x/lineage/declare', {
-    method:'POST',
-    headers:{'Content-Type':'application/json','Authorization':'Bearer '+k},
-    body:JSON.stringify(body)
-  }).then(function(r){return r.json().then(function(j){
-      return {http:r.status, response:j};});})
-    .then(show).catch(function(e){show('Failed: '+e);});
-}
-
-function declareOne(){
-  var child = val('child'), parent = val('parent');
-  if(child.length !== 64){show('The decision receipt must be 64 hex characters.');return;}
-  if(parent.length !== 64){show('The input receipt must be 64 hex characters.');return;}
-  var item = {chain: val('pchain') || 'aileash', receipt: parent, role: val('role')};
-  if(val('pbase')) item.base = val('pbase');
-  if(val('note')) item.note = val('note');
-  post({receipt: child, inputs: [item]});
-}
-
-function declareRaw(){
-  var t = val('raw');
-  if(!t){show('Nothing to send.');return;}
-  var body;
-  try{body = JSON.parse(t);}catch(e){show('That is not valid JSON: '+e);return;}
-  post(body);
-}
-
-function read(action){
-  var r = val('child');
-  if(r.length !== 64){show('Put a 64 hex receipt in the decision receipt box.');return;}
-  show('Reading...');
-  fetch('/x/lineage/'+action+'?receipt='+encodeURIComponent(r))
-    .then(function(x){return x.json();}).then(show)
-    .catch(function(e){show('Failed: '+e);});
-}
-
-function status(){
-  show('Reading...');
-  fetch('/x/lineage/status').then(function(x){return x.json();})
-    .then(show).catch(function(e){show('Failed: '+e);});
-}
-</script>
-</body>
-</html>"""
-
-
-def _install_page(ctx):
-    if _patched[0]:
-        return "already installed"
-    import sys
-    s = sys.modules.get("__main__")
-    if s is None or not hasattr(s, "get_bearer"):
-        s = sys.modules.get("server")
-    if s is None:
-        return "server not found"
-    H = getattr(s, "Handler", None)
-    if H is None or not hasattr(H, "do_GET"):
-        return "no handler"
-    if getattr(H, "_lineagedesk_patched", False):
-        _patched[0] = True
-        return "already installed"
-
-    original = H.do_GET
-
-    def do_GET(self):
+                s._conn.execute("ALTER TABLE humankeys_proof ADD COLUMN " + col)
+            except Exception:
+                pass
+        s._conn.execute("CREATE TABLE IF NOT EXISTS humankeys_pass("
+                        "viewer TEXT PRIMARY KEY, paid_at REAL, expires REAL, months INTEGER DEFAULT 0)")
+        s._conn.commit()
+
+
+def _arm_credits(ctx):
+    """The wallet lives in modules/credits.py. Make sure its /c/ routes are up."""
+    try:
         try:
-            from urllib.parse import urlparse
-            p = urlparse(self.path).path
+            from modules import credits as C
         except Exception:
-            p = self.path or ""
-        if p.rstrip("/") == "/lineage-desk":
-            body = PAGE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return original(self)
-
-    H.do_GET = do_GET
-    H._lineagedesk_patched = True
-    _patched[0] = True
-    print("LINEAGEDESK: /lineage-desk installed at runtime", flush=True)
-    return "installed"
+            import credits as C
+        C.handle("GET", "status", {}, None, ctx)
+        return True
+    except Exception as e:
+        _state["last_error"] = "credits: %s" % e
+        return False
 
 
-def handle(method, action, data, api_key, ctx):
-    action = str(action or "status").strip().lower().strip("/")
-    result = _install_page(ctx)
-
-    if action in ("", "status", "health", "index"):
-        return {"module": "lineagedesk", "version": VERSION, "ok": True,
-                "page_install": result,
-                "page": "https://sebbi.pro/lineage-desk",
-                "note": "Hit this route after every deploy to arm the page."}, 200
-
-    if action == "spec":
-        return {"module": "lineagedesk", "version": VERSION,
-                "what_it_does": "Serves a keyed page at /lineage-desk so lineage declarations "
-                                "can be made from a phone, where a browser address bar cannot "
-                                "send a POST or an Authorization header.",
-                "page": "https://sebbi.pro/lineage-desk",
-                "arm": "https://sebbi.pro/x/lineagedesk/status",
-                "calls": ["POST /x/lineage/declare",
-                          "GET /x/lineage/trace", "GET /x/lineage/impact",
-                          "GET /x/lineage/receipt", "GET /x/lineage/status"]}, 200
-
-    return {"error": "unknown_action", "action": action,
-            "known_actions": ["status", "spec"]}, 404
-
-```
+def _new_code():
+    raw = secrets.token_bytes(8)
+    chars = "".join(ALPHABET[b % len(ALPHABET)] for b in raw)
+    return "HK-%s-%s" % (chars[:4], chars[4:8])
 
 
-## `modules/machine.py`
+# ---------------------------------------------------------------------
+# challenge
+# ---------------------------------------------------------------------
 
-658 lines, 27386 bytes
-
-```python
-"""
-modules/machine.py  v1.0.3  -  the machine
-
-Ask it in a web address. It goes out to the internet, does the work, and
-answers in data anyone - person or program - can check.
-
-    https://sebbi.pro/x/machine/ask?q=find 35ff59fa
-    https://sebbi.pro/x/machine/ask?q=bitcoin
-    https://sebbi.pro/x/machine/ask?q=verify today
-    https://sebbi.pro/x/machine/ask?q=block 2013
-    https://sebbi.pro/x/machine/ask?q=check openai.com
-    https://sebbi.pro/x/machine/ask?q=archive today
-    https://sebbi.pro/x/machine/ask?q=witness
-    https://sebbi.pro/x/machine/ask?q=walk
-    https://sebbi.pro/x/machine/help
-
-Every command is also its own route (/x/machine/find?sha256=..., etc).
-
-Every answer carries:
-  sources   - each thing it fetched, with the SHA-256 of what came back
-  evidence  - what it computed from that
-  check_it_yourself - how to redo the same work without this machine
-
-The machine reads and checks. It never changes anything. All routes public.
-"""
-
-import base64
-import gzip
-import hashlib
-import ipaddress
-import json
-import re
-import socket
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-
-VERSION = "1.0.3"
-SITE = "https://sebbi.pro"
-BASE = SITE + "/x/machine/"
-UA = "sebbi-machine/1.0.3 (+https://sebbi.pro/x/machine/help)"
-TIMEOUT = 30
-MAX_BYTES = 96 * 1024 * 1024
-EXPLORERS = [
-    ("mempool.space", "https://mempool.space/api"),
-    ("blockstream.info", "https://blockstream.info/api"),
-]
-
-PUBLIC = {("GET", a) for a in (
-    "help", "ask", "find", "verify", "bitcoin", "block", "check",
-    "archive", "witness", "walk", "register", "status", "spec")}
-
-_busy = threading.BoundedSemaphore(3)
-
-
-# ---------------------------------------------------------------- fetching
-
-class _Trail(object):
-    """Every fetch is recorded with the hash of what came back."""
-
-    def __init__(self):
-        self.sources = []
-
-    def get(self, url, max_bytes=MAX_BYTES, accept="application/json"):
-        t0 = time.time()
-        req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                                   "Accept": accept})
-        try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                raw = resp.read(max_bytes + 1)
-                final = resp.geturl()
-        except urllib.error.HTTPError as exc:
-            self.sources.append({"url": url, "result": "HTTP %s" % exc.code})
-            raise
-        except Exception as exc:
-            self.sources.append({"url": url, "result": "unreachable (%s)"
-                                 % exc.__class__.__name__})
-            raise
-        if len(raw) > max_bytes:
-            self.sources.append({"url": url, "result": "too large"})
-            raise ValueError("response too large")
-        compressed = raw[:2] == b"\x1f\x8b"
-        if compressed:
-            # Archives keep a page exactly as it was sent - often zipped.
-            raw = gzip.decompress(raw)
-        self.sources.append({"url": url, "final_url": final,
-                             "was_compressed": compressed,
-                             "bytes": len(raw),
-                             "sha256": hashlib.sha256(raw).hexdigest(),
-                             "ms": int((time.time() - t0) * 1000)})
-        return raw
-
-    def json(self, url, **kw):
-        return json.loads(self.get(url, **kw).decode("utf-8"))
-
-    def text(self, url):
-        return self.get(url, accept="text/plain").decode("utf-8").strip()
-
-
-def _public_https(url):
-    """For addresses a caller supplies: https, port 443, public host only."""
+def _beacon():
+    s = _srv()
+    out = {}
     try:
-        p = urllib.parse.urlsplit(url)
+        with s._db_lock:
+            r = s._conn.execute("SELECT source,beacon_round,value,fetched_at FROM heartbeat_tick "
+                                "ORDER BY id DESC LIMIT 1").fetchone()
+        if r:
+            out = {"source": r[0], "round": r[1], "value": r[2], "fetched_utc": _iso(r[3])}
     except Exception:
-        return False
-    if p.scheme != "https" or p.port not in (None, 443) or not p.hostname:
-        return False
-    if p.username or p.password:
-        return False
+        pass
     try:
-        for info in socket.getaddrinfo(p.hostname, 443,
-                                       proto=socket.IPPROTO_TCP):
-            ip = ipaddress.ip_address(info[4][0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local or
-                    ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-                return False
+        out["chain_tip"] = s.chain_tip()
     except Exception:
-        return False
-    return True
-
-
-def _canonical_sha(obj):
-    return hashlib.sha256(json.dumps(obj, sort_keys=True,
-                                     separators=(",", ":")).encode("utf-8")
-                          ).hexdigest()
-
-
-def _answer(command, answer, evidence, trail, check, ok=True, **extra):
-    out = {"ok": ok, "machine": VERSION, "command": command,
-           "answer": answer, "evidence": evidence,
-           "sources": trail.sources, "check_it_yourself": check,
-           "answered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    out.update(extra)
+        pass
     return out
 
 
-# ---------------------------------------------------------------- the chain
-
-def _recompute(blocks, prev="GENESIS"):
-    problems, public, withheld = [], 0, 0
-    for b in blocks:
-        h = b.get("audit_hash")
-        if "preimage" in b:
-            pre = b["preimage"]
-            if hashlib.sha256(pre.encode("utf-8")).hexdigest() != h:
-                problems.append("block %s does not recompute" % b.get("block_index"))
-            try:
-                stated = json.loads(pre).get("prev_hash")
-            except Exception:
-                stated = None
-            public += 1
-        else:
-            stated = b.get("prev_hash")
-            withheld += 1
-        if stated != prev:
-            problems.append("block %s does not link to the block before it"
-                            % b.get("block_index"))
-        prev = h
-    return {"blocks": len(blocks), "recomputed_from_own_text": public,
-            "linkage_only": withheld, "tip": prev,
-            "problems": problems[:20]}
+def _sign(body):
+    return hmac.new(_secret(), json.dumps(body, sort_keys=True).encode(), hashlib.sha256).hexdigest()
 
 
-def _walk_all(trail):
-    blocks, after = [], 0
-    while True:
-        page = trail.json("%s/x/walk/blocks?after=%d&limit=500" % (SITE, after))
-        blocks.extend(page.get("blocks") or [])
-        if not page.get("has_more"):
-            return blocks
-        nxt = page.get("next_after")
-        if not isinstance(nxt, int) or nxt <= after:
-            raise ValueError("walk paging did not advance")
-        after = nxt
+def _challenge():
+    body = {"issued": round(time.time(), 3), "nonce": secrets.token_hex(12), "beacon": _beacon()}
+    return {"challenge": body, "sig": _sign(body), "expires_in": CHALLENGE_TTL}
 
 
-def cmd_walk(q):
-    t = _Trail()
-    blocks = _walk_all(t)
-    r = _recompute(blocks)
-    ok = not r["problems"]
-    return _answer(
-        "walk",
-        "Walked all %d blocks from genesis to tip and recomputed them: %s."
-        % (r["blocks"], "PASS" if ok else "FAIL"),
-        r, t,
-        ["Fetch https://sebbi.pro/x/walk/blocks?after=0&limit=500 and each "
-         "next page", "For every block with a preimage: SHA-256 it, compare "
-         "with audit_hash, and check its prev_hash is the block before",
-         "Method: https://sebbi.pro/x/walk/spec"], ok=ok)
+def _check_challenge(ch, sig):
+    if not isinstance(ch, dict) or not isinstance(sig, str):
+        return False, "challenge missing"
+    if not hmac.compare_digest(_sign(ch), sig):
+        return False, "challenge not issued by this server"
+    age = time.time() - float(ch.get("issued", 0))
+    if age < 0 or age > CHALLENGE_TTL:
+        return False, "challenge expired - start a new session"
+    return True, age
 
 
-def cmd_block(q):
-    t = _Trail()
-    try:
-        n = int(q.get("n") or q.get("index"))
-    except (TypeError, ValueError):
-        return _answer("block", "Give a block number, e.g. block 2013.", {},
-                       t, [], ok=False)
-    data = t.json("%s/x/walk/block?index=%d" % (SITE, n))
-    b = data.get("block") or {}
-    ev = {"block_index": n, "audit_hash": b.get("audit_hash"),
-          "previous_block_hash": data.get("previous_audit_hash")}
-    if "preimage" in b:
-        pre = b["preimage"]
-        ev["recomputed_hash"] = hashlib.sha256(pre.encode("utf-8")).hexdigest()
-        ev["matches"] = ev["recomputed_hash"] == b.get("audit_hash")
+# ---------------------------------------------------------------------
+# the rhythm
+# ---------------------------------------------------------------------
+
+def score(intervals, counts, server_elapsed):
+    """Score a typing session from its timings alone. Returns (verdict, score, summary)."""
+    iv = []
+    for x in (intervals or [])[:MAX_INTERVALS]:
         try:
-            ev["sealed_text"] = json.loads(pre)
-            ev["links_to_previous"] = (ev["sealed_text"].get("prev_hash") ==
-                                       data.get("previous_audit_hash"))
-        except Exception:
-            pass
-        ans = ("Block %d recomputes from its own sealed text and links to the "
-               "block before it." % n) if ev.get("matches") and \
-            ev.get("links_to_previous") else "Block %d does NOT check out." % n
-        ok = bool(ev.get("matches") and ev.get("links_to_previous"))
-    else:
-        ev["withheld_reason"] = b.get("withheld_reason")
-        ev["links_to_previous"] = b.get("prev_hash") == data.get("previous_audit_hash")
-        ans = ("Block %d is withheld from public view (%s); its link to the "
-               "block before it checks out." % (n, b.get("withheld_reason")))
-        ok = bool(ev["links_to_previous"])
-    return _answer("block", ans, ev, t,
-                   ["Open https://sebbi.pro/x/walk/block?index=%d" % n,
-                    "SHA-256 the preimage text; it must equal audit_hash"],
-                   ok=ok)
+            v = float(x)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= v <= 600000:
+            iv.append(v)
+    c = {k: int(counts.get(k, 0) or 0) for k in
+         ("inserts", "deletes", "multi_inserts", "multi_chars", "paste_events", "paste_chars",
+          "final_length", "blurs", "typed_chars")}
+    typed = max(c["typed_chars"], c["inserts"])
+    claimed_ms = sum(iv)
+    flags = []
 
+    active = [v for v in iv if v <= 2000]
+    pauses = [v for v in iv if v > 2000]
+    n = len(active)
+    mean = sum(active) / n if n else 0
+    sd = math.sqrt(sum((v - mean) ** 2 for v in active) / n) if n else 0
+    cv = (sd / mean) if mean else 0
+    too_fast = sum(1 for v in active if v < 12)
+    minutes = (claimed_ms / 60000.0) if claimed_ms else 0
+    cpm = (typed / minutes) if minutes else 0
+    corr_ratio = (c["deletes"] / float(typed)) if typed else 0
+    paste_share = (c["paste_chars"] / float(c["final_length"])) if c["final_length"] else 0
 
-# ---------------------------------------------------------------- archive files
+    # text that appeared from nowhere: final length far beyond what was typed or pasted
+    accounted = typed + c["multi_chars"] + c["paste_chars"]
+    unaccounted = max(0, c["final_length"] - accounted)
 
-def _manifest(t):
-    return t.json(SITE + "/x/archive/manifest").get("files") or []
-
-
-def _resolve_file(t, ref):
-    """ref: 'today', 'latest', a date, or a fingerprint or its prefix."""
-    files = _manifest(t)
-    ref = (ref or "latest").strip().lower()
-    if ref in ("today", "latest", ""):
-        return files[0] if files else None
-    for f in files:
-        if f.get("date") == ref:
-            return f
-        if len(ref) >= 8 and str(f.get("sha256", "")).startswith(ref):
-            return f
-    return None
-
-
-def _wayback_captures(t, target):
-    """Every capture the Internet Archive holds of an address, newest first.
-    Uses the capture index; falls back to the availability lookup."""
-    try:
-        rows = t.json("https://web.archive.org/cdx/search/cdx?url=" +
-                      urllib.parse.quote(target, safe="") +
-                      "&output=json&filter=statuscode:200&limit=-10")
-        stamps = [r[1] for r in rows[1:] if len(r) > 1]
-        if stamps:
-            return sorted(stamps, reverse=True)
-    except Exception:
-        pass
-    try:
-        avail = t.json("https://archive.org/wayback/available?url=" +
-                       urllib.parse.quote(target, safe=""))
-        snap = (avail.get("archived_snapshots") or {}).get("closest") or {}
-        if snap.get("available"):
-            return [re.sub(r"[^0-9]", "", str(snap.get("timestamp", "")))]
-        return []
-    except Exception:
-        return None
-
-
-def cmd_find(q):
-    """Hunt for copies of an archive file across the internet, and prove
-    each one is the sealed file."""
-    t = _Trail()
-    ref = q.get("sha256") or q.get("ref") or "latest"
-    f = _resolve_file(t, ref)
-    if not f:
-        return _answer("find", "No sealed file matches '%s'." % ref, {}, t,
-                       ["List every sealed file: https://sebbi.pro/x/archive/manifest"],
-                       ok=False)
-    sha = f["sha256"]
-    file_url = "%s/x/archive/file?sha256=%s" % (SITE, sha)
-    copies = []
-
-    # 1. the operator's own server
-    try:
-        body = json.loads(t.get(file_url).decode("utf-8"))
-        got = _canonical_sha(body)
-        copies.append({"where": "sebbi.pro (the operator)", "url": file_url,
-                       "fingerprint": got, "is_the_sealed_file": got == sha})
-    except Exception:
-        copies.append({"where": "sebbi.pro (the operator)", "url": file_url,
-                       "found": False})
-
-    # 2. the Internet Archive - independent, owes nothing to the operator
-    stamps = _wayback_captures(t, file_url)
-    if stamps is None:
-        copies.append({"where": "Internet Archive (independent)",
-                       "found": None, "note": "archive could not be asked"})
-    elif not stamps:
-        copies.append({"where": "Internet Archive (independent)",
-                       "found": False,
-                       "archive_it_now": "https://web.archive.org/save/" + file_url,
-                       "note": "Not archived yet. Opening archive_it_now "
-                               "from any phone or browser makes an "
-                               "independent copy."})
-    else:
-        best = None
-        for stamp in stamps[:3]:
-            raw_url = "https://web.archive.org/web/%sid_/%s" % (stamp, file_url)
-            try:
-                body = json.loads(t.get(raw_url).decode("utf-8"))
-                got = _canonical_sha(body)
-                best = {"where": "Internet Archive (independent)",
-                        "url": "https://web.archive.org/web/%s/%s" % (stamp, file_url),
-                        "raw_copy": raw_url, "captured": stamp,
-                        "fingerprint": got, "is_the_sealed_file": got == sha,
-                        "captures_listed": len(stamps)}
-                if got == sha:
-                    break
-            except Exception:
-                best = best or {"where": "Internet Archive (independent)",
-                                "found": True, "captured": stamp,
-                                "note": "capture listed but could not be read"}
-        copies.append(best)
-
-    # 3. registered holders (custody) - read if the module exists
-    try:
-        holders = t.json(SITE + "/x/custody/holders").get("holders") or []
-        for h in holders:
-            copies.append({"where": h.get("name") or "holder",
-                           "url": h.get("url"),
-                           "fingerprint": h.get("last_fingerprint"),
-                           "is_the_sealed_file": h.get("last_fingerprint") == sha,
-                           "last_verified": h.get("last_verified")})
-    except Exception:
-        pass
-
-    verified = [c for c in copies if c.get("is_the_sealed_file")]
-    independent = [c for c in verified if "operator" not in c["where"]]
-    return _answer(
-        "find",
-        "Found %d verified cop%s of file %s… (%d independent of sebbi.pro)."
-        % (len(verified), "y" if len(verified) == 1 else "ies", sha[:12],
-           len(independent)),
-        {"file": {"date": f.get("date"), "sha256": sha,
-                  "sealed_in_block": f.get("sealed_in_block"),
-                  "check_block": f.get("check_block")},
-         "copies": copies}, t,
-        ["Take any copy's raw bytes, parse the JSON, re-serialise it with "
-         "sorted keys and no spaces, SHA-256 it",
-         "It must equal the fingerprint sealed in block %s" % f.get("sealed_in_block"),
-         "Then run the checker inside the file: python3 -c \"import json,sys;"
-         "exec(json.load(open(sys.argv[1]))['verifier_py'])\" FILE.json"])
-
-
-def cmd_verify(q):
-    """Verify a whole archive file here: fingerprint, every block, every link."""
-    t = _Trail()
-    url = q.get("url")
-    sealed = {f["sha256"]: f for f in _manifest(t)}
-    if url:
-        if not _public_https(url):
-            return _answer("verify", "Only public https addresses are fetched.",
-                           {}, t, [], ok=False)
-        where = url
-    else:
-        f = _resolve_file(t, q.get("sha256") or q.get("ref") or "latest")
-        if not f:
-            return _answer("verify", "No sealed file matches that.", {}, t,
-                           [], ok=False)
-        where = "%s/x/archive/file?sha256=%s" % (SITE, f["sha256"])
-    body = json.loads(t.get(where).decode("utf-8"))
-    fp = _canonical_sha(body)
-    chain = (body.get("chain") or {})
-    r = _recompute(chain.get("blocks") or [])
-    checks = {
-        "fingerprint": fp,
-        "fingerprint_is_sealed": fp in sealed,
-        "sealed_in_block": (sealed.get(fp) or {}).get("sealed_in_block"),
-        "chain": r,
-        "tip_matches_declared": r["tip"] == chain.get("tip"),
-        "genesis_matches_declared": bool(chain.get("blocks")) and
-        chain["blocks"][0].get("audit_hash") == chain.get("genesis_hash"),
-        "previous_file": body.get("previous_file_sha256"),
+    summary = {
+        "keystrokes": typed,
+        "corrections": c["deletes"],
+        "correction_rate": round(corr_ratio, 3),
+        "thinking_pauses": len(pauses),
+        "longest_pause_s": round(max(pauses) / 1000.0, 1) if pauses else 0,
+        "typing_minutes": round(minutes, 2),
+        "chars_per_minute": round(cpm),
+        "rhythm_variation": round(cv, 2),
+        "word_suggestions_used": c["multi_inserts"],
+        "pasted_characters": c["paste_chars"],
+        "pasted_share": round(paste_share, 3),
+        "final_length": c["final_length"],
+        "left_the_page": c["blurs"],
+        "server_seconds": round(server_elapsed, 1),
     }
-    ok = (checks["fingerprint_is_sealed"] and not r["problems"] and
-          checks["tip_matches_declared"] and checks["genesis_matches_declared"])
-    return _answer(
-        "verify",
-        "%s: file %s… is %s, and its %d blocks %s." % (
-            "PASS" if ok else "FAIL", fp[:12],
-            "a sealed file" if checks["fingerprint_is_sealed"] else "NOT a sealed file",
-            r["blocks"], "all check out" if not r["problems"] else "do not all check out"),
-        checks, t,
-        ["The same checks run with nothing from us: the program is inside the "
-         "file. python3 -c \"import json,sys;exec(json.load(open(sys.argv[1]))"
-         "['verifier_py'])\" FILE.json"], ok=ok)
 
+    if server_elapsed + 5 < claimed_ms / 1000.0:
+        return "REFUSED", 0.0, dict(summary, reason="The typing reported is longer than the real time that passed since the session started.")
+    if unaccounted > max(20, 0.05 * c["final_length"]):
+        return "REFUSED", 0.0, dict(summary, reason="Text appeared that was neither typed nor pasted.")
+    if typed + c["multi_inserts"] < MIN_KEYS:
+        return "TOO_SHORT", 0.0, dict(summary, reason="Type at least %d characters for a proof." % MIN_KEYS)
 
-def cmd_archive(q):
-    """Ask the Internet Archive to take an independent copy, and hand back
-    a one-tap link that works from any phone if it refuses a server."""
-    t = _Trail()
-    what = (q.get("what") or "today").strip().lower()
-    if what in ("today", "latest", "file"):
-        f = _resolve_file(t, "latest")
-        target = "%s/x/archive/file?sha256=%s" % (SITE, f["sha256"]) if f else None
-    elif what.startswith("block"):
-        n = re.sub(r"[^0-9]", "", what)
-        target = "%s/x/walk/block?index=%s" % (SITE, n) if n else None
-    elif what in ("chain", "genesis"):
-        target = SITE + "/x/walk/genesis"
-    elif what in ("register", "ratings"):
-        target = SITE + "/x/integrity/register"
+    s = 1.0
+    if cv < 0.18:
+        flags.append("rhythm is unnaturally even, like a program")
+        s -= 0.6
+    elif cv < 0.3:
+        flags.append("rhythm is very even")
+        s -= 0.2
+    if cpm > 1100 and c["multi_inserts"] < typed / 20:
+        flags.append("faster than human typing")
+        s -= 0.5
+    if n and too_fast / float(n) > 0.15:
+        flags.append("many keystrokes closer together than fingers can manage")
+        s -= 0.4
+    if typed >= 200 and c["deletes"] == 0 and not pauses:
+        flags.append("no corrections and no pauses over a long text - steady copying")
+        s -= 0.15
+    s = max(0.0, min(1.0, s))
+
+    composing = 0
+    if corr_ratio >= 0.02:
+        composing += 1
+    if len(pauses) >= max(1, typed // 250):
+        composing += 1
+    if cv >= 0.6:
+        composing += 1
+    summary["composition_signals"] = ["weak", "some", "clear", "strong"][composing]
+    summary["flags"] = flags
+
+    if s < 0.45:
+        verdict = "MECHANICAL"
+    elif paste_share > 0.02 or c["paste_events"] > 0:
+        verdict = "HUMAN_TYPED_PART_PASTED"
     else:
-        target = None
-    if not target:
-        return _answer("archive", "Say what to archive: today, block 2013, "
-                       "genesis or register.", {}, t, [], ok=False)
-    tap = "https://web.archive.org/save/" + target
-    result = None
+        verdict = "HUMAN_TYPED"
+    return verdict, round(s, 2), summary
+
+
+VERDICT_TEXT = {
+    "HUMAN_TYPED": "Typed by a human, live. Nothing pasted.",
+    "HUMAN_TYPED_PART_PASTED": "Typed by a human, live - but part of it was pasted in.",
+    "MECHANICAL": "The rhythm does not look like a human typing.",
+}
+
+
+# ---------------------------------------------------------------------
+# sealing and payment
+# ---------------------------------------------------------------------
+
+def _pass(viewer):
+    """(active, expires) for a wallet's monthly pass."""
+    s = _srv()
+    with s._db_lock:
+        r = s._conn.execute("SELECT expires FROM humankeys_pass WHERE viewer=?", (viewer,)).fetchone()
+    if r and r[0] > time.time():
+        return True, r[0]
+    return False, (r[0] if r else None)
+
+
+def _balance(viewer):
+    s = _srv()
+    with s._db_lock:
+        try:
+            r = s._conn.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()
+            return r[0] if r else 0
+        except Exception:
+            return 0
+
+
+def _buy_pass(viewer):
+    """Take 50p and open a 30-day pass. Returns (ok, expires, balance)."""
+    s = _srv()
+    now = time.time()
+    with s._db_lock:
+        try:
+            cur = s._conn.execute("UPDATE credit_viewer SET balance=balance-?, spent=spent+? "
+                                  "WHERE id=? AND balance>=?", (PRICE_PENCE, PRICE_PENCE, viewer, PRICE_PENCE))
+            ok = cur.rowcount == 1
+        except Exception:
+            ok = False
+        if ok:
+            exp = now + PASS_DAYS * 86400
+            s._conn.execute("INSERT INTO humankeys_pass(viewer,paid_at,expires,months) VALUES(?,?,?,1) "
+                            "ON CONFLICT(viewer) DO UPDATE SET paid_at=excluded.paid_at, "
+                            "expires=excluded.expires, months=months+1", (viewer, now, exp))
+        s._conn.commit()
+    bal = _balance(viewer)
+    if not ok:
+        return False, None, bal
     try:
-        t.get(tap, accept="*/*", max_bytes=4 * 1024 * 1024)
-        result = "the archive accepted the request from this server"
-    except Exception:
-        result = ("the archive turned this server away, as it often does "
-                  "with cloud servers - the one-tap link below works from "
-                  "any phone or browser")
-    return _answer(
-        "archive",
-        "Archive request for %s: %s." % (target, result),
-        {"target": target, "one_tap_archive": tap,
-         "then_find_it": BASE + "find?ref=latest"}, t,
-        ["Open one_tap_archive on your own device", "Then ask the machine to "
-         "find it: https://sebbi.pro/x/machine/ask?q=find today"])
+        ev = {"user_id": "humankeys", "action": "monthly_pass", "amount": 0, "country": "UK",
+              "device_id": "humankeys", "anomaly": 0, "device_risk": 0}
+        s.seal(ev, {"decision": "PASS_PURCHASED", "score": 0, "version": VERSION, "timestamp": now,
+                    "price_pence": PRICE_PENCE, "days": PASS_DAYS,
+                    "wallet": hashlib.sha256(viewer.encode()).hexdigest()[:16]}, now)
+    except Exception as e:
+        _state["last_error"] = "pass seal: %s" % e
+    return True, now + PASS_DAYS * 86400, bal
 
 
-# ---------------------------------------------------------------- bitcoin
+def _refund_pass(viewer):
+    s = _srv()
+    with s._db_lock:
+        s._conn.execute("UPDATE credit_viewer SET balance=balance+?, spent=spent-? WHERE id=?",
+                        (PRICE_PENCE, PRICE_PENCE, viewer))
+        s._conn.execute("UPDATE humankeys_pass SET expires=paid_at WHERE viewer=?", (viewer,))
+        s._conn.commit()
 
-def cmd_bitcoin(q):
-    """Follow the chain's anchor all the way into Bitcoin, and check it
-    against two independent Bitcoin explorers."""
-    t = _Trail()
-    a = t.json(SITE + "/x/ots/latest_confirmed")
-    if not a.get("ok"):
-        return _answer("bitcoin", "No confirmed Bitcoin proof yet.", a, t, [],
-                       ok=False)
-    tip = str(a.get("tip") or "").lower()
-    ev = {"chain_tip": tip, "tip_is_block": a.get("tip_is_block"),
-          "stamp_id": a.get("stamp_id")}
-    attest = []
+
+def _seal(data, api_key):
+    s = _srv()
+    data = data or {}
+    text_hash = str(data.get("text_hash", "")).strip().lower()
+    if not HEX64.match(text_hash):
+        return {"error": "text_hash must be the SHA-256 of the text"}, 400
+    ok, info = _check_challenge(data.get("challenge"), data.get("sig"))
+    if not ok:
+        return {"error": "bad_challenge", "message": info}, 400
+    elapsed = info
+    counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
+    verdict, sc, summary = score(data.get("intervals") or [], counts, elapsed)
+    if verdict in ("REFUSED", "TOO_SHORT"):
+        return {"sealed": False, "verdict": verdict, "message": summary.get("reason"), "summary": summary}, 422
+
+    reference = str(data.get("reference", ""))[:120] or None
+    pubkey = str(data.get("pubkey", "") or "").strip()
+    owner_sig = str(data.get("owner_sig", "") or "").strip()
+    if not (B64.match(pubkey) and B64.match(owner_sig)):
+        pubkey, owner_sig = None, None
+    viewer = str(data.get("viewer", "")).strip()
+    expires = None
+    if api_key and s.get_key(api_key):
+        payer = "key:" + hashlib.sha256(api_key.encode()).hexdigest()[:16]
+        paid = None
+        balance = None
+    else:
+        if not VIEWER_RE.match(viewer):
+            return {"error": "wallet_needed", "message": "Top up once at https://sebbi.pro/credits",
+                    "price_pence": PRICE_PENCE}, 402
+        active, expires = _pass(viewer)
+        if active:
+            paid, balance = False, _balance(viewer)
+        else:
+            paid, expires, balance = _buy_pass(viewer)
+            if not paid:
+                return {"sealed": False, "reason": "pass_needed", "price_pence": PRICE_PENCE,
+                        "balance_pence": balance, "topup": "https://sebbi.pro/credits",
+                        "message": "Human Keys is 50p a month for unlimited proofs. Top up and seal straight away."}, 402
+        payer = "credit:" + hashlib.sha256(viewer.encode()).hexdigest()[:16]
+
+    code = _new_code()
+    ch = data.get("challenge")
+    ts = time.time()
+    event = {"user_id": "humankeys", "action": "human_typed", "amount": 0, "country": "UK",
+             "device_id": "humankeys", "anomaly": 0, "device_risk": 0}
+    result = {"decision": verdict, "score": sc, "version": VERSION, "timestamp": ts,
+              "code": code, "text_hash": text_hash, "summary": summary,
+              "session_started_utc": _iso(ch.get("issued")),
+              "beacon": (ch.get("beacon") or {}).get("round"),
+              "beacon_value": (ch.get("beacon") or {}).get("value"),
+              "chain_tip_at_start": (ch.get("beacon") or {}).get("chain_tip"),
+              "reference": reference, "pass_purchased": bool(paid),
+              "owner_key": pubkey,
+              "owner_key_fingerprint": hashlib.sha256(pubkey.encode()).hexdigest()[:16] if pubkey else None,
+              "owner_signature": owner_sig}
     try:
-        from opentimestamps.core.serialize import BytesDeserializationContext
-        from opentimestamps.core.timestamp import DetachedTimestampFile
-        from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
-        det = DetachedTimestampFile.deserialize(BytesDeserializationContext(
-            base64.b64decode(a["ots_base64"])))
-        tb = bytes.fromhex(tip)
-        forms = {
-            "sha256 of the tip's bytes": hashlib.sha256(tb).digest(),
-            "the tip's bytes directly": tb,
-            "sha256 of the tip as text": hashlib.sha256(tip.encode("ascii")).digest(),
-            "sha256 of the tip as a line of text":
-                hashlib.sha256((tip + "\n").encode("ascii")).digest(),
-        }
-        match = [name for name, d in forms.items() if det.file_digest == d]
-        ev["proof_is_for_this_tip"] = bool(match)
-        ev["proof_commits_to"] = match[0] if match else None
-        for msg, att in det.timestamp.all_attestations():
-            if isinstance(att, BitcoinBlockHeaderAttestation):
-                attest.append((att.height, msg[::-1].hex()))
-    except ImportError:
-        ev["note"] = "proof reader not installed on this server"
-    except Exception as exc:
-        ev["note"] = "proof could not be read: %s" % exc.__class__.__name__
-    if not attest:
-        heights = a.get("bitcoin_block_heights") or []
-        attest = [(h, None) for h in heights]
-    results = []
-    for height, expected_root in attest[:2]:
-        row = {"bitcoin_block": height,
-               "proof_computes_merkle_root": expected_root, "explorers": []}
-        for name, api in EXPLORERS:
-            try:
-                bh = t.text("%s/block-height/%d" % (api, height))
-                blk = t.json("%s/block/%s" % (api, bh))
-                row["explorers"].append({
-                    "explorer": name, "block_hash": bh,
-                    "merkle_root": blk.get("merkle_root"),
-                    "time": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                          time.gmtime(blk.get("timestamp", 0))),
-                    "matches_proof": (expected_root is not None and
-                                      blk.get("merkle_root") == expected_root)})
-            except Exception:
-                row["explorers"].append({"explorer": name,
-                                         "result": "unreachable"})
-        roots = set(e.get("merkle_root") for e in row["explorers"]
-                    if e.get("merkle_root"))
-        row["explorers_agree"] = len(roots) == 1
-        row["proof_lands_on_block"] = bool(expected_root) and \
-            roots == {expected_root}
-        results.append(row)
-    ev["bitcoin"] = results
-    ok = bool(results) and all(r.get("proof_lands_on_block") for r in results) \
-        and ev.get("proof_is_for_this_tip", False)
-    first = results[0] if results else {}
-    when = next((e.get("time") for e in first.get("explorers", [])
-                 if e.get("time")), None)
-    return _answer(
-        "bitcoin",
-        ("The chain tip at block %s is committed in Bitcoin block %s (%s). "
-         "The proof lands exactly on that block's merkle root, and two "
-         "independent explorers agree on it." % (
-             a.get("tip_is_block"), first.get("bitcoin_block"), when))
-        if ok else "The Bitcoin proof could not be fully confirmed; see evidence.",
-        ev, t,
-        ["Download the proof: https://sebbi.pro/x/ots/latest_confirmed "
-         "(ots_base64)", "Run: ots verify, which checks the same merkle root "
-         "against your own Bitcoin node",
-         "Or open the block on mempool.space and blockstream.info and compare "
-         "its merkle root with proof_computes_merkle_root"], ok=ok)
+        out = s.seal(event, result, ts)
+        h, idx = out[0], out[1]
+    except Exception as e:
+        if paid:
+            _refund_pass(viewer)
+        return {"error": "seal_failed", "detail": str(e)[:160]}, 500
+    with s._db_lock:
+        s._conn.execute("INSERT INTO humankeys_proof(code,text_hash,verdict,score,summary_json,"
+                        "challenge_json,sealed_at,block_index,audit_hash,payer,reference,pubkey,owner_sig) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (code, text_hash, verdict, sc, json.dumps(summary), json.dumps(ch), ts,
+                         idx, h, payer, reference, pubkey, owner_sig))
+        s._conn.commit()
+    _state["sealed"] += 1
+    out = {"sealed": True, "code": code, "verdict": verdict, "verdict_text": VERDICT_TEXT.get(verdict),
+           "score": sc, "summary": summary, "block_index": idx, "audit_hash": h,
+           "sealed_uk": _uk(ts), "check": "https://sebbi.pro/k/" + code,
+           "badge": "https://sebbi.pro/k/%s.svg" % code}
+    if balance is not None:
+        out["balance_pence"] = balance
+    if expires:
+        out["pass_until_uk"] = _uk(expires)
+        out["pass_purchased_now"] = bool(paid)
+    out["owner_signed"] = bool(pubkey)
+    email = str(data.get("backup_email", "") or "").strip()
+    backup = str(data.get("backup_code", "") or "").strip()
+    if pubkey and email and backup and EMAIL_RE.match(email) and re.match(r"^[A-Za-z0-9_-]{100,600}$", backup):
+        threading.Thread(target=_email_backup, args=(email, backup, code), daemon=True).start()
+        out["backup_emailed"] = True
+    return out, 200
 
 
-# ---------------------------------------------------------------- others
-
-def cmd_check(q):
-    t = _Trail()
-    d = (q.get("domain") or "").strip().lower()
-    if not d:
-        return _answer("check", "Give a domain, e.g. check openai.com.", {}, t,
-                       [], ok=False)
-    r = t.json(SITE + "/x/integrity/check?domain=" + urllib.parse.quote(d))
-    return _answer(
-        "check", "%s verifies as %s (%s)." % (d, r.get("verified_level"),
-                                              r.get("badge")),
-        {k: r.get(k) for k in ("domain", "verified_level", "badge",
-                               "claimed_level", "overclaimed", "verdict",
-                               "request_sealed", "verdict_sealed")}, t,
-        ["Full result: https://sebbi.pro/x/integrity/check?domain=" + d,
-         "The verdict is sealed in the block shown; recompute it with "
-         "https://sebbi.pro/x/machine/ask?q=block <number>"])
-
-
-def cmd_witness(q):
-    t = _Trail()
-    held = t.json("https://mir.events/v1/transparency/held/tips?peer=sebbi")
-    tips = [e.get("peer_tip") for e in (held.get("tips") or []) if e.get("peer_tip")]
-    found = []
-    blocks = _walk_all(t)
-    index = {b["audit_hash"]: b.get("block_index") for b in blocks}
-    for tip in tips:
-        if tip in index:
-            found.append(index[tip])
-    return _answer(
-        "witness",
-        "MIR, an independent chain, holds %d of sebbi.pro's tips; %d are "
-        "blocks in the chain as served today." % (len(tips), len(found)),
-        {"witness": "MIR (MIRegistry)", "tips_held": len(tips),
-         "matched_blocks": sorted(found)[-20:]}, t,
-        ["Fetch https://mir.events/v1/transparency/held/tips?peer=sebbi",
-         "Look each peer_tip up in the walk; every match is a block MIR holds"])
-
-
-def cmd_register(q):
-    t = _Trail()
-    r = t.json(SITE + "/x/integrity/register")
-    rows = [{"domain": e.get("domain"), "level": e.get("verified_level"),
-             "badge": e.get("badge"), "sealed_in_block": e.get("sealed_in_block")}
-            for e in r.get("entries") or []]
-    return _answer("register", "%d domains rated; every rating is sealed."
-                   % len(rows), {"entries": rows}, t,
-                   ["Recompute any rating's block: "
-                    "https://sebbi.pro/x/machine/ask?q=block <number>"])
-
-
-def cmd_help(q):
-    ex = lambda s: BASE + "ask?q=" + urllib.parse.quote(s)
-    return {"ok": True, "machine": VERSION,
-            "what": "Ask in a web address. The machine goes out to the "
-                    "internet, does the work, and answers with its sources "
-                    "and a way to check the answer without it.",
-            "commands": {
-                "find <fingerprint|today|date>": ex("find today"),
-                "verify <fingerprint|today>": ex("verify today"),
-                "bitcoin": ex("bitcoin"),
-                "block <number>": ex("block 2013"),
-                "walk": ex("walk"),
-                "check <domain>": ex("check openai.com"),
-                "witness": ex("witness"),
-                "archive <today|block N|genesis|register>": ex("archive today"),
-                "register": ex("register"),
-            },
-            "rule": "The machine reads and checks. It never changes anything."}
-
-
-COMMANDS = {"find": cmd_find, "verify": cmd_verify, "bitcoin": cmd_bitcoin,
-            "block": cmd_block, "walk": cmd_walk, "check": cmd_check,
-            "witness": cmd_witness, "archive": cmd_archive,
-            "register": cmd_register, "help": cmd_help}
-
-
-def _parse(text):
-    text = str(text or "").strip()
-    # Clean copy-pasted Markdown link syntax or attached URLs
-    text = re.sub(r'\]?https?://\S+', '', text).strip()
-    text = re.sub(r'^[\[\(\s]+|[\]\)\s]+$', '', text)
-
-    words = text.split()
-    if not words:
-        return "help", {}
-    cmd = words[0].lower()
-    arg = " ".join(words[1:]).strip()
-    q = {}
-    if cmd in ("find", "verify"):
-        q["ref"] = arg or "latest"
-    elif cmd == "block":
-        q["n"] = arg
-    elif cmd == "check":
-        q["domain"] = arg
-    elif cmd == "archive":
-        q["what"] = arg or "today"
-    return cmd, q
-
-
-def handle(method, action, data, api_key, ctx):
-    q = {}
-    for k, v in (data or {}).items():
-        q[k] = v[0] if isinstance(v, list) and v else v
-    action = action or "help"
-    if action == "ask":
-        action, parsed = _parse(q.get("q"))
-        q.update(parsed)
-    if action in ("status", "spec"):
-        action = "help"
-    fn = COMMANDS.get(action)
-    if not fn:
-        out = cmd_help(q)
-        out.update({"ok": False, "error": "unknown command: %s" % action})
-        return out, 404
-    if action == "help":
-        return fn(q), 200
-    if not _busy.acquire(timeout=20):
-        return {"ok": False, "error": "busy",
-                "detail": "Three commands are running. Try again shortly."}, 429
+def _email_backup(email, backup, code):
+    """Send the owner their backup code. Passed through, never stored."""
     try:
-        out = fn(q)
-        return out, 200
-    except Exception as exc:
-        return {"ok": False, "command": action,
-                "error": "%s: %s" % (exc.__class__.__name__, str(exc)[:200])}, 502
-    finally:
-        _busy.release()
-
-```
-
-
-## `modules/map.py`
-
-238 lines, 17926 bytes
-
-```python
-"""
-modules/map.py  v1.0.0
-Serves the layer-map page at /map.
-
-Page module, same family as investor.py / console.py / network.py: a runtime
-do_GET patch puts a full HTML page at a clean URL. Armed by hitting
-/x/map/status once after each deploy. server.py is never edited. The page is
-base64-embedded so no character in the HTML can break the Python string.
-"""
-
-import base64
-import sys
-
-VERSION = "1.0.0"
-PAGE_PATH = "/map"
-
-_B64 = (
-    "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0i"
-    "dmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLCB2aWV3cG9ydC1maXQ9Y292ZXIi"
-    "Pgo8dGl0bGU+V2hlcmUgc2ViYmkucHJvIHNpdHMg4oCUIHRoZSBsYXllciBtYXA8L3RpdGxlPgo8bWV0YSBuYW1lPSJkZXNjcmlw"
-    "dGlvbiIgY29udGVudD0iQSBiaXJkJ3MtZXllIG1hcCBvZiB0aGUgc3RhY2suIE1vbml0b3Jpbmcgd2F0Y2hlcyBmcm9tIHRoZSBz"
-    "aWRlLCBhZnRlciB0aGUgZmFjdC4gQXV0b25vbW91cyBkZWNpc2lvbnMgY2FuJ3QgYmUgcHJvdmVuIGZyb20gdGhhdCBsYXllci4g"
-    "c2ViYmkucHJvIHNpdHMgdW5kZXJuZWF0aCB0aGUgZGVjaXNpb24sIHNlYWxpbmcgaXQgYXMgaXQgaGFwcGVucy4iPgo8bGluayBy"
-    "ZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBpcy5jb20iPgo8bGluayBocmVmPSJodHRwczovL2Zv"
-    "bnRzLmdvb2dsZWFwaXMuY29tL2NzczI/ZmFtaWx5PU5ld3NyZWFkZXI6b3Bzeix3Z2h0QDYuLjcyLDQwMDs2Li43Miw1MDA7Ni4u"
-    "NzIsNjAwJmZhbWlseT1JQk0rUGxleCtTYW5zOndnaHRANDAwOzUwMDs2MDA7NzAwJmZhbWlseT1JQk0rUGxleCtNb25vOndnaHRA"
-    "NDAwOzUwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7CiAgLS1pbms6IzBhMGYxZTstLWlu"
-    "azI6IzEwMTgyZTstLXBhcGVyOiNGQUZBRjY7LS1saW5lOiNERURCRDE7CiAgLS1nb2xkOiNjOWE4NGM7LS1vazojMkU3RDU3Oy0t"
-    "b2stYmc6I0U0RUNFODsKICAtLXdhcm46IzlDMkYyNjstLXdhcm4tYmc6I0Y1RTZFMzstLW11dGVkOiM1QTYyNzA7LS1mYWludDoj"
-    "OEE5MEEwOwogIC0tc2FuczonSUJNIFBsZXggU2Fucycsc3lzdGVtLXVpLHNhbnMtc2VyaWY7CiAgLS1zZXJpZjonTmV3c3JlYWRl"
-    "cicsR2VvcmdpYSxzZXJpZjsKICAtLW1vbm86J0lCTSBQbGV4IE1vbm8nLHVpLW1vbm9zcGFjZSxtb25vc3BhY2U7Cn0KKntib3gt"
-    "c2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGluZzowfQpib2R5e2ZvbnQtZmFtaWx5OnZhcigtLXNhbnMpO2JhY2tncm91"
-    "bmQ6dmFyKC0tcGFwZXIpO2NvbG9yOnZhcigtLWluayk7bGluZS1oZWlnaHQ6MS42Oy13ZWJraXQtZm9udC1zbW9vdGhpbmc6YW50"
-    "aWFsaWFzZWR9Ci53cmFwe21heC13aWR0aDo4MjBweDttYXJnaW46MCBhdXRvO3BhZGRpbmc6MCAyNHB4fQoKLyogdG9wIGJhciAq"
-    "LwoudG9we2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRpbmc6MTZweCAwfQoudG9wIC53cmFwe2Rpc3Bs"
-    "YXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVtczpiYXNlbGluZTtnYXA6MTJweDtmbGV4LXdy"
-    "YXA6d3JhcH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxM3B4O2NvbG9yOnZhcigtLWluayl9Ci5i"
-    "cmFuZCBie2NvbG9yOnZhcigtLWdvbGQpO2ZvbnQtd2VpZ2h0OjUwMH0KLnRvcCBuYXZ7Zm9udC1mYW1pbHk6dmFyKC0tbW9ubyk7"
-    "Zm9udC1zaXplOjEyLjVweH0KLnRvcCBuYXYgYXtjb2xvcjp2YXIoLS1tdXRlZCk7dGV4dC1kZWNvcmF0aW9uOm5vbmU7bWFyZ2lu"
-    "LWxlZnQ6MTZweH0KLnRvcCBuYXYgYTpob3Zlcntjb2xvcjp2YXIoLS1pbmspfQoKLyogaGVybyAqLwouaGVyb3twYWRkaW5nOjU2"
-    "cHggMCAyMHB4fQouaGVybyBoMXtmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZTpjbGFt"
-    "cCgzMHB4LDUuNXZ3LDUwcHgpO2xpbmUtaGVpZ2h0OjEuMDg7bGV0dGVyLXNwYWNpbmc6LTAuMDFlbTttYXgtd2lkdGg6MTdjaDtt"
-    "YXJnaW4tYm90dG9tOjE4cHh9Ci5oZXJvIHB7Zm9udC1zaXplOjE3cHg7Y29sb3I6dmFyKC0tbXV0ZWQpO21heC13aWR0aDo1NmNo"
-    "fQoKLyogdGhlIHN0YWNrIOKAlCB0aGUgaGVybyB2aXN1YWwgKi8KLnN0YWNre3BhZGRpbmc6MjRweCAwIDhweH0KLmxheWVye2Jv"
-    "cmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo2cHg7cGFkZGluZzoyMHB4IDIycHg7bWFyZ2luLWJvdHRv"
-    "bToxNHB4O2JhY2tncm91bmQ6I2ZmZjtwb3NpdGlvbjpyZWxhdGl2ZX0KLmxheWVyIC50YWd7Zm9udC1mYW1pbHk6dmFyKC0tbW9u"
-    "byk7Zm9udC1zaXplOjExcHg7bGV0dGVyLXNwYWNpbmc6MC4wNGVtO2NvbG9yOnZhcigtLWZhaW50KTttYXJnaW4tYm90dG9tOjdw"
-    "eH0KLmxheWVyIGgze2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOjIxcHg7bWFyZ2lu"
-    "LWJvdHRvbTo2cHg7bGluZS1oZWlnaHQ6MS4yfQoubGF5ZXIgcHtmb250LXNpemU6MTQuNXB4O2NvbG9yOnZhcigtLW11dGVkKTtt"
-    "YXgtd2lkdGg6NjBjaH0KLmxheWVyIC52ZXJkaWN0e2Rpc3BsYXk6aW5saW5lLWJsb2NrO2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8p"
-    "O2ZvbnQtc2l6ZToxMnB4O21hcmdpbi10b3A6MTJweDtwYWRkaW5nOjRweCAxMHB4O2JvcmRlci1yYWRpdXM6M3B4fQoudi1ub3ti"
-    "YWNrZ3JvdW5kOnZhcigtLXdhcm4tYmcpO2NvbG9yOnZhcigtLXdhcm4pfQoudi15ZXN7YmFja2dyb3VuZDp2YXIoLS1vay1iZyk7"
-    "Y29sb3I6dmFyKC0tb2spfQoKLyogdGhlIHR3byB3YXRjaGVyIGxheWVycywgZHJhd24gYXMgYm9sdGVkIG9uIGJlc2lkZSAqLwou"
-    "d2F0Y2h7Ym9yZGVyLXN0eWxlOmRhc2hlZDtib3JkZXItY29sb3I6I0M5Q0JkMH0KLndhdGNoIGgze2NvbG9yOnZhcigtLW11dGVk"
-    "KX0KLmFzaWRle2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMXB4O2NvbG9yOnZhcigtLWZhaW50KTtwb3NpdGlv"
-    "bjphYnNvbHV0ZTt0b3A6MjBweDtyaWdodDoyMnB4fQoKLyogdGhlIGV4ZWN1dGlvbiBsYXllciDigJQgbmV1dHJhbCAqLwouZXhl"
-    "Y3tiYWNrZ3JvdW5kOnZhcigtLWluayk7Ym9yZGVyLWNvbG9yOnZhcigtLWluayl9Ci5leGVjIC50YWd7Y29sb3I6cmdiYSgyNTUs"
-    "MjU1LDI1NSwwLjUpfQouZXhlYyBoM3tjb2xvcjojZmZmfQouZXhlYyBwe2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsMC43Mil9Cgov"
-    "KiB0aGUgZXZpZGVuY2UgbGF5ZXIg4oCUIHRoZSBvbmUgdGhhdCBtYXR0ZXJzICovCi5ldmlkZW5jZXtiYWNrZ3JvdW5kOnZhcigt"
-    "LWluayk7Ym9yZGVyOjJweCBzb2xpZCB2YXIoLS1nb2xkKTtib3gtc2hhZG93OjAgOHB4IDMwcHggcmdiYSgyMDEsMTY4LDc2LDAu"
-    "MTIpfQouZXZpZGVuY2UgLnRhZ3tjb2xvcjp2YXIoLS1nb2xkKX0KLmV2aWRlbmNlIGgze2NvbG9yOiNmZmY7Zm9udC1zaXplOjIz"
-    "cHh9Ci5ldmlkZW5jZSBwe2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsMC44KX0KLmV2aWRlbmNlIC5mb3VuZGF0aW9ue2ZvbnQtZmFt"
-    "aWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLWdvbGQpO21hcmdpbi10b3A6MTRweDtkaXNwbGF5OmZs"
-    "ZXg7ZmxleC13cmFwOndyYXA7Z2FwOjhweH0KLmV2aWRlbmNlIC5mb3VuZGF0aW9uIHNwYW57Ym9yZGVyOjFweCBzb2xpZCByZ2Jh"
-    "KDIwMSwxNjgsNzYsMC4zNSk7Ym9yZGVyLXJhZGl1czozcHg7cGFkZGluZzozcHggOXB4fQoKLyogY29ubmVjdGl2ZSBub3RlIGJl"
-    "dHdlZW4gd2F0Y2hlcnMgYW5kIHRoZSByZXN0ICovCi5nYXAtbm90ZXtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6"
-    "MTJweDtjb2xvcjp2YXIoLS1mYWludCk7dGV4dC1hbGlnbjpjZW50ZXI7cGFkZGluZzo2cHggMCAxOHB4fQoKLyogYXJndW1lbnQg"
-    "c2VjdGlvbiAqLwouYXJne3BhZGRpbmc6NDRweCAwO2JvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUpO21hcmdpbi10b3A6"
-    "MjRweH0KLmFyZyBoMntmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZTpjbGFtcCgyNHB4"
-    "LDR2dywzNHB4KTtsaW5lLWhlaWdodDoxLjE1O21hcmdpbi1ib3R0b206MThweDttYXgtd2lkdGg6MjBjaH0KLmFyZyBwe2ZvbnQt"
-    "c2l6ZToxNS41cHg7Y29sb3I6dmFyKC0tbXV0ZWQpO21heC13aWR0aDo2MmNoO21hcmdpbi1ib3R0b206MTRweH0KLmFyZyBwIGJ7"
-    "Y29sb3I6dmFyKC0taW5rKTtmb250LXdlaWdodDo2MDB9CgovKiB0aGUgZm91ciBxdWVzdGlvbnMgKi8KLnF7Ym9yZGVyLWxlZnQ6"
-    "MnB4IHNvbGlkIHZhcigtLWdvbGQpO3BhZGRpbmc6NHB4IDAgNHB4IDE4cHg7bWFyZ2luOjAgMCAyMHB4fQoucSBoNHtmb250LXNp"
-    "emU6MTZweDttYXJnaW4tYm90dG9tOjVweH0KLnEgcHtmb250LXNpemU6MTQuNXB4O21hcmdpbjowfQoKLyogY2xvc2UgKi8KLmNs"
-    "b3Nle2JhY2tncm91bmQ6dmFyKC0taW5rKTtjb2xvcjp2YXIoLS1wYXBlcik7Ym9yZGVyLXJhZGl1czo4cHg7cGFkZGluZzozNHB4"
-    "O21hcmdpbjozMHB4IDAgNjBweH0KLmNsb3NlIGgye2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Y29s"
-    "b3I6I2ZmZjtmb250LXNpemU6MjZweDttYXJnaW4tYm90dG9tOjEycHg7bWF4LXdpZHRoOjIyY2h9Ci5jbG9zZSBwe2ZvbnQtc2l6"
-    "ZToxNXB4O2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsMC43NSk7bWF4LXdpZHRoOjU2Y2g7bWFyZ2luLWJvdHRvbToyMHB4fQouY2xv"
-    "c2UgYXtkaXNwbGF5OmlubGluZS1ibG9jaztmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTMuNXB4O3RleHQtZGVj"
-    "b3JhdGlvbjpub25lO21hcmdpbjo0cHggMTRweCA0cHggMH0KLmNsb3NlIGEucHJpbWFyeXtiYWNrZ3JvdW5kOnZhcigtLWdvbGQp"
-    "O2NvbG9yOnZhcigtLWluayk7cGFkZGluZzoxMnB4IDIwcHg7Ym9yZGVyLXJhZGl1czo1cHg7Zm9udC13ZWlnaHQ6NTAwfQouY2xv"
-    "c2UgYS5naG9zdHtjb2xvcjp2YXIoLS1nb2xkKTtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjAxLDE2OCw3NiwwLjQpO3BhZGRpbmc6"
-    "MTJweCAyMHB4O2JvcmRlci1yYWRpdXM6NXB4fQoKZm9vdGVye2JvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRp"
-    "bmc6MjRweCAwIDUwcHh9CmZvb3RlciBwe2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMS41cHg7Y29sb3I6dmFy"
-    "KC0tZmFpbnQpO2xpbmUtaGVpZ2h0OjEuOH0KCkBtZWRpYShwcmVmZXJzLXJlZHVjZWQtbW90aW9uOnJlZHVjZSl7Knt0cmFuc2l0"
-    "aW9uOm5vbmUhaW1wb3J0YW50O2FuaW1hdGlvbjpub25lIWltcG9ydGFudH19Cjwvc3R5bGU+CjwvaGVhZD4KPGJvZHk+Cgo8aGVh"
-    "ZGVyIGNsYXNzPSJ0b3AiPgogIDxkaXYgY2xhc3M9IndyYXAiPgogICAgPGRpdiBjbGFzcz0iYnJhbmQiPnNlYmJpPGI+LnBybzwv"
-    "Yj48L2Rpdj4KICAgIDxuYXY+CiAgICAgIDxhIGhyZWY9Ii8iPkhvbWU8L2E+CiAgICAgIDxhIGhyZWY9Ii93aGl0ZXBhcGVyIj5X"
-    "aGl0ZXBhcGVyPC9hPgogICAgICA8YSBocmVmPSIvaW52ZXN0b3ItcHJvc3BlY3R1cyI+SW52ZXN0PC9hPgogICAgPC9uYXY+CiAg"
-    "PC9kaXY+CjwvaGVhZGVyPgoKPGRpdiBjbGFzcz0id3JhcCI+CgogIDxzZWN0aW9uIGNsYXNzPSJoZXJvIj4KICAgIDxoMT5FdmVy"
-    "eW9uZSBpcyB3YXRjaGluZyB0aGUgc3lzdGVtLiBBbG1vc3Qgbm9ib2R5IGlzIHVuZGVybmVhdGggaXQuPC9oMT4KICAgIDxwPlRo"
-    "aXMgaXMgdGhlIHdob2xlIHN0YWNrLCB0b3AgdG8gYm90dG9tLiBUaGUgdG9vbHMgbW9zdCBvcmdhbmlzYXRpb25zIHJlbHkgb24g"
-    "c2l0IHRvIHRoZSBzaWRlIGFuZCB3YXRjaC4gVGhlIHBsYWNlIGEgZGVjaXNpb24gYWN0dWFsbHkgaGFzIHRvIGJlIHByb3ZlbiBp"
-    "cyB0aGUgbGF5ZXIgYmVuZWF0aCBpdCDigJQgYW5kIHRoYXQgbGF5ZXIgaXMgbmVhcmx5IGFsd2F5cyBlbXB0eS48L3A+CiAgPC9z"
-    "ZWN0aW9uPgoKICA8c2VjdGlvbiBjbGFzcz0ic3RhY2siIGFyaWEtbGFiZWw9IlRoZSBzdGFjaywgdG9wIHRvIGJvdHRvbSI+Cgog"
-    "ICAgPGRpdiBjbGFzcz0ibGF5ZXIgd2F0Y2giPgogICAgICA8ZGl2IGNsYXNzPSJ0YWciPmJvbHRlZCBvbiDCtyB3YXRjaGVzIGZy"
-    "b20gdGhlIHNpZGU8L2Rpdj4KICAgICAgPHNwYW4gY2xhc3M9ImFzaWRlIj5vYnNlcnZhYmlsaXR5PC9zcGFuPgogICAgICA8aDM+"
-    "TW9uaXRvcmluZyAmYW1wOyBkYXNoYm9hcmRzPC9oMz4KICAgICAgPHA+TG9nZ2luZyBwbGF0Zm9ybXMsIGRhc2hib2FyZHMsIGFs"
-    "ZXJ0aW5nLiBUaGV5IHJlYWQgd2hhdCB0aGUgc3lzdGVtIGVtaXRzIGFuZCBzaG93IGl0IGJhY2sgdG8geW91LiBUaGUgcmVjb3Jk"
-    "IHRoZXkga2VlcCBsaXZlcyBpbiBhIGRhdGFiYXNlIHlvdXIgb3duIHRlYW0gY2FuIGVkaXQsIHNvIGl0IHNheXMgd2hhdCB5b3Ug"
-    "Y3VycmVudGx5IGNsYWltIGhhcHBlbmVkIOKAlCBub3QgdGhhdCBub3RoaW5nIGNoYW5nZWQgaXQgc2luY2UuPC9wPgogICAgICA8"
-    "c3BhbiBjbGFzcz0idmVyZGljdCB2LW5vIj53YXRjaGVzIMK3IGNhbm5vdCBwcm92ZTwvc3Bhbj4KICAgIDwvZGl2PgoKICAgIDxk"
-    "aXYgY2xhc3M9ImxheWVyIHdhdGNoIj4KICAgICAgPGRpdiBjbGFzcz0idGFnIj5ib2x0ZWQgb24gwrcgcmVhZHMgdGhlIG91dHB1"
-    "dDwvZGl2PgogICAgICA8c3BhbiBjbGFzcz0iYXNpZGUiPmd1YXJkcmFpbHM8L3NwYW4+CiAgICAgIDxoMz5GaWx0ZXJzICZhbXA7"
-    "IGd1YXJkcmFpbHM8L2gzPgogICAgICA8cD5Db250ZW50IGZpbHRlcnMgYW5kIHBvbGljeSBsYXllcnMgdGhhdCBpbnNwZWN0IHdo"
-    "YXQgYSBtb2RlbCBzYXlzLiBVc2VmdWwsIGJ1dCB0aGV5IGFjdCBvbiB0aGUgdGV4dCBhZnRlciB0aGUgbW9kZWwgaGFzIHByb2R1"
-    "Y2VkIGl0LCBhbmQgdGhleSBrZWVwIG5vIGV2aWRlbmNlIGEgcmVndWxhdG9yIGNhbiBjaGVjayB3aXRob3V0IHRydXN0aW5nIHRo"
-    "ZSB2ZW5kb3Igd2hvIHdyb3RlIHRoZW0uPC9wPgogICAgICA8c3BhbiBjbGFzcz0idmVyZGljdCB2LW5vIj5maWx0ZXJzIMK3IGNh"
-    "bm5vdCBwcm92ZTwvc3Bhbj4KICAgIDwvZGl2PgoKICAgIDxkaXYgY2xhc3M9ImdhcC1ub3RlIj7ihpEgZXZlcnl0aGluZyBhYm92"
-    "ZSB3YXRjaGVzIGFmdGVyIHRoZSBmYWN0IOKGkTwvZGl2PgoKICAgIDxkaXYgY2xhc3M9ImxheWVyIGV4ZWMiPgogICAgICA8ZGl2"
-    "IGNsYXNzPSJ0YWciPndoZXJlIHRoZSBkZWNpc2lvbiBoYXBwZW5zPC9kaXY+CiAgICAgIDxoMz5UaGUgZXhlY3V0aW9uIGxheWVy"
-    "PC9oMz4KICAgICAgPHA+VGhlIG1vZGVsLCB0aGUgYWdlbnQsIHRoZSBhdXRvbWF0ZWQgZGVjaXNpb24gaXRzZWxmIOKAlCB0aGUg"
-    "bW9tZW50IHNvbWV0aGluZyBpcyBhY3R1YWxseSBkZWNpZGVkIGFuZCBhY3RlZCBvbi4gVGhpcyBpcyB0aGUgZXZlbnQgdGhhdCBo"
-    "YXMgdG8gYmUgZXZpZGVuY2VkLiBJdCBpcyBhbHNvIHRoZSBtb21lbnQgdGhlIHdhdGNoaW5nIGxheWVycyBhYm92ZSBvbmx5IGV2"
-    "ZXIgc2VlIHNlY29uZC1oYW5kLjwvcD4KICAgIDwvZGl2PgoKICAgIDxkaXYgY2xhc3M9ImxheWVyIGV2aWRlbmNlIj4KICAgICAg"
-    "PGRpdiBjbGFzcz0idGFnIj51bmRlcm5lYXRoIHRoZSBkZWNpc2lvbiDCtyBzZWFscyBpdCBhcyBpdCBoYXBwZW5zPC9kaXY+CiAg"
-    "ICAgIDxoMz5UaGUgZXZpZGVuY2UgbGF5ZXIg4oCUIHdoZXJlIHNlYmJpLnBybyBzaXRzPC9oMz4KICAgICAgPHA+RWFjaCBkZWNp"
-    "c2lvbiBpcyBzZWFsZWQgaW50byBhIGhhc2ggY2hhaW4gYXQgdGhlIG1vbWVudCBpdCBpcyBtYWRlLCBhbmNob3JlZCB0byBhIGNs"
-    "b2NrIG5vYm9keSBjb250cm9scywgYW5kIGNyb3NzLXdpdG5lc3NlZCBieSBpbmRlcGVuZGVudCBzeXN0ZW1zLiBOb3QgYSByZWNv"
-    "cmQgeW91IGtlZXAgYW5kIGhvcGUgaXMgYmVsaWV2ZWQg4oCUIGEgcmVjb3JkIGFueW9uZSBjYW4gdmVyaWZ5IHdpdGggeW91ciBj"
-    "b21wYW55IHN3aXRjaGVkIG9mZi48L3A+CiAgICAgIDxkaXYgY2xhc3M9ImZvdW5kYXRpb24iPgogICAgICAgIDxzcGFuPmhhc2gg"
-    "Y2hhaW48L3NwYW4+PHNwYW4+ZXh0ZXJuYWwgYW5jaG9yPC9zcGFuPjxzcGFuPmluZGVwZW5kZW50IHdpdG5lc3Nlczwvc3Bhbj48"
-    "c3Bhbj5wdWJsaWMgdmVyaWZpY2F0aW9uPC9zcGFuPgogICAgICA8L2Rpdj4KICAgICAgPHNwYW4gY2xhc3M9InZlcmRpY3Qgdi15"
-    "ZXMiPnByb3ZlcyDCtyBjYW5ub3QgYmUgZWRpdGVkPC9zcGFuPgogICAgPC9kaXY+CgogIDwvc2VjdGlvbj4KCiAgPHNlY3Rpb24g"
-    "Y2xhc3M9ImFyZyI+CiAgICA8aDI+V2h5IHRoZSB3YXRjaGluZyBsYXllciBjYW4ndCBjYXJyeSBhdXRvbm9tb3VzIGRlY2lzaW9u"
-    "czwvaDI+CiAgICA8cD5XaGVuIHNvZnR3YXJlIGRpZCB3aGF0IGl0IHdhcyB0b2xkLCB3YXRjaGluZyBpdCB3YXMgZW5vdWdoIOKA"
-    "lCB0aGUgaW5wdXRzIGltcGxpZWQgdGhlIG91dHB1dHMsIGFuZCBhIGxvZyBvZiB0aGUgaW5wdXRzIHdhcyBhcyBnb29kIGFzIGEg"
-    "cmVjb3JkIG9mIHdoYXQgaGFwcGVuZWQuIFRoYXQgaXMgbm8gbG9uZ2VyIHRydWUuPC9wPgogICAgPHA+QW4gYXV0b25vbW91cyBz"
-    "eXN0ZW0gcHJvZHVjZXMgb3V0cHV0cyB5b3UgY2Fubm90IGRlcml2ZSBieSBsb29raW5nIGF0IHRoZSBpbnB1dHMuIFNvIHRoZSBv"
-    "dXRwdXQgaGFzIHRvIGJlIHJlY29yZGVkIGFzIGEgZmFjdCBpbiBpdHMgb3duIHJpZ2h0LCBhdCB0aGUgbW9tZW50IGl0IGhhcHBl"
-    "bnMsIGluIGEgZm9ybSBub2JvZHkgY2FuIHF1aWV0bHkgY2hhbmdlIGFmdGVyd2FyZHMuIDxiPkEgbGF5ZXIgdGhhdCB3YXRjaGVz"
-    "IGZyb20gdGhlIHNpZGUgY2Fubm90IGRvIHRoYXQ8L2I+IOKAlCBieSB0aGUgdGltZSBpdCBzZWVzIHRoZSBkZWNpc2lvbiwgdGhl"
-    "IGRlY2lzaW9uIGhhcyBhbHJlYWR5IGhhcHBlbmVkLCBhbmQgdGhlIG9ubHkgcmVjb3JkIGlzIG9uZSB0aGUgb3BlcmF0b3IgY2Fu"
-    "IGVkaXQuPC9wPgogICAgPHA+VGhpcyBpcyB3aHkgdGhlIHZvbHVtZSBwcm9ibGVtIGJpdGVzLiBPbmUgcmV2aWV3ZWQgZGVjaXNp"
-    "b24gYSBkYXkgY2FuIGJlIHdhdGNoZWQgYnkgYSBwZXJzb24uIE1pbGxpb25zIG9mIGF1dG9tYXRlZCBkZWNpc2lvbnMgYSBtb250"
-    "aCBjYW5ub3Qg4oCUIGFuZCB0aGUgbW9tZW50IG9uZSBpcyBjb250ZXN0ZWQsICJvdXIgZGFzaGJvYXJkIHNob3dlZCBpdCIgaXMg"
-    "bm90IGV2aWRlbmNlLiBJdCBpcyBhbiBhc3NlcnRpb24gd2l0aCBnb29kIGZvcm1hdHRpbmcuPC9wPgogIDwvc2VjdGlvbj4KCiAg"
-    "PHNlY3Rpb24gY2xhc3M9ImFyZyIgc3R5bGU9ImJvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRpbmctdG9wOjM2"
-    "cHgiPgogICAgPGgyPkZvdXIgcXVlc3Rpb25zIHRoZSB3YXRjaGluZyBsYXllciBhbnN3ZXJzICJubyIgdG88L2gyPgogICAgPGRp"
-    "diBjbGFzcz0icSI+PGg0PkNhbiB0aGUgcGVvcGxlIGJlaW5nIGF1ZGl0ZWQgZWRpdCB0aGUgYXVkaXQ/PC9oND48cD5PbiB0aGUg"
-    "d2F0Y2hpbmcgbGF5ZXIsIHllcyDigJQgdGhlIHJlY29yZCBzaXRzIGluIGEgZGF0YWJhc2UgdGhleSBjb250cm9sLiBPbiB0aGUg"
-    "ZXZpZGVuY2UgbGF5ZXIsIGNoYW5naW5nIG9uZSByZWNvcmQgYnJlYWtzIGV2ZXJ5IHJlY29yZCBhZnRlciBpdC48L3A+PC9kaXY+"
-    "CiAgICA8ZGl2IGNsYXNzPSJxIj48aDQ+Q2FuIGl0IGJlIGNoZWNrZWQgd2l0aCB0aGUgdmVuZG9yIHN3aXRjaGVkIG9mZj88L2g0"
-    "PjxwPk9uIHRoZSB3YXRjaGluZyBsYXllciwgbm8g4oCUIHlvdSBsb2cgaW50byB0aGUgdmVuZG9yIHRvIHNlZSBpdC4gT24gdGhl"
-    "IGV2aWRlbmNlIGxheWVyLCBhIHN0YW5kYWxvbmUgdmVyaWZpZXIgY2hlY2tzIGl0IHdpdGggbm8gYWNjb3VudCBhbmQgbm8gbmV0"
-    "d29yayBjYWxsIGJhY2suPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0icSI+PGg0PkNhbiB5b3UgcHJvdmUgYSByZWNvcmQgcHJl"
-    "ZGF0ZXMgdGhlIGNvbXBsYWludCBhYm91dCBpdD88L2g0PjxwPk9uIHRoZSB3YXRjaGluZyBsYXllciwgdGhlIGRhdGUgY29tZXMg"
-    "ZnJvbSBhIGZpZWxkIHRoZSBzeXN0ZW0gY291bGQgc2V0IHRvIGFueXRoaW5nLiBPbiB0aGUgZXZpZGVuY2UgbGF5ZXIsIHRoZSB0"
-    "aW1pbmcgaXMgZml4ZWQgYnkgYSBjbG9jayBub2JvZHkgaW52b2x2ZWQgY29udHJvbHMuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFz"
-    "cz0icSI+PGg0PkNhbiB5b3UgcHJvdmUgdGhlIGh1bWFuIGFwcHJvdmVkIGJlZm9yZSB0aGUgbWFjaGluZSBhY3RlZD88L2g0Pjxw"
-    "Pk9uIHRoZSB3YXRjaGluZyBsYXllciwgb3JkZXIgaXMgbm90IHJlY29yZGVkLiBPbiB0aGUgZXZpZGVuY2UgbGF5ZXIsIHRoZSBy"
-    "ZXZpZXdlcidzIGRlY2lzaW9uIGlzIHNlYWxlZCBiZWZvcmUgdGhlIG1hY2hpbmUncyB2ZXJkaWN0IGlzIHNob3duIHRvIHRoZW0u"
-    "PC9wPjwvZGl2PgogIDwvc2VjdGlvbj4KCiAgPGRpdiBjbGFzcz0iY2xvc2UiPgogICAgPGgyPkRvbid0IHRha2UgdGhlIGRpYWdy"
-    "YW0ncyB3b3JkIGZvciBpdC4gQ2hlY2sgdGhlIGxheWVyIHlvdXJzZWxmLjwvaDI+CiAgICA8cD5FdmVyeSBjbGFpbSBvbiB0aGUg"
-    "ZXZpZGVuY2UgbGF5ZXIgaXMgdmVyaWZpYWJsZSByaWdodCBub3csIHdpdGggbm8gYWNjb3VudCwgd2l0aCBvdXIgY29tcGFueSBz"
-    "d2l0Y2hlZCBvZmYuIFN0YXJ0IHdpdGggdGhlIGxpdmUgY2hhaW4sIG9yIHJlYWQgdGhlIGZ1bGwgYXJjaGl0ZWN0dXJlLjwvcD4K"
-    "ICAgIDxhIGNsYXNzPSJwcmltYXJ5IiBocmVmPSIvd2hpdGVwYXBlciI+UmVhZCB0aGUgd2hpdGVwYXBlcjwvYT4KICAgIDxhIGNs"
-    "YXNzPSJnaG9zdCIgaHJlZj0iL3gvd2l0bmVzcy90aXAiPlNlZSB0aGUgbGl2ZSBjaGFpbjwvYT4KICA8L2Rpdj4KCjwvZGl2PgoK"
-    "PGZvb3Rlcj4KICA8ZGl2IGNsYXNzPSJ3cmFwIj4KICAgIDxwPnNlYmJpLnBybyDCtyBNb25vcCBDb250ZW50IMK3IEJseXRoLCBO"
-    "b3J0aHVtYmVybGFuZCwgVUs8YnI+CiAgICBUaGUgZXZpZGVuY2UgbGF5ZXIgZm9yIEFJIGRlY2lzaW9ucy4gRnJlZSBmb3IgOTAg"
-    "ZGF5cywgdGhlbiA1MHAgcGVyIGRldmljZSBwZXIgbW9udGguPC9wPgogIDwvZGl2Pgo8L2Zvb3Rlcj4KCjwvYm9keT4KPC9odG1s"
-    "Pgo="
-)
-
-_HTML = base64.b64decode("".join(_B64.split())).decode("utf-8")
-_patched = False
+        html = ("<html><body style='font-family:Arial,sans-serif;background:#f5f7fa;padding:20px'>"
+                "<div style='max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden'>"
+                "<div style='background:#0a0f1e;padding:28px;border-bottom:4px solid #c9a84c'>"
+                "<div style='font-size:22px;color:#fff;font-family:Georgia,serif'>Human <span style='color:#c9a84c'>Keys</span></div></div>"
+                "<div style='padding:30px;color:#1a1f2e;font-size:15px;line-height:1.6'>"
+                "<p><b>Your ownership key backup.</b></p>"
+                "<p>Your phone holds the key that proves your Human Keys proofs are yours - starting with "
+                "<b>%s</b>. If you lose or change your phone, this code puts the key back.</p>"
+                "<p style='font-family:monospace;font-size:12px;word-break:break-all;background:#f3f1ea;"
+                "border:1px solid #e2d9bd;padding:14px;border-radius:6px'>%s</p>"
+                "<p>To restore it, open <a href='https://sebbi.pro/keys'>https://sebbi.pro/keys</a> on the new phone "
+                "and tap <b>Restore my key</b>.</p>"
+                "<p style='color:#666;font-size:13px'>Keep this email private. Anyone with this code can prove "
+                "ownership as you. sebbi.pro does not keep a copy.</p>"
+                "<p>Check any proof: <a href='https://sebbi.pro/k/%s'>https://sebbi.pro/k/%s</a></p>"
+                "</div></div></body></html>") % (code, backup, code, code)
+        _srv().send_email(email, "", "Your Human Keys backup code", html)
+    except Exception as e:
+        _state["last_error"] = "backup email: %s" % e
 
 
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
+def _record(code):
+    s = _srv()
+    with s._db_lock:
+        r = s._conn.execute("SELECT code,text_hash,verdict,score,summary_json,challenge_json,sealed_at,"
+                            "block_index,audit_hash,reference,pubkey,owner_sig FROM humankeys_proof WHERE code=?",
+                            (code,)).fetchone()
+    if not r:
+        return None
+    ch = json.loads(r[5] or "{}")
+    return {"code": r[0], "text_hash": r[1], "verdict": r[2], "verdict_text": VERDICT_TEXT.get(r[2]),
+            "score": r[3], "summary": json.loads(r[4] or "{}"),
+            "session_started_utc": _iso(ch.get("issued")), "sealed_utc": _iso(r[6]), "sealed_uk": _uk(r[6]),
+            "beacon": ch.get("beacon"), "block_index": r[7], "audit_hash": r[8], "reference": r[9],
+            "verify_block": "https://sebbi.pro/x/walk/block?index=%s" % r[7],
+            "owner_key": r[10], "owner_signature": r[11],
+            "check": "https://sebbi.pro/k/" + r[0]}
 
 
-def _install_page(ctx):
-    global _patched
-    if _patched:
+# ---------------------------------------------------------------------
+# pages
+# ---------------------------------------------------------------------
+
+def _send(h, body, ctype, status=200):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    h.send_response(status)
+    h.send_header("Content-Type", ctype)
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", "no-store" if "json" in ctype else "public, max-age=60")
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def _esc(t):
+    return (str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _badge(rec):
+    ok = rec and rec["verdict"] == "HUMAN_TYPED"
+    part = rec and rec["verdict"] == "HUMAN_TYPED_PART_PASTED"
+    label = "Human typed" if ok else ("Human typed · part pasted" if part else "Not verified")
+    colour = "#2fbf71" if ok else ("#c9a84c" if part else "#9aa0ae")
+    code = rec["code"] if rec else "unknown"
+    w = 300 if part else 240
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="28" role="img" aria-label="%s %s">'
+            '<rect width="%d" height="28" rx="5" fill="#0a0f1e"/><rect x="1" y="1" width="%d" height="26" rx="4" fill="none" stroke="%s" stroke-opacity=".6"/>'
+            '<circle cx="15" cy="14" r="5" fill="%s"/>'
+            '<text x="27" y="18" fill="#fff" font-family="Verdana,sans-serif" font-size="11.5" font-weight="bold">%s</text>'
+            '<text x="%d" y="18" fill="%s" font-family="Verdana,sans-serif" font-size="10.5" text-anchor="end">%s</text></svg>'
+            % (w, _esc(label), code, w, w - 2, colour, colour, _esc(label), w - 10, colour, code))
+
+
+def _install_page():
+    if _state["page"]:
         return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
+    s = _srv()
+    H = getattr(s, "Handler", None)
+    if H is None:
         return False
-    if getattr(cls, "_map_patched", False):
-        _patched = True
+    if getattr(H, "_humankeys_patched", False):
+        _state["page"] = True
         return True
-
-    original_do_GET = cls.do_GET
+    orig = H.do_GET
 
     def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
-        if path == PAGE_PATH:
-            body = _HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return original_do_GET(self)
+        p = self.path.split("?")[0].rstrip("/")
+        if p == "/keys":
+            return _send(self, KEYS_PAGE, "text/html; charset=utf-8")
+        if p == "/k" or p.startswith("/k/"):
+            code = p[3:].upper()
+            if code.endswith(".SVG"):
+                code = code[:-4]
+                rec = _record(code) if CODE_RE.match(code) else None
+                return _send(self, _badge(rec), "image/svg+xml")
+            if CODE_RE.match(code):
+                return _send(self, CHECK_PAGE.replace("__CODE__", code), "text/html; charset=utf-8")
+            return _send(self, CHECK_PAGE.replace("__CODE__", ""), "text/html; charset=utf-8")
+        return orig(self)
 
-    cls.do_GET = do_GET
-    cls._map_patched = True
-    _patched = True
+    H.do_GET = do_GET
+    H._humankeys_patched = True
+    _state["page"] = True
     return True
 
 
+def arm(ctx=None):
+    with _lock:
+        _setup()
+        _arm_credits(ctx)
+        _install_page()
+        _state["ready"] = True
+
+
+# ---------------------------------------------------------------------
+# router entry
+# ---------------------------------------------------------------------
+
 def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    if action == "spec":
-        return ({
-            "module": "map",
-            "version": VERSION,
-            "serves": PAGE_PATH,
-            "public": [["GET", "status"], ["GET", "spec"]],
-            "note": "Hit /x/map/status once after each deploy to arm " + PAGE_PATH + ".",
-        }, 200)
-    return ({
-        "module": "map",
-        "version": VERSION,
-        "serves": PAGE_PATH,
-        "armed": armed,
-        "page_bytes": len(_HTML),
-    }, 200)
-
-
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-```
-
-
-## `modules/marquee.py`
-
-115 lines, 5126 bytes
-
-```python
-"""
-modules/marquee.py  v1.0.0
-The 10p Wing: creator submissions for the sebbi.pro cinema.
-
-    POST /x/marquee/submit    {url, title, creator, price}   (public)
-    GET  /x/marquee/list      approved screens                (public)
-    GET  /x/marquee/status    counts                          (public)
-    GET  /x/marquee/pending   everything waiting              (keyed)
-    POST /x/marquee/approve   {id, approved}                  (keyed)
-
-We never hold anyone's video. A submission is a link, a title, a name and a
-price, nothing else. Every submission is sealed into the chain when it lands,
-so the date it was sent is provable, and nothing appears in the cinema until
-it has been approved.
-"""
-
-import re
-import time
-
-VERSION = "1.0.0"
-PUBLIC = {("POST", "submit"), ("GET", "list"), ("GET", "status"), ("GET", "spec")}
-KEY = "public-marquee"
-URL_RE = re.compile(r"^https://[A-Za-z0-9.\-]{3,253}(/[^\s<>\"']{0,300})?$")
-CLEAN = re.compile(r"[<>\"'\\]")
-_ready = False
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        ctx["conn"].execute("CREATE TABLE IF NOT EXISTS marquee(id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                            "url TEXT UNIQUE,title TEXT,creator TEXT,price INTEGER,at REAL,"
-                            "approved INTEGER DEFAULT 0,audit_hash TEXT,block_index INTEGER)")
-        ctx["conn"].commit()
-    _ready = True
-
-
-def _clean(s, n):
-    return CLEAN.sub("", str(s or "")).strip()[:n]
-
-
-def _rows(ctx, approved=None):
-    q = "SELECT id,url,title,creator,price,at,approved,audit_hash,block_index FROM marquee"
-    if approved is not None:
-        q += " WHERE approved=%d" % (1 if approved else 0)
-    q += " ORDER BY id DESC LIMIT 200"
-    with ctx["lock"]:
-        rows = ctx["conn"].execute(q).fetchall()
-    return [{"id": r[0], "url": r[1], "title": r[2], "creator": r[3], "price": r[4],
-             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[5])),
-             "approved": bool(r[6]), "sealed_in_chain": r[7], "block_index": r[8]} for r in rows]
-
-
-def _submit(ctx, data):
-    url = str(data.get("url", "")).strip()
-    if not URL_RE.match(url):
-        return {"received": False, "message": "That link does not look right. It needs to start with https://"}, 400
-    title = _clean(data.get("title"), 80) or "Untitled"
-    creator = _clean(data.get("creator"), 40) or "Anonymous"
     try:
-        price = max(1, min(500, int(float(data.get("price", 10)))))
-    except (TypeError, ValueError):
-        price = 10
-    with ctx["lock"]:
-        if ctx["conn"].execute("SELECT 1 FROM marquee WHERE url=?", (url,)).fetchone():
-            return {"received": False, "message": "That link is already in the queue."}, 200
-    now = time.time()
-    ev = {"user_id": "mrq:" + creator[:24], "action": "marquee_submission", "amount": 0,
-          "country": "UK", "device_id": "cinema", "anomaly": 0, "device_risk": 0}
-    res = {"decision": "MARQUEE_SUBMITTED", "score": 0, "marquee_version": VERSION,
-           "detail": "creator=%s;title=%s;price=%d;url=%s" % (creator, title, price, url)}
-    out = ctx["seal"](ev, res, now, KEY)
-    audit_hash = out[0] if isinstance(out, (list, tuple)) else out
-    block = out[1] if isinstance(out, (list, tuple)) and len(out) > 1 else None
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO marquee(url,title,creator,price,at,approved,audit_hash,block_index)"
-                            " VALUES(?,?,?,?,?,0,?,?)", (url, title, creator, price, now, audit_hash, block))
-        ctx["conn"].commit()
-    return {"received": True, "title": title, "creator": creator, "price": price,
-            "sealed_in_chain": audit_hash, "block_index": block,
-            "message": "Sealed. It goes up once it has been looked at."}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
+        arm(ctx)
+    except Exception as e:
+        _state["last_error"] = "arm: %s" % e
     data = data or {}
-    if action == "submit" and method == "POST":
-        return _submit(ctx, data)
-    if action == "list":
-        return {"screens": _rows(ctx, True)}, 200
-    if action == "pending":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        return {"waiting": _rows(ctx, False)}, 200
-    if action == "approve" and method == "POST":
-        if not api_key:
-            return {"error": "invalid_api_key"}, 401
-        try:
-            i = int(data.get("id"))
-        except (TypeError, ValueError):
-            return {"error": "id_required"}, 400
-        ok = 0 if str(data.get("approved", "1")).lower() in ("0", "false", "no") else 1
-        with ctx["lock"]:
-            ctx["conn"].execute("UPDATE marquee SET approved=? WHERE id=?", (ok, i))
-            ctx["conn"].commit()
-        return {"id": i, "approved": bool(ok)}, 200
-    with ctx["lock"]:
-        a = ctx["conn"].execute("SELECT COUNT(*) FROM marquee WHERE approved=1").fetchone()[0]
-        w = ctx["conn"].execute("SELECT COUNT(*) FROM marquee WHERE approved=0").fetchone()[0]
-    return {"module": "marquee", "version": VERSION, "on_screen": a, "waiting": w,
-            "list": "https://sebbi.pro/x/marquee/list"}, 200
+    if action in ("", "status"):
+        s = _srv()
+        with s._db_lock:
+            n = s._conn.execute("SELECT COUNT(*) FROM humankeys_proof").fetchone()[0]
+        return {"module": "humankeys", "version": VERSION, "armed": _state["page"],
+                "page": "https://sebbi.pro/keys", "proofs_sealed": n, "price": "50p a month, unlimited proofs",
+                "last_error": _state["last_error"]}, 200
+    if action == "spec":
+        return {"module": "humankeys", "version": VERSION,
+                "what": "Proof a human typed a text, live. The text never leaves the device; its fingerprint and a score of the typing rhythm are sealed.",
+                "price": "50p a month for unlimited proofs, from the credit wallet, or included with an API key. Checking is free.",
+                "verdicts": VERDICT_TEXT,
+                "routes": {"challenge": "GET https://sebbi.pro/x/humankeys/challenge",
+                           "seal": "POST https://sebbi.pro/x/humankeys/seal {challenge, sig, text_hash, intervals, counts, viewer | API key, reference}",
+                           "check": "GET https://sebbi.pro/x/humankeys/check?code=HK-XXXX-XXXX",
+                           "compare": "POST https://sebbi.pro/x/humankeys/compare {code, text_hash}",
+                           "page": "https://sebbi.pro/keys"},
+                "text_hash": "SHA-256 of the text as UTF-8, after normalising to NFC, converting line endings to \\n and trimming the ends."}, 200
+    if action == "challenge" and method == "GET":
+        return _challenge(), 200
+    if action == "pass" and method == "GET":
+        v = str(data.get("viewer", "")).strip()
+        if not VIEWER_RE.match(v):
+            return {"error": "viewer needed"}, 400
+        active, exp = _pass(v)
+        return {"active": active, "until_uk": _uk(exp) if exp else None, "price_pence": PRICE_PENCE,
+                "days": PASS_DAYS, "balance_pence": _balance(v)}, 200
+    if action == "seal" and method == "POST":
+        return _seal(data, api_key)
+    if action == "check" and method == "GET":
+        code = str(data.get("code", "")).strip().upper()
+        rec = _record(code) if CODE_RE.match(code) else None
+        return (rec, 200) if rec else ({"error": "no_such_proof", "code": code}, 404)
+    if action == "compare" and method == "POST":
+        code = str(data.get("code", "")).strip().upper()
+        th = str(data.get("text_hash", "")).strip().lower()
+        rec = _record(code) if CODE_RE.match(code) else None
+        if not rec:
+            return {"error": "no_such_proof"}, 404
+        return {"code": code, "matches": hmac.compare_digest(rec["text_hash"], th),
+                "verdict": rec["verdict"], "verdict_text": rec["verdict_text"], "sealed_uk": rec["sealed_uk"]}, 200
+    return {"error": "unknown_action", "spec": "https://sebbi.pro/x/humankeys/spec"}, 404
+
+
+# ---------------------------------------------------------------------
+# page markup
+# ---------------------------------------------------------------------
+
+_HEAD = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--gold2:#f0d78a;--ok:#2fbf71;--ok2:#7fe3b0;--err:#ff8a80;--mut:rgba(255,255,255,.62);--line:rgba(201,168,76,.22);
+--sans:'IBM Plex Sans',system-ui,sans-serif;--serif:'Newsreader',Georgia,serif;--mono:'IBM Plex Mono',ui-monospace,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--ink);color:#fff;font-family:var(--sans);line-height:1.55;-webkit-font-smoothing:antialiased;padding-bottom:env(safe-area-inset-bottom,0)}
+.wrap{max-width:820px;margin:0 auto;padding:0 16px}
+.top{border-bottom:1px solid var(--line);padding:14px 0}.top .wrap{display:flex;justify-content:space-between;align-items:baseline}
+.brand{font-family:var(--mono);font-size:13px;color:#fff;text-decoration:none}.brand b{color:var(--gold);font-weight:500}
+.top a.l{font-family:var(--mono);font-size:12px;color:var(--mut);text-decoration:none}
+.hero{padding:38px 0 14px}.kick{font-family:var(--mono);font-size:12px;color:var(--gold);letter-spacing:.08em;margin-bottom:10px}
+h1{font-family:var(--serif);font-weight:500;font-size:clamp(34px,7vw,58px);line-height:1.03;margin-bottom:12px}h1 em{color:var(--gold);font-style:italic}
+.hero p{color:var(--mut);font-size:16.5px;max-width:58ch}
+.card{background:var(--ink2);border:1px solid var(--line);border-radius:10px;padding:18px;margin:18px 0}
+textarea{width:100%;min-height:210px;background:var(--ink);border:1px solid var(--line);border-radius:8px;color:#fff;padding:14px;font-family:var(--sans);font-size:16.5px;line-height:1.6;resize:vertical;outline:none}
+textarea:focus{border-color:var(--gold)}
+input{width:100%;background:var(--ink);border:1px solid var(--line);border-radius:6px;color:#fff;padding:11px 12px;font-family:var(--mono);font-size:14px}
+canvas{width:100%;height:64px;display:block;margin-top:12px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}
+@media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
+.st{background:var(--ink);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:9px 10px}
+.st b{display:block;font-family:var(--mono);font-size:18px;font-weight:500}.st span{font-size:11.5px;color:var(--mut)}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}
+.btn{background:var(--gold);color:var(--ink);border:0;border-radius:6px;padding:13px 18px;font-family:var(--mono);font-size:14px;font-weight:500;cursor:pointer;text-decoration:none;display:inline-block}
+.btn.g{background:transparent;color:var(--gold);border:1px solid var(--gold)}.btn[disabled]{opacity:.5}
+.msg{font-family:var(--mono);font-size:13px;margin-top:10px;min-height:1em}.msg.err{color:var(--err)}.msg.ok{color:var(--ok2)}
+.wallet{font-family:var(--mono);font-size:12.5px;color:var(--mut)}
+.cert{border:1px solid rgba(47,191,113,.5);background:linear-gradient(160deg,rgba(47,191,113,.10),rgba(16,24,46,1) 60%);border-radius:12px;padding:22px;margin:18px 0}
+.cert.part{border-color:rgba(201,168,76,.6);background:linear-gradient(160deg,rgba(201,168,76,.12),rgba(16,24,46,1) 60%)}
+.cert.bad{border-color:rgba(255,138,128,.5);background:linear-gradient(160deg,rgba(255,138,128,.10),rgba(16,24,46,1) 60%)}
+.seal{display:flex;gap:14px;align-items:center}
+.ring{width:54px;height:54px;border-radius:50%;border:2px solid var(--ok);display:flex;align-items:center;justify-content:center;font-size:26px;color:var(--ok);flex:none}
+.part .ring{border-color:var(--gold);color:var(--gold)}.bad .ring{border-color:var(--err);color:var(--err)}
+.cert h2{font-family:var(--serif);font-weight:500;font-size:26px;line-height:1.15}
+.code{font-family:var(--mono);font-size:24px;letter-spacing:.06em;color:var(--gold2);margin:14px 0 4px}
+dl{display:grid;grid-template-columns:minmax(120px,170px) 1fr;gap:5px 12px;font-size:14px;margin-top:12px}
+dt{color:var(--mut);font-size:13px}dd{font-family:var(--mono);font-size:13px;word-break:break-all}
+.how{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:8px 0 18px}@media(max-width:640px){.how{grid-template-columns:1fr}}
+.how div{border-top:1px solid var(--line);padding-top:10px}.how b{font-family:var(--mono);font-size:12px;color:var(--gold);letter-spacing:.06em}.how p{color:var(--mut);font-size:14px;margin-top:4px}
+footer{border-top:1px solid var(--line);margin-top:30px;padding:20px 0;font-size:12.5px;color:var(--mut)}
+footer a{color:var(--gold);text-decoration:none}
+</style>"""
+
+KEYS_PAGE = _HEAD + r"""
+<title>Human Keys · proof a human typed it</title>
+<meta name="description" content="Type it here and get a sealed code that proves a human typed it, live, not pasted or generated. 50p a month, unlimited proofs. Checking is free.">
+</head><body>
+<div class="top"><div class="wrap"><a class="brand" href="https://sebbi.pro/">AI<b>Leash</b> · Human Keys</a><a class="l" href="https://sebbi.pro/k/">Check a code</a></div></div>
+<div class="wrap">
+<div class="hero"><div class="kick">HUMAN KEYS</div>
+<h1>Proof a human <em>typed it.</em></h1>
+<p>Type below. We read the rhythm of your typing, never your words. Seal it and you get one short code that proves a person typed this, live, not pasted and not generated. Anyone can check it, free, forever.</p></div>
+
+<div class="how">
+<div><b>01 · TYPE</b><p>Write it here, by hand. Your words stay on your phone.</p></div>
+<div><b>02 · SEAL</b><p>The rhythm is scored and sealed with a public clock nobody can predict. 50p a month, as many proofs as you like.</p></div>
+<div><b>03 · SHARE</b><p>Put the code or badge under your post, essay, review or sign-off.</p></div>
+</div>
+
+<div class="card">
+<textarea id="t" placeholder="Start typing…" autocomplete="off" autocorrect="on" spellcheck="true"></textarea>
+<canvas id="cv" width="800" height="64"></canvas>
+<div class="stats">
+<div class="st"><b id="sk">0</b><span>keystrokes</span></div>
+<div class="st"><b id="sc">0</b><span>corrections</span></div>
+<div class="st"><b id="sp">0</b><span>thinking pauses</span></div>
+<div class="st"><b id="sv">0</b><span>pasted characters</span></div>
+</div>
+<input id="em" type="email" placeholder="Email me my ownership backup code (optional)" style="margin-top:12px;font-family:var(--sans)" autocomplete="email">
+<div class="btns"><button class="btn" id="seal" disabled>Seal it</button><span class="wallet" id="wallet">Wallet: …</span><a class="btn g" id="topup" href="https://sebbi.pro/credits" style="display:none">Top up</a></div>
+<div class="msg" id="msg"></div>
+<p class="wallet" style="margin-top:12px">Your phone holds a private key that signs every proof, so only you can prove a proof is yours. <a href="#" id="rst" style="color:var(--gold)">Restore my key from a backup code</a></p>
+<div id="rbox" style="display:none;margin-top:10px"><textarea id="rcode" style="min-height:90px;font-family:var(--mono);font-size:12px" placeholder="Paste your backup code"></textarea><div class="btns"><button class="btn g" id="rgo">Restore</button></div></div>
+</div>
+<div id="out"></div>
+</div>
+<footer><div class="wrap">Monop Content · <a href="https://sebbi.pro/x/humankeys/spec">How the proof works</a> · <a href="https://sebbi.pro/k/">Check a code</a></div></footer>
+<script>
+const HK={
+ db(){return new Promise((res,rej)=>{const r=indexedDB.open('sebbi-hk',1);r.onupgradeneeded=()=>r.result.createObjectStore('keys');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})},
+ async get(){try{const d=await HK.db();return await new Promise(res=>{const q=d.transaction('keys').objectStore('keys').get('device');q.onsuccess=()=>res(q.result||null);q.onerror=()=>res(null)})}catch(e){return null}},
+ async put(v){const d=await HK.db();return new Promise(res=>{const t=d.transaction('keys','readwrite');t.objectStore('keys').put(v,'device');t.oncomplete=()=>res(true)})},
+ b64(buf){return btoa(String.fromCharCode(...new Uint8Array(buf)))},
+ b64u(buf){return HK.b64(buf).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')},
+ unb64(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))},
+ alg:{name:'ECDSA',namedCurve:'P-256'},sig:{name:'ECDSA',hash:'SHA-256'},
+ async ensure(){let k=await HK.get();if(k)return {k,fresh:false};
+  const pair=await crypto.subtle.generateKey(HK.alg,true,['sign','verify']);k={privateKey:pair.privateKey,publicKey:pair.publicKey};await HK.put(k);return {k,fresh:true}},
+ async pub(k){return HK.b64(await crypto.subtle.exportKey('spki',k.publicKey))},
+ async backup(k){return HK.b64u(await crypto.subtle.exportKey('pkcs8',k.privateKey))},
+ async sign(k,text){return HK.b64(await crypto.subtle.sign(HK.sig,k.privateKey,new TextEncoder().encode(text)))},
+ async verify(pubB64,sigB64,text){try{const key=await crypto.subtle.importKey('spki',HK.unb64(pubB64),HK.alg,false,['verify']);return await crypto.subtle.verify(HK.sig,key,HK.unb64(sigB64),new TextEncoder().encode(text))}catch(e){return false}},
+ async restore(code){const priv=await crypto.subtle.importKey('pkcs8',HK.unb64(code.trim()),HK.alg,true,['sign']);
+  const jwk=await crypto.subtle.exportKey('jwk',priv);const pubJwk={kty:jwk.kty,crv:jwk.crv,x:jwk.x,y:jwk.y,ext:true};
+  const pub=await crypto.subtle.importKey('jwk',pubJwk,HK.alg,true,['verify']);await HK.put({privateKey:priv,publicKey:pub});return true}
+};
+
+(function(){
+const $=s=>document.querySelector(s);
+const t=$('#t'),cv=$('#cv'),cx=cv.getContext('2d');
+let ch=null,iv=[],last=0,n={inserts:0,deletes:0,multi_inserts:0,multi_chars:0,paste_events:0,paste_chars:0,blurs:0,typed_chars:0},pauses=0;
+let viewer=null;try{viewer=localStorage.getItem('sebbi.viewer')}catch(e){}
+if(!viewer){viewer=Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');try{localStorage.setItem('sebbi.viewer',viewer)}catch(e){}}
+function msg(x,c){const m=$('#msg');m.textContent=x;m.className='msg '+(c||'')}
+async function start(){try{const r=await fetch('/x/humankeys/challenge');ch=await r.json()}catch(e){msg('Could not reach sebbi.pro. Check your connection.','err')}}
+async function wallet(){try{await fetch('/c/hello?viewer='+viewer);const r=await fetch('/x/humankeys/pass?viewer='+viewer);const d=await r.json();const b=d.balance_pence||0;
+ if(d.active){$('#wallet').textContent='Unlimited proofs until '+d.until_uk;$('#topup').style.display='none'}
+ else{$('#wallet').textContent='50p a month, unlimited proofs · wallet £'+(b/100).toFixed(2);$('#topup').style.display=b<50?'inline-block':'none'}
+ return b}catch(e){$('#wallet').textContent='50p a month, unlimited proofs';return 0}}
+start();wallet();
+function tick(){const now=performance.now();if(last){const g=now-last;iv.push(Math.round(g));if(g>2000)pauses++}last=now;if(iv.length>6000)iv.shift();draw();stats()}
+let comp=0;
+t.addEventListener('compositionstart',()=>{comp=0});
+t.addEventListener('compositionend',()=>{comp=0});
+t.addEventListener('beforeinput',e=>{
+ const ty=e.inputType||'';
+ if(ty==='insertFromPaste'||ty==='insertFromDrop'){return}
+ if(ty.startsWith('delete')){n.deletes++;tick();return}
+ if(ty==='insertCompositionText'){
+  const d=(e.data||'').length;const delta=d-comp;comp=d;
+  if(delta<0){n.deletes++}else if(delta===1){n.inserts++;n.typed_chars++}else if(delta>1){n.multi_inserts++;n.multi_chars+=delta}
+  tick();return}
+ if(ty==='insertText'||ty==='insertReplacementText'||ty==='insertLineBreak'||ty==='insertParagraph'){
+  const d=(e.data||'');const len=(ty==='insertLineBreak'||ty==='insertParagraph')?1:Math.max(1,d.length);
+  if(len>1){n.multi_inserts++;n.multi_chars+=len}else{n.inserts++;n.typed_chars++}
+  tick()}
+});
+t.addEventListener('paste',e=>{const d=(e.clipboardData&&e.clipboardData.getData('text'))||'';n.paste_events++;n.paste_chars+=d.length;stats()});
+t.addEventListener('drop',e=>{n.paste_events++;n.paste_chars+=((e.dataTransfer&&e.dataTransfer.getData('text'))||'').length;stats()});
+window.addEventListener('blur',()=>{n.blurs++});
+function stats(){$('#sk').textContent=n.typed_chars+n.multi_inserts;$('#sc').textContent=n.deletes;$('#sp').textContent=pauses;$('#sv').textContent=n.paste_chars;
+ $('#seal').disabled=(n.typed_chars+n.multi_inserts<30)}
+function draw(){const W=cv.width,H=cv.height;cx.clearRect(0,0,W,H);const sl=iv.slice(-120);const bw=W/120;
+ sl.forEach((g,i)=>{const v=Math.min(g,1200)/1200;const h=Math.max(2,v*(H-6));cx.fillStyle=g>2000?'#f0d78a':(g<12?'#ff8a80':'#c9a84c');cx.globalAlpha=.35+.65*(i/sl.length);
+  cx.fillRect(i*bw+1,H-h,bw-2,h)});cx.globalAlpha=1}
+draw();
+function norm(s){return s.normalize('NFC').replace(/\r\n?/g,'\n').trim()}
+async function sha(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('')}
+$('#rst').onclick=e=>{e.preventDefault();const b=$('#rbox');b.style.display=b.style.display==='none'?'block':'none'};
+$('#rgo').onclick=async()=>{try{await HK.restore($('#rcode').value);msg('Key restored. Your proofs are yours on this phone again.','ok');$('#rbox').style.display='none'}catch(e){msg('That backup code did not work. Check it was copied in full.','err')}};
+$('#seal').onclick=async()=>{
+ const btn=$('#seal');btn.disabled=true;btn.textContent='Sealing…';msg('');
+ if(!ch||!ch.sig){await start();if(!ch||!ch.sig){btn.disabled=false;btn.textContent='Seal it';return}}
+ const text=norm(t.value);const h=await sha(text);
+ const body={challenge:ch.challenge,sig:ch.sig,text_hash:h,intervals:iv,counts:Object.assign({final_length:text.length},n),viewer:viewer};
+ let backup=null;
+ try{const r=await HK.ensure();body.pubkey=await HK.pub(r.k);body.owner_sig=await HK.sign(r.k,h);
+  if(r.fresh){backup=await HK.backup(r.k);const em=$('#em').value.trim();if(em){body.backup_email=em;body.backup_code=backup}}}catch(e){}
+ try{const r=await fetch('/x/humankeys/seal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();
+  if(r.status===402){msg(d.message||'Human Keys is 50p a month for unlimited proofs. Top up first.','err');$('#topup').style.display='inline-block';btn.disabled=false;btn.textContent='Seal it';return}
+  if(!r.ok||!d.sealed){msg(d.message||d.error||'Could not seal it.','err');btn.disabled=false;btn.textContent='Seal it';return}
+  d._backup=backup;render(d);wallet();btn.textContent='Sealed';
+ }catch(e){msg('Could not reach sebbi.pro.','err');btn.disabled=false;btn.textContent='Seal it'}};
+function render(d){const cls=d.verdict==='HUMAN_TYPED'?'':(d.verdict==='HUMAN_TYPED_PART_PASTED'?'part':'bad');const s=d.summary||{};
+ const share='✓ Human typed · check it: '+d.check;
+ $('#out').innerHTML='<div class="cert '+cls+'"><div class="seal"><div class="ring">'+(cls==='bad'?'!':'✓')+'</div><h2>'+d.verdict_text+'</h2></div>'+
+ '<div class="code">'+d.code+'</div><div class="wallet">Sealed '+d.sealed_uk+' · block '+d.block_index+'</div>'+
+ '<dl><dt>Keystrokes</dt><dd>'+s.keystrokes+'</dd><dt>Corrections</dt><dd>'+s.corrections+'</dd><dt>Thinking pauses</dt><dd>'+s.thinking_pauses+'</dd><dt>Typing time</dt><dd>'+s.typing_minutes+' min</dd><dt>Composition</dt><dd>'+s.composition_signals+'</dd><dt>Pasted</dt><dd>'+s.pasted_characters+' characters</dd></dl>'+
+ '<div class="btns"><button class="btn" id="cp">Copy the proof line</button><a class="btn g" href="'+d.check+'">Open the check page</a>'+(navigator.share?'<button class="btn g" id="sh">Share</button>':'')+'</div>'+
+ '<p class="wallet" style="margin-top:10px">Badge for websites: '+d.badge+'</p>'+
+ (d.owner_signed?'<p class="wallet" style="margin-top:6px;color:var(--ok2)">✓ Signed by this phone — only you can prove it\'s yours.</p>':'')+
+ (d._backup?'<div style="margin-top:14px;border:1px dashed var(--gold);border-radius:8px;padding:12px"><b style="font-family:var(--mono);font-size:12px;color:var(--gold)">YOUR OWNERSHIP BACKUP CODE · SHOWN ONCE</b><p class="wallet" style="margin:6px 0">'+(d.backup_emailed?'We\'ve emailed it to you too. ':'')+'Keep it private. It restores your key on a new phone.</p><div style="font-family:var(--mono);font-size:11px;word-break:break-all;color:#fff">'+d._backup+'</div><div class="btns"><button class="btn g" id="cpb">Copy backup code</button></div></div>':'')+
+ '</div>';
+ $('#cp').onclick=()=>{navigator.clipboard.writeText(share);$('#cp').textContent='Copied'};
+ const cpb=$('#cpb');if(cpb)cpb.onclick=()=>{navigator.clipboard.writeText(d._backup);cpb.textContent='Copied'};
+ const sh=$('#sh');if(sh)sh.onclick=()=>navigator.share({title:'Human typed',text:share,url:d.check});
+ $('#out').scrollIntoView({behavior:'smooth'})}
+})();
+</script></body></html>"""
+
+CHECK_PAGE = _HEAD + r"""
+<title>Check a Human Keys proof</title>
+<meta name="description" content="Check whether a text was typed by a human, live. Paste it and compare it with the sealed proof. Free.">
+</head><body>
+<div class="top"><div class="wrap"><a class="brand" href="https://sebbi.pro/">AI<b>Leash</b> · Human Keys</a><a class="l" href="https://sebbi.pro/keys">Make a proof</a></div></div>
+<div class="wrap">
+<div class="hero"><div class="kick">CHECK A PROOF</div><h1>Was it typed by <em>a human?</em></h1>
+<p>Enter the code, then paste the text it came with. The text is checked on your own device. Checking is free.</p></div>
+<div class="card"><input id="code" placeholder="HK-XXXX-XXXX" value="__CODE__" autocapitalize="characters">
+<div class="btns"><button class="btn" id="look">Look it up</button></div><div class="msg" id="msg"></div></div>
+<div id="out"></div>
+</div>
+<footer><div class="wrap">Monop Content · <a href="https://sebbi.pro/x/humankeys/spec">How the proof works</a> · <a href="https://sebbi.pro/keys">Make your own · 50p a month</a></div></footer>
+<script>
+const HK={
+ db(){return new Promise((res,rej)=>{const r=indexedDB.open('sebbi-hk',1);r.onupgradeneeded=()=>r.result.createObjectStore('keys');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})},
+ async get(){try{const d=await HK.db();return await new Promise(res=>{const q=d.transaction('keys').objectStore('keys').get('device');q.onsuccess=()=>res(q.result||null);q.onerror=()=>res(null)})}catch(e){return null}},
+ async put(v){const d=await HK.db();return new Promise(res=>{const t=d.transaction('keys','readwrite');t.objectStore('keys').put(v,'device');t.oncomplete=()=>res(true)})},
+ b64(buf){return btoa(String.fromCharCode(...new Uint8Array(buf)))},
+ b64u(buf){return HK.b64(buf).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')},
+ unb64(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))},
+ alg:{name:'ECDSA',namedCurve:'P-256'},sig:{name:'ECDSA',hash:'SHA-256'},
+ async ensure(){let k=await HK.get();if(k)return {k,fresh:false};
+  const pair=await crypto.subtle.generateKey(HK.alg,true,['sign','verify']);k={privateKey:pair.privateKey,publicKey:pair.publicKey};await HK.put(k);return {k,fresh:true}},
+ async pub(k){return HK.b64(await crypto.subtle.exportKey('spki',k.publicKey))},
+ async backup(k){return HK.b64u(await crypto.subtle.exportKey('pkcs8',k.privateKey))},
+ async sign(k,text){return HK.b64(await crypto.subtle.sign(HK.sig,k.privateKey,new TextEncoder().encode(text)))},
+ async verify(pubB64,sigB64,text){try{const key=await crypto.subtle.importKey('spki',HK.unb64(pubB64),HK.alg,false,['verify']);return await crypto.subtle.verify(HK.sig,key,HK.unb64(sigB64),new TextEncoder().encode(text))}catch(e){return false}},
+ async restore(code){const priv=await crypto.subtle.importKey('pkcs8',HK.unb64(code.trim()),HK.alg,true,['sign']);
+  const jwk=await crypto.subtle.exportKey('jwk',priv);const pubJwk={kty:jwk.kty,crv:jwk.crv,x:jwk.x,y:jwk.y,ext:true};
+  const pub=await crypto.subtle.importKey('jwk',pubJwk,HK.alg,true,['verify']);await HK.put({privateKey:priv,publicKey:pub});return true}
+};
+
+(function(){
+const $=s=>document.querySelector(s);
+function msg(x,c){const m=$('#msg');m.textContent=x;m.className='msg '+(c||'')}
+function norm(s){return s.normalize('NFC').replace(/\r\n?/g,'\n').trim()}
+async function sha(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('')}
+const esc=v=>String(v==null?'—':v).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let rec=null;
+async function look(){const code=$('#code').value.trim().toUpperCase();if(!/^HK-[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(code)){msg('Codes look like HK-7Q2M-X9KD.','err');return}
+ msg('Looking it up…');try{const r=await fetch('/x/humankeys/check?code='+code);const d=await r.json();if(!r.ok){msg('No proof with that code.','err');$('#out').innerHTML='';return}
+ rec=d;msg('');render()}catch(e){msg('Could not reach sebbi.pro.','err')}}
+function render(){const d=rec,s=d.summary||{};const cls=d.verdict==='HUMAN_TYPED'?'':(d.verdict==='HUMAN_TYPED_PART_PASTED'?'part':'bad');
+ $('#out').innerHTML='<div class="cert '+cls+'"><div class="seal"><div class="ring">'+(cls==='bad'?'!':'✓')+'</div><h2>'+esc(d.verdict_text)+'</h2></div>'+
+ '<div class="code">'+esc(d.code)+'</div><div class="wallet">Sealed '+esc(d.sealed_uk)+' · <a style="color:var(--gold)" href="'+esc(d.verify_block)+'">block '+esc(d.block_index)+'</a></div>'+
+ '<dl><dt>Keystrokes</dt><dd>'+esc(s.keystrokes)+'</dd><dt>Corrections</dt><dd>'+esc(s.corrections)+'</dd><dt>Thinking pauses</dt><dd>'+esc(s.thinking_pauses)+'</dd><dt>Typing time</dt><dd>'+esc(s.typing_minutes)+' min</dd><dt>Composition</dt><dd>'+esc(s.composition_signals)+'</dd><dt>Pasted</dt><dd>'+esc(s.pasted_characters)+' characters</dd><dt>Session began</dt><dd>'+esc(d.session_started_utc)+'</dd>'+(d.reference?'<dt>Linked to</dt><dd>'+esc(d.reference)+'</dd>':'')+'</dl>'+
+ '<p style="margin-top:16px;color:var(--mut);font-size:14px">Paste the text this code came with:</p><textarea id="txt" style="min-height:140px;margin-top:8px"></textarea>'+
+ '<div class="btns"><button class="btn" id="cmp">Check it matches</button></div><div class="msg" id="res"></div>'+
+ '<div id="own" style="margin-top:18px;border-top:1px solid var(--line);padding-top:14px"></div></div>';
+ ownership();
+ $('#cmp').onclick=async()=>{const h=await sha(norm($('#txt').value));const ok=h===d.text_hash;const r=$('#res');
+  r.textContent=ok?'✓ Exact match. This is the text that was typed and sealed.':'✗ Not a match. This is not the text that was sealed — even one changed character shows here.';r.className='msg '+(ok?'ok':'err')}}
+async function ownership(){const d=rec,box=$('#own');if(!box)return;
+ if(!d.owner_key){box.innerHTML='<p class="wallet">This proof was sealed before ownership keys existed, so it is not tied to a device.</p>';return}
+ const signed=await HK.verify(d.owner_key,d.owner_signature||'',d.text_hash);
+ let h='<p class="msg '+(signed?'ok':'err')+'">'+(signed?'✓ Sealed and signed by its owner\'s device.':'✗ The owner signature does not check out.')+'</p>';
+ const q=new URLSearchParams(location.search),own=q.get('own'),t=q.get('t');
+ if(own&&t){const ok=await HK.verify(d.owner_key,own,'HKOWN|'+d.code+'|'+t);const age=Math.max(0,Math.round(Date.now()/1000-Number(t)));
+  const ago=age<120?age+' seconds ago':(age<7200?Math.round(age/60)+' minutes ago':Math.round(age/3600)+' hours ago');
+  h+=ok?'<div class="cert" style="margin:10px 0 0"><div class="seal"><div class="ring">✓</div><h2>Ownership proven</h2></div><p class="wallet" style="margin-top:8px">The person who sent you this link holds the device that typed it. Signed '+ago+'.</p></div>'
+       :'<p class="msg err">✗ This ownership link is not valid for this proof.</p>'}
+ else{h+='<p class="wallet">Someone showing you this proof can prove it is theirs: ask them to open this page on the phone that typed it and tap the button below, then send you the link.</p>'}
+ h+='<div class="btns"><button class="btn g" id="mine">Prove this is mine</button></div><div class="msg" id="mres"></div>';
+ box.innerHTML=h;
+ $('#mine').onclick=async()=>{const r=$('#mres');const k=await HK.get();
+  if(!k){r.textContent='This phone has no Human Keys key. Restore it from your backup code on https://sebbi.pro/keys';r.className='msg err';return}
+  const mine=(await HK.pub(k))===d.owner_key;if(!mine){r.textContent='This phone does not hold the key for this proof.';r.className='msg err';return}
+  const ts=Math.floor(Date.now()/1000);const sg=await HK.sign(k,'HKOWN|'+d.code+'|'+ts);
+  const link=location.origin+'/k/'+d.code+'?own='+encodeURIComponent(sg)+'&t='+ts;
+  try{await navigator.clipboard.writeText(link)}catch(e){}
+  r.innerHTML='Ownership link copied. Send it to whoever needs proof:<br><span style="word-break:break-all;color:#fff">'+link+'</span>';r.className='msg ok';
+  if(navigator.share)navigator.share({title:'Proof this is mine',url:link}).catch(()=>{})}}
+$('#look').onclick=look;if($('#code').value)look();
+})();
+</script></body></html>"""
 
 ```

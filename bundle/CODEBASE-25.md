@@ -1,1416 +1,1763 @@
-# Codebase — part 25 of 45
+# Codebase — part 25 of 47
 
 Contains:
-- `modules/studio.py`
+- `modules/signed.py`
+- `modules/sortition.py`
 
 
-## `modules/studio.py`
+## `modules/signed.py`
 
-1404 lines, 73250 bytes
+953 lines, 44350 bytes
 
 ```python
 """
-modules/studio.py  v4.0.5
-Monop Studio. Creators upload a video at /create and get back:
+Peer-signed submissions - /x/signed/<action>
 
-  * a teaser video saved to their phone, ready for TikTok, Instagram,
-    Facebook and YouTube - the first few seconds play clear, then the picture
-    blurs behind an end card with the video's link and a QR code burned into
-    the pixels, so it survives any upload anywhere;
-  * a short link, https://sebbi.pro/v/<id>, that opens straight onto that
-    video in the 10p Wing (modules/cinema.py);
-  * a channel link for their bio, https://sebbi.pro/cinema/@<name>.
+WHAT CHANGED IN 1.1
+-------------------
+Three things, all of the same kind: a field that read stronger than it was.
 
-Viewers watch the teaser free, then pay 10p to watch the rest. A viewer with
-no credit taps Google Pay or Apple Pay once (Stripe Checkout), GBP 1 or GBP 5
-lands on their phone as credit, 10p comes off and the video plays. No account.
-Stripe's card fee (1.5% + 20p) is added on top of the credit and shown before
-paying, so the full credit is spent on videos: GBP 1 credit costs GBP 1.22.
+1. receipt_seq is a real number now.
 
-The creator gets 70% of every paid view, less 50p a month per video which is
-only ever taken from that video's own earnings - a video that earns nothing
-costs nothing. Balances and payouts run on modules/credits.py (/earn), and
-every paid view, payment and upload is sealed into the chain.
+   This lane returned whatever server.py's seal() gave back for the
+   sequence, and passed the literal string "public-signed" as the api_key.
+   That is not a row in api_keys, so the UPDATE matched nothing, the SELECT
+   returned nothing, and the value was always null. The field sat in the
+   response named as though it were a receipt sequence, carrying nothing.
 
-Routes (all served by a runtime do_GET / do_POST patch, like credits.py):
-  GET  /create                       the creator page
-  GET  /v/<id>                       one tap -> the video in the 10p Wing
-  GET  /v/<id>/teaser                the free teaser video
-  GET  /v/<id>/poster.jpg            the still
-  GET  /v/<id>/full?viewer=&t=       the full video, for viewers who paid
-  POST /v/api/join | signin | new | chunk | finish | mine | delete
-  GET  /v/api/state?id=&viewer=      unlocked? balance? price?
-  POST /v/api/unlock | pay | paid | report
-  GET  /v/api/admin?key=&do=list|remove&id=     (CREDITS_ADMIN_KEY)
-  GET  /x/studio/status              arms the routes after a deploy
+   The point of a sequence is that a holder of receipts N and N+2 can PROVE
+   N+1 exists and was not received. A null cannot do that, so this lane had
+   no completeness property while appearing to offer one.
 
-Railway variables (all optional):
-  STUDIO_DIR          where videos are kept (default: the folder DB_PATH is in)
-  STUDIO_MAX_MB       biggest upload in MB (default 20000 - about three hours of phone video)
-  STUDIO_PACKS        credit packs in pence (default 100,500)
-  STUDIO_MONTHLY_FEE  pence per video per month, from its earnings (default 50)
-  STUDIO_CARD_FEE_PCT / STUDIO_CARD_FEE_PENCE   the card fee added on top (1.5 / 20)
-Stripe uses the key server.py already has (STRIPE_SECRET). Apple Pay and
-Google Pay show on the Stripe payment page when they are switched on in the
-Stripe dashboard (Settings > Payment methods).
+   Found on the sibling lane at /x/peer/submit by Philip Pinol (PRAXIS),
+   whose schema required an integer and got a null. Same fault here, fixed
+   before anybody hit it. The sequence is now issued by this module, per
+   enrolled name, inside the same lock hold that writes the row.
+
+2. A failed seal no longer returns a receipt.
+
+   ctx["seal"] was called and its result used without checking. If it
+   raised or came back without a hash, this lane would have returned a
+   success body with nothing behind it - the exact hollow receipt that
+   turned up on the peer lane on 2026-08-26. It now returns 500, records
+   nothing, and says why.
+
+3. Enrolment and rotation report whether they sealed.
+
+   Both were sealing as a side effect and ignoring the outcome. The
+   operation still happens - a key is a database row and a failed audit
+   note does not un-enrol it - but the response says sealed true or false
+   with the error, rather than leaving it to be assumed.
+
+The server-wide key counter is still returned, as key_seq, and is still
+null. Reported rather than omitted so the absence is visible instead of
+inferred, which is the confusion that made this worth fixing at all.
+
+THE GAP THIS CLOSES
+-------------------
+Two people arrived at the same missing piece from opposite directions on the
+same day.
+
+Ishaan (Shango MID) read the existing signed lane and said, correctly, that
+"binds a name to a secret rather than to an address" reads stronger than it
+is. An HMAC uses a shared secret. A shared secret is held by both parties. So
+it proves the submission came from SOMEONE HOLDING THE SECRET - which is the
+peer and also the operator of this deployment. It closes third-party
+submission under a peer's name. It does not close operator submission under a
+peer's name.
+
+Chidi (ViriSIM) came at it from the regulator's side: for the evidence to mean
+anything to a third party, the customer has to sign, not the platform holding
+the customer's records.
+
+Same gap. This module closes it.
+
+HOW
+---
+The peer generates an Ed25519 keypair and keeps the private half. This
+deployment is given ONLY the public half. A public key is not a secret and
+grants nothing: it verifies a signature and cannot produce one.
+
+From then on, a submission under that name is accepted only if it carries a
+signature this deployment can verify against that public key - and this
+deployment CANNOT create such a signature, because it does not hold the
+private key and never has. The property is not a promise about our conduct.
+It is arithmetic.
+
+WHAT THIS MEANS FOR THE RECORD
+------------------------------
+The other lanes answer "did somebody hand us this tip". This lane answers
+"did the holder of this key hand us this tip", and the difference matters
+precisely when the operator is the party you are worried about.
+
+A regulator or auditor reading a signed observation does not have to trust
+this deployment about who submitted it. They can take the public key from
+/x/signed/keys, take the canonical message and the signature from the record,
+and check it themselves with any Ed25519 library in any language.
+
+WHAT IT STILL DOES NOT DO
+-------------------------
+- It does not prove the records behind the tip are true. Nothing here does.
+- It does not prove completeness of the peer's own chain. A signed chain can
+  still omit records. Catching that needs an audit protocol, not
+  cryptography - see Chidi's incognito-user test, which is the only thing
+  anyone has proposed that attacks it. Note this is a different claim from
+  the receipt sequence below, which is about completeness of the receipts WE
+  issued, not of the records THEY sealed.
+- It does not prove who the keyholder IS. It proves the same party signed
+  each time. Identity is a separate problem and this does not solve it.
+- Enrolment is open, so the first party to enrol a name gets it. Same as
+  everywhere else in this standard, that is detection rather than
+  prevention: an enrolment is sealed, permanent and public, and an enrolment
+  placed over a name already seen in the witness log is flagged as such.
+
+WHY THE OPERATOR CANNOT QUIETLY SWAP A KEY
+------------------------------------------
+The obvious attack on the whole idea: the operator replaces the peer's public
+key with one of their own, then signs freely. So there is no route that
+overwrites a key. Rotation exists, and a rotation must itself be signed by
+the key being replaced. An operator who does not hold the current private key
+cannot rotate it, and every rotation is sealed into the chain with both keys
+recorded. A peer who has lost their key cannot rotate either - they enrol a
+new name, and the abandoned one stays visible.
+
+CANONICAL MESSAGE
+-----------------
+Exactly this, UTF-8, no trailing newline, four lines joined by \\n:
+
+    aileash-signed-v1
+    <chain>
+    <tip>
+    <ts>
+
+  chain  the peer name, lowercase, as enrolled
+  tip    64 lowercase hex characters
+  ts     integer epoch seconds, no decimal point
+
+Sign those bytes with the Ed25519 private key. Send the 64-byte signature as
+128 lowercase hex characters. The message is deliberately short, positional
+and free of JSON so that two implementations cannot disagree about how to
+build it.
+
+Rotation signs a different message with the SAME shape:
+
+    aileash-rotate-v1
+    <chain>
+    <new public key, 64 hex>
+    <ts>
+
+REPLAY
+------
+A signature is a bearer token for the statement it signs. Anyone who sees one
+can send it again. So: ts must be within SKEW_PAST seconds behind and
+SKEW_FUTURE ahead of our clock, ts must be strictly greater than the last ts
+we accepted for that name, and an exact repeat of a signature already stored
+is refused. None of that is exotic - it is the ordinary set, written down so
+nobody has to guess which of them we do.
+
+WHY THIS LANE REJECTS, WHEN THE OPEN LANE NEVER DOES
+----------------------------------------------------
+/x/witness/observe seals everything and describes what it sealed, because
+refusing an anonymous submission would mean deciding who is allowed to be
+recorded. This lane is the opposite case. A submission whose signature does
+not verify has no business being written into a name's history at all - the
+harm is exactly that it would sit in the record looking like an event
+involving that peer. So this lane refuses, says why, and seals nothing.
+
+    GET  /x/signed/spec                  the protocol
+    GET  /x/signed/keys                  every enrolled name and public key
+    POST /x/signed/enroll                chain, pubkey
+    POST /x/signed/submit                chain, tip, ts, signature
+    POST /x/signed/rotate                chain, new_pubkey, ts, signature
+    GET  /x/signed/verify?peer=&tip=     the receipt, with everything a third
+                                         party needs to check it themselves
 """
 
-import base64
-import gzip
 import hashlib
-import hmac
-import importlib
-import json
-import math
-import os
 import re
-import secrets
-import shutil
-import sys
-import threading
 import time
-import urllib.parse
-from collections import defaultdict, deque
+from datetime import datetime, timezone
 
-VERSION = "4.0.5"
-PUBLIC = {("GET", "status"), ("GET", "spec")}
+VERSION = "1.1.1"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX128 = re.compile(r"^[0-9a-f]{128}$")
 
-SITE = (os.environ.get("HOST") or "https://sebbi.pro").strip().rstrip("/")
+MSG_PREFIX = "aileash-signed-v1"
+ROTATE_PREFIX = "aileash-rotate-v1"
 
+# Replay window. Generous enough for a batch job on a slow link, tight enough
+# that a captured signature is not useful for long.
+SKEW_PAST = 900
+SKEW_FUTURE = 120
 
-def _int_env(name, default, lo, hi):
-    try:
-        return max(lo, min(hi, int(os.environ.get(name, default))))
-    except (TypeError, ValueError):
-        return default
+# Everything here is readable and usable without an account. A verification
+# lane that only account holders can check is not a verification lane.
+PUBLIC = {("GET", "spec"), ("GET", "keys"), ("GET", "verify"),
+          ("POST", "enroll"), ("POST", "submit"), ("POST", "rotate")}
 
+MAX_LIST = 500
 
-MAX_BYTES = _int_env("STUDIO_MAX_MB", 20000, 20, 100000) * 1024 * 1024
-TEASER_MAX = 120 * 1024 * 1024
-POSTER_MAX = 4 * 1024 * 1024
-CHUNK_MAX = 9 * 1024 * 1024
-MONTHLY_FEE = _int_env("STUDIO_MONTHLY_FEE", 50, 0, 1000)
-FEE_PERIOD = 30 * 86400
-SHARE = 0.70
-PRICES = (10, 20, 50, 100)
-KEEP_FREE = 1024 * 1024 * 1024
+# What this lane files its own audit rows under. Deliberately not a real
+# api_key - it is a label, and it is exactly why server.py's per-key
+# sequence comes back null here. See _seq_note.
+FILED_UNDER = "public-signed"
 
+MESSAGES = {
+    "what_this_proves": (
+        "That the holder of the enrolled private key produced this exact "
+        "statement - name, tip and timestamp - and that we sealed it at the "
+        "recorded time. This deployment holds only the public key and cannot "
+        "produce such a signature, so it is not a claim you have to take on "
+        "our word. Recheck it yourself with any Ed25519 library."),
+    "what_this_does_not_prove": (
+        "Nothing about whether the records behind the tip are true, nothing "
+        "about whether the peer's chain is complete, and nothing about who "
+        "the keyholder is in the world. It proves the same party signed each "
+        "time."),
+    "enrolled": (
+        "This name is now bound to this public key permanently. We cannot "
+        "change it - rotation requires a signature from the key being "
+        "replaced, which we do not hold."),
+    "keys_note": (
+        "Public keys are not secrets. They are published so that anyone can "
+        "verify a signed observation without asking us for anything."),
+    "seq": (
+        "An integer, never null, incremented by exactly one for each accepted "
+        "submission UNDER THIS NAME on this lane. Issued inside the same lock "
+        "that writes the record, so a number is never spent on a submission "
+        "that was not stored. Two receipts numbered N and N+2 prove a third "
+        "exists that you did not receive. The current highest is published at "
+        "/x/signed/keys, so the check does not depend on asking us."),
+    "key_seq": (
+        "The server-wide per-API-key sequence, which is null on this lane and "
+        "always will be. That counter lives on an api_key row, and this lane "
+        "files under a label rather than a key because it authenticates by "
+        "signature and issues nobody an account. It is returned rather than "
+        "omitted so the absence is visible instead of inferred. Before 1.1 "
+        "this null was reported as receipt_seq, which made a missing property "
+        "look like a broken field."),
+    "seq_survives_rotation": (
+        "Rotating the key does not reset the sequence. It belongs to the "
+        "name's submission history rather than to the key, so a rotation "
+        "cannot be used to erase a gap."),
+}
 
-def _packs():
-    out = []
-    for p in (os.environ.get("STUDIO_PACKS") or "100,500").split(","):
-        try:
-            v = int(p.strip())
-        except ValueError:
-            continue
-        if 50 <= v <= 10000 and v not in out:
-            out.append(v)
-    return sorted(out) or [100, 500]
-
-
-PACKS = _packs()
-
-
-def _fee_env(name, default):
-    try:
-        return max(0.0, float(os.environ.get(name, default)))
-    except (TypeError, ValueError):
-        return float(default)
-
-
-CARD_FEE_PCT = _fee_env("STUDIO_CARD_FEE_PCT", 1.5)
-CARD_FEE_PENCE = _fee_env("STUDIO_CARD_FEE_PENCE", 20)
-
-
-def _charge(credit):
-    """What the viewer pays so that, after Stripe's card fee, the full credit is left."""
-    return int(math.ceil((credit + CARD_FEE_PENCE) / (1 - CARD_FEE_PCT / 100.0)))
-
-ID_RE = re.compile(r"^[a-z0-9]{8}$")
-VIEWER_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
-OWNER_RE = re.compile(r"^owner:cr_[a-f0-9]{20}$")
-SESSION_RE = re.compile(r"^cs_[A-Za-z0-9_]{8,200}$")
-PI_RE = re.compile(r"^pi_[A-Za-z0-9_]{8,200}$")
-TITLE_CLEAN = re.compile(r"[<>\"\\\x00-\x1f]")
-ALPHA = "abcdefghijkmnpqrstuvwxyz23456789"
-
-KINDS = {"full": ("full", MAX_BYTES), "teaser": ("teaser", TEASER_MAX), "poster": ("jpg", POSTER_MAX)}
-
-_ctx = {}
-_cr = None
 _ready = False
-_patched = False
-_dir_cache = None
-_ulocks = defaultdict(threading.Lock)
-_wins = defaultdict(deque)
-_wins_lock = threading.Lock()
-
-_CREATE_GZ = (
-    "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"
-    "ArsKMKkC0wAA"
-)
 
 
-def _page(b):
-    return gzip.decompress(base64.b64decode("".join(b.split())))
+# ----------------------------------------------------------------------
+# Ed25519 verification, RFC 8032, pure standard library
+#
+# Deliberately no third-party dependency. This deployment runs on a small
+# box and a verification routine that needs a native extension is a
+# verification routine that stops working on a platform migration. Extended
+# homogeneous coordinates so a verify is milliseconds rather than seconds.
+#
+# Verify only. There is no signing function in this file, and that is not an
+# oversight - there is nothing here that could be turned into a way for this
+# deployment to produce a peer's signature.
+# ----------------------------------------------------------------------
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
 
 
-CREATE_HTML = _page(_CREATE_GZ)
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != 0:
+        x = _P - x
+    return x
 
 
-# ------------------------------------------------------------------ plumbing
-
-def _credits():
-    """The credits module holds balances, creator accounts and Stripe."""
-    global _cr
-    if _cr is not None:
-        return _cr
-    m = sys.modules.get("modules.credits") or importlib.import_module("modules.credits")
-    if "conn" in _ctx:
-        m._ctx.update(_ctx)
-        m._setup()
-    _cr = m
-    return m
+_BY = 4 * pow(5, _P - 2, _P) % _P
+_BX = _xrecover(_BY)
+_B = (_BX % _P, _BY % _P, 1, _BX * _BY % _P)
 
 
-def _storage():
-    """(folder, survives_redeploys)"""
-    global _dir_cache
-    if _dir_cache:
-        return _dir_cache
-    cands = []
-    if os.environ.get("STUDIO_DIR", "").strip():
-        cands.append((os.environ["STUDIO_DIR"].strip(), True))
-    db = os.environ.get("DB_PATH", "").strip()
-    if db and os.path.dirname(db):
-        cands.append((os.path.join(os.path.dirname(db), "studio"), True))
-    if os.path.isdir("/data"):
-        cands.append(("/data/studio", True))
-    cands.append((os.path.abspath("studio_media"), False))
-    for d, persistent in cands:
-        try:
-            os.makedirs(d, exist_ok=True)
-            if os.access(d, os.W_OK):
-                _dir_cache = (d, persistent)
-                return _dir_cache
-        except Exception:
-            continue
-    _dir_cache = (os.path.abspath("."), False)
-    return _dir_cache
+def _add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * 2 * _D * t2 % _P
+    dd = z1 * 2 * z2 % _P
+    e = b - a
+    f = dd - c
+    g = dd + c
+    h = b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
 
 
-def _path(vid, kind, part=False):
-    return os.path.join(_storage()[0], "%s.%s%s" % (vid, KINDS[kind][0], ".part" if part else ""))
+def _double(p):
+    return _add(p, p)
 
 
-def _setup():
+def _scalarmult(p, e):
+    if e == 0:
+        return (0, 1, 1, 0)
+    q = _scalarmult(p, e >> 1)
+    q = _double(q)
+    if e & 1:
+        q = _add(q, p)
+    return q
+
+
+def _decodepoint(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x = _xrecover(y)
+    if x & 1 != (raw[31] >> 7) & 1:
+        x = _P - x
+    point = (x, y, 1, x * y % _P)
+    # on-curve check: -x^2 + y^2 = 1 + d x^2 y^2
+    if (-x * x + y * y - 1 - _D * x * x * y * y) % _P != 0:
+        return None
+    return point
+
+
+def _equal(p, q):
+    x1, y1, z1, _t1 = p
+    x2, y2, z2, _t2 = q
+    if (x1 * z2 - x2 * z1) % _P != 0:
+        return False
+    if (y1 * z2 - y2 * z1) % _P != 0:
+        return False
+    return True
+
+
+def ed25519_verify(public_key, message, signature):
+    """True if signature is a valid Ed25519 signature of message under
+    public_key. Bytes in, bool out, never raises."""
+    try:
+        if len(public_key) != 32 or len(signature) != 64:
+            return False
+        a = _decodepoint(public_key)
+        if a is None:
+            return False
+        r_raw = signature[:32]
+        r = _decodepoint(r_raw)
+        if r is None:
+            return False
+        s = int.from_bytes(signature[32:], "little")
+        if s >= _L:
+            return False
+        h = int.from_bytes(
+            hashlib.sha512(r_raw + public_key + message).digest(), "little") % _L
+        left = _scalarmult(_B, s)
+        right = _add(r, _scalarmult(a, h))
+        return _equal(left, right)
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
+# storage
+# ----------------------------------------------------------------------
+
+def _setup(ctx):
     global _ready
-    if _ready or "conn" not in _ctx:
+    if _ready:
         return
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS studio_video(id TEXT PRIMARY KEY,account TEXT,creator TEXT,"
-                  "title TEXT,price INTEGER,free_seconds INTEGER,created REAL,status TEXT,"
-                  "full_size INTEGER,full_mime TEXT,teaser_size INTEGER,teaser_mime TEXT,"
-                  "plays INTEGER DEFAULT 0,unlocks INTEGER DEFAULT 0,earned INTEGER DEFAULT 0,"
-                  "fees INTEGER DEFAULT 0,fee_period INTEGER DEFAULT -1,fee_taken INTEGER DEFAULT 0,"
-                  "likes INTEGER DEFAULT 0,comments INTEGER DEFAULT 0,sha256 TEXT,"
-                  "audit_hash TEXT,block_index INTEGER,live_at REAL)")
-        try:
-            c.execute("ALTER TABLE studio_video ADD COLUMN tags TEXT DEFAULT ''")
-        except Exception:
-            pass
-        c.execute("CREATE INDEX IF NOT EXISTS studio_video_account ON studio_video(account)")
-        c.execute("CREATE INDEX IF NOT EXISTS studio_video_status ON studio_video(status)")
-        c.execute("CREATE TABLE IF NOT EXISTS studio_meta(k TEXT PRIMARY KEY,v TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS studio_report(id INTEGER PRIMARY KEY AUTOINCREMENT,video TEXT,"
-                  "reason TEXT,at REAL,who TEXT)")
-        row = c.execute("SELECT v FROM studio_meta WHERE k='secret'").fetchone()
-        if not row:
-            c.execute("INSERT INTO studio_meta(k,v) VALUES('secret',?)", (secrets.token_hex(32),))
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS signed_keys("
+                  "peer TEXT PRIMARY KEY,pubkey TEXT,enrolled REAL,"
+                  "audit_hash TEXT,block_index INTEGER,"
+                  "rotations INTEGER DEFAULT 0,last_ts REAL,note TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS signed_log("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,peer TEXT,tip TEXT,"
+                  "peer_ts REAL,observed REAL,signature TEXT,pubkey TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_peer ON signed_log(peer,id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sig_tip ON signed_log(tip)")
+
+        # Added in 1.1. The receipt counter, per enrolled name, in its own
+        # table so the counter survives anything that happens to the key row
+        # - including a rotation. A rotation that reset the sequence could be
+        # used to erase a gap, which is the one thing the sequence exists to
+        # make impossible.
+        c.execute("CREATE TABLE IF NOT EXISTS signed_seq("
+                  "peer TEXT PRIMARY KEY, last_seq INTEGER DEFAULT 0)")
         c.commit()
-    _credits()
     _ready = True
 
 
-def _secret():
-    with _ctx["lock"]:
-        return _ctx["conn"].execute("SELECT v FROM studio_meta WHERE k='secret'").fetchone()[0]
-
-
-def _token(vid, viewer):
-    return hmac.new(_secret().encode(), ("%s|%s" % (vid, viewer)).encode(), hashlib.sha256).hexdigest()[:40]
-
-
-def _seal(kind, detail, extra):
-    ex = {"studio_version": VERSION}
-    ex.update(extra or {})
-    try:
-        return _credits()._seal(kind, detail, ex)
-    except Exception:
-        return None, None
-
-
-def _limit(who, group, per_min, per_hour):
-    t = time.time()
-    k = group + "|" + who
-    with _wins_lock:
-        w = _wins[k]
-        while w and w[0] < t - 3600:
-            w.popleft()
-        if len(w) >= per_hour or sum(1 for x in w if x > t - 60) >= per_min:
-            return False
-        w.append(t)
-        if len(_wins) > 20000:
-            for key in [x for x, v in _wins.items() if not v or v[-1] < t - 3600][:5000]:
-                del _wins[key]
-    return True
-
-
-def _ip(h):
-    try:
-        xff = h.headers.get("X-Forwarded-For", "")
-        if xff:
-            return xff.split(",")[0].strip()[:64]
-        return str(h.client_address[0])[:64]
-    except Exception:
-        return "unknown"
-
-
-def _slug(name):
-    return urllib.parse.quote(str(name or "").replace(" ", "_"))
-
-
-def _size(n):
-    return "%.1f GB" % (n / 1073741824.0) if n >= 1073741824 else "%d MB" % max(1, n // 1048576)
-
-
-def _gbp(p):
-    return "£%d.%02d" % (p // 100, p % 100) if p >= 100 else "%dp" % p
-
-
-COLS = ("id,account,creator,title,price,free_seconds,created,status,full_size,full_mime,teaser_size,"
-        "teaser_mime,plays,unlocks,earned,fees,fee_period,fee_taken,likes,comments,sha256,audit_hash,"
-        "block_index,live_at,tags")
-
-
-def _video(vid):
-    if not ID_RE.match(vid or ""):
+def _iso(ts):
+    if not ts:
         return None
-    with _ctx["lock"]:
-        r = _ctx["conn"].execute("SELECT " + COLS + " FROM studio_video WHERE id=?", (vid,)).fetchone()
-    return dict(zip(COLS.split(","), r)) if r else None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
-def _public(v):
-    return {"id": v["id"], "title": v["title"], "creator": v["creator"], "price": v["price"],
-            "price_label": _gbp(v["price"]), "free_seconds": v["free_seconds"],
-            "plays": v["plays"], "paid_views": v["unlocks"], "likes": v["likes"],
-            "comments": v["comments"], "link": SITE + "/v/" + v["id"],
-            "teaser": "/v/%s/teaser" % v["id"], "poster": "/v/%s/poster.jpg" % v["id"],
-            "channel": SITE + "/cinema/@" + _slug(v["creator"]),
-            "live_at": v["live_at"], "block_index": v["block_index"],
-            "tags": [t for t in (v.get("tags") or "").split(" ") if t]}
+def _peer_name(data):
+    return str(data.get("chain") or data.get("peer") or "").strip().lower()
 
 
-def _acct(q, b):
-    key = str(b.get("key") or q.get("key") or "").strip()
-    return _credits()._account(key)
+def _key_row(ctx, peer):
+    with ctx["lock"]:
+        return ctx["conn"].execute(
+            "SELECT pubkey,enrolled,audit_hash,block_index,rotations,last_ts "
+            "FROM signed_keys WHERE peer=?", (peer,)).fetchone()
 
 
-def _ensure_viewer(viewer):
-    with _ctx["lock"]:
-        _ctx["conn"].execute("INSERT OR IGNORE INTO credit_viewer(id,balance,spent,created) VALUES(?,0,0,?)",
-                             (viewer, time.time()))
-        _ctx["conn"].commit()
-        r = _ctx["conn"].execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()
-    return r[0] if r else 0
-
-
-def _unlocked(vid, viewer):
-    with _ctx["lock"]:
-        r = _ctx["conn"].execute("SELECT block_index FROM credit_unlock WHERE viewer=? AND video=?",
-                                 (viewer, "st:" + vid)).fetchone()
-    return (True, r[0]) if r else (False, None)
-
-
-# ------------------------------------------------------------------ creators
-
-def a_join(q, b, h):
-    if not _limit(_ip(h), "join", 3, 10):
-        return {"error": "slow_down", "message": "Too many tries. Wait a minute."}, 429
-    return _credits().c_creator_join(q, b)
-
-
-def a_signin(q, b, h):
-    acct = _acct(q, b)
-    if not acct:
-        return {"error": "bad_key", "message": "That key wasn't recognised."}, 403
-    return {"name": acct["name"], "creator_id": acct["id"],
-            "channel": SITE + "/cinema/@" + _slug(acct["name"])}, 200
-
-
-def a_new(q, b, h):
-    acct = _acct(q, b)
-    if not acct:
-        return {"error": "bad_key", "message": "Sign in again, your key wasn't recognised."}, 403
-    if not _limit(acct["id"], "new", 6, 40):
-        return {"error": "slow_down", "message": "That's a lot of uploads. Try again in a few minutes."}, 429
-    title = TITLE_CLEAN.sub("", str(b.get("title") or "")).strip()[:80]
-    if len(title) < 2:
-        return {"error": "title", "message": "Give your video a name so people can find it."}, 400
-    if not b.get("rights"):
-        return {"error": "rights", "message": "Tick the box to confirm the video is yours to sell."}, 400
+def _latest_seq(ctx, peer):
+    """Highest receipt number issued to this name. 0 if none."""
     try:
-        price = int(b.get("price") or 10)
-    except (TypeError, ValueError):
-        price = 10
-    if price not in PRICES:
-        price = 10
-    tags = []
-    for t in re.split(r"[\s,]+", str(b.get("tags") or "")):
-        t = re.sub(r"[^A-Za-z0-9_]", "", t.lstrip("#"))[:24].lower()
-        if t and "#" + t not in tags:
-            tags.append("#" + t)
-    tags = " ".join(tags[:8])
-    try:
-        free = max(3, min(30, int(b.get("free_seconds") or 8)))
-    except (TypeError, ValueError):
-        free = 8
-    try:
-        size = int(b.get("full_size") or 0)
-    except (TypeError, ValueError):
-        size = 0
-    if size <= 0:
-        return {"error": "no_video", "message": "Pick a video first."}, 400
-    if size > MAX_BYTES:
-        return {"error": "too_big", "message": "That video is %d MB. The limit is %d MB - trim it and try again."
-                % (size // 1048576, MAX_BYTES // 1048576)}, 413
-    mime = str(b.get("full_mime") or "video/mp4")[:60]
-    if not mime.startswith("video/"):
-        mime = "video/mp4"
-    try:
-        free_disk = shutil.disk_usage(_storage()[0]).free
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
     except Exception:
-        free_disk = 0
-    if free_disk < size + TEASER_MAX + KEEP_FREE:
-        print("STUDIO: upload of %d MB refused, %d MB free on the video volume" % (size // 1048576, free_disk // 1048576), flush=True)
-        return {"error": "full", "message": "That video is %s. There isn't room for it right now - try a shorter clip, "
-                "or try again later." % _size(size)}, 507
-    _sweep()
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        for _ in range(20):
-            vid = "".join(secrets.choice(ALPHA) for _ in range(8))
-            if not c.execute("SELECT 1 FROM studio_video WHERE id=?", (vid,)).fetchone():
-                break
-        c.execute("INSERT INTO studio_video(id,account,creator,title,price,free_seconds,created,status,"
-                  "full_size,full_mime,tags) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                  (vid, acct["id"], acct["name"], title, price, free, time.time(), "uploading", size, mime, tags))
-        c.commit()
-    return {"id": vid, "link": SITE + "/v/" + vid, "short": SITE.split("//")[-1] + "/v/" + vid,
-            "title": title, "price": price, "free_seconds": free, "creator": acct["name"],
-            "channel": SITE + "/cinema/@" + _slug(acct["name"]), "chunk": 4 * 1024 * 1024}, 200
+        return 0
 
 
-def _sweep():
-    """Clear uploads that were started and never finished (older than a day)."""
-    cutoff = time.time() - 86400
-    with _ctx["lock"]:
-        old = [r[0] for r in _ctx["conn"].execute(
-            "SELECT id FROM studio_video WHERE status='uploading' AND created<? LIMIT 50", (cutoff,)).fetchall()]
-    for vid in old:
-        for kind in KINDS:
-            try:
-                os.remove(_path(vid, kind, True))
-            except OSError:
-                pass
-        with _ctx["lock"]:
-            _ctx["conn"].execute("UPDATE studio_video SET status='abandoned' WHERE id=?", (vid,))
-            _ctx["conn"].commit()
+def _try_seal(ctx, event, result, when, api_key):
+    """Seal, and say plainly whether it worked.
 
-
-def _magic_ok(kind, head):
-    if kind == "poster":
-        return head[:3] == b"\xff\xd8\xff"
-    if len(head) >= 8 and head[4:8] == b"ftyp":
-        return True
-    if head[:4] == b"\x1a\x45\xdf\xa3":
-        return True
-    return False
-
-
-def chunk(h, q):
-    """Raw bytes, appended at an offset. Retries and resumes are safe."""
-    vid = str(q.get("id") or "")
-    kind = str(q.get("kind") or "")
+    Returns (audit_hash, block_index, key_seq, error). Nothing here swallows
+    a failure. Before 1.1 the result was used without checking, which is how
+    a hollow receipt gets issued.
+    """
     try:
-        offset = int(q.get("offset") or 0)
-        n = int(h.headers.get("Content-Length") or 0)
-    except (TypeError, ValueError):
-        return {"error": "bad_request"}, 400
-    if kind not in KINDS or n < 0 or n > CHUNK_MAX:
-        return {"error": "bad_request", "message": "Bad upload piece."}, 400
-    data = _read(h, n)
-    if data is None:
-        return {"error": "cut_off", "message": "Connection dropped. Retrying."}, 400
-    acct = _credits()._account(h.headers.get("X-Creator-Key", ""))
-    if not acct:
-        return {"error": "bad_key", "message": "Sign in again."}, 403
-    v = _video(vid)
-    if not v or v["account"] != acct["id"]:
-        return {"error": "not_found"}, 404
-    if v["status"] != "uploading":
-        return {"error": "finished", "message": "That video is already live."}, 409
-    cap = KINDS[kind][1] if kind != "full" else v["full_size"]
-    p = _path(vid, kind, True)
-    with _ulocks[vid + kind]:
-        got = os.path.getsize(p) if os.path.exists(p) else 0
-        if offset > got:
-            return {"error": "gap", "got": got}, 409
-        if offset + len(data) > cap:
-            return {"error": "too_big", "message": "That file is bigger than it said it was."}, 413
-        if offset == 0 and not _magic_ok(kind, data[:16]):
-            return {"error": "not_video", "message": "That doesn't look like a video file we can play."}, 415
-        if offset + len(data) <= got and offset < got:
-            return {"got": got}, 200
-        with open(p, "r+b" if os.path.exists(p) else "wb") as f:
-            f.seek(offset)
-            f.write(data)
-            f.truncate(offset + len(data))
-        got = offset + len(data)
-    return {"got": got}, 200
+        h, idx, seq = ctx["seal"](event, result, when, api_key)
+    except Exception as exc:
+        return None, None, None, "%s: %s" % (type(exc).__name__, str(exc)[:300])
+    if not h:
+        return None, None, None, "seal returned no audit hash"
+    return h, idx, seq, None
 
 
-def _read(h, n):
-    out = bytearray()
-    while len(out) < n:
-        try:
-            part = h.rfile.read(min(65536, n - len(out)))
-        except Exception:
-            return None
-        if not part:
-            return None
-        out += part
-    return bytes(out)
+def _seen_in_open_lane(ctx, peer):
+    """Has this name already appeared in the open witness log?
 
-
-def _sha_file(p):
-    s = hashlib.sha256()
-    with open(p, "rb") as f:
-        for blk in iter(lambda: f.read(1048576), b""):
-            s.update(blk)
-    return s.hexdigest()
-
-
-def a_finish(q, b, h):
-    acct = _acct(q, b)
-    if not acct:
-        return {"error": "bad_key", "message": "Sign in again."}, 403
-    v = _video(str(b.get("id") or ""))
-    if not v or v["account"] != acct["id"]:
-        return {"error": "not_found"}, 404
-    if v["status"] == "live":
-        return {"live": True, "video": _public(v)}, 200
-    if v["status"] != "uploading":
-        return {"error": "gone"}, 410
-    fp, tp, pp = _path(v["id"], "full", True), _path(v["id"], "teaser", True), _path(v["id"], "poster", True)
-    fs = os.path.getsize(fp) if os.path.exists(fp) else 0
-    ts = os.path.getsize(tp) if os.path.exists(tp) else 0
-    if fs != v["full_size"]:
-        return {"error": "incomplete", "message": "The video didn't finish uploading.", "got": fs}, 409
-    if ts <= 0:
-        return {"error": "incomplete", "message": "The teaser didn't finish uploading."}, 409
-    tmime = str(b.get("teaser_mime") or "video/mp4")
-    tmime = "video/webm" if "webm" in tmime else "video/mp4"
-    os.replace(fp, _path(v["id"], "full"))
-    os.replace(tp, _path(v["id"], "teaser"))
-    if os.path.exists(pp):
-        os.replace(pp, _path(v["id"], "poster"))
-    with _ctx["lock"]:
-        _ctx["conn"].execute("UPDATE studio_video SET status='live',teaser_size=?,teaser_mime=?,live_at=? WHERE id=?",
-                             (ts, tmime, time.time(), v["id"]))
-        _ctx["conn"].commit()
-    threading.Thread(target=_fingerprint, args=(v["id"], v["creator"], v["price"], fs), daemon=True).start()
-    return {"live": True, "video": _public(_video(v["id"]))}, 200
-
-
-def _fingerprint(vid, creator, price, size):
-    """Hash the full video and seal it. Runs after the video is live, so a long video never holds the upload up."""
+    An enrolment over a name somebody else has been using is the same shape as
+    the url squat, and gets the same treatment: we cannot prevent it, so we
+    record it permanently at the moment it happens.
+    """
     try:
-        digest = _sha_file(_path(vid, "full"))
-        ah, blk = _seal("studio_video_live", "video=%s;creator=%s;price=%d;sha256=%s" % (vid, creator, price, digest),
-                        {"video": vid, "creator": creator, "price_pence": price, "video_sha256": digest, "bytes": size})
-        with _ctx["lock"]:
-            _ctx["conn"].execute("UPDATE studio_video SET sha256=?,audit_hash=?,block_index=? WHERE id=?",
-                                 (digest, ah, blk, vid))
-            _ctx["conn"].commit()
-    except Exception as e:
-        print("STUDIO: fingerprint of %s failed: %s" % (vid, e), flush=True)
+        with ctx["lock"]:
+            row = ctx["conn"].execute(
+                "SELECT COUNT(*) FROM witness_log WHERE peer=?", (peer,)).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
 
 
-def a_mine(q, b, h):
-    acct = _acct(q, b)
-    if not acct:
-        return {"error": "bad_key", "message": "Sign in again, your key wasn't recognised."}, 403
-    with _ctx["lock"]:
-        rows = _ctx["conn"].execute("SELECT " + COLS + " FROM studio_video WHERE account=? AND status='live' "
-                                    "ORDER BY created DESC LIMIT 200", (acct["id"],)).fetchall()
-    vids = []
-    owner = "owner:" + acct["id"]
-    for r in rows:
-        v = dict(zip(COLS.split(","), r))
-        p = _public(v)
-        p.update({"earned": v["earned"], "fees": v["fees"],
-                  "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], owner, _token(v["id"], owner))})
-        vids.append(p)
-    balance, views = _credits()._creator_totals(acct["name"])
-    return {"name": acct["name"], "balance_pence": balance, "balance_label": _gbp(balance) if balance else "0p",
-            "paid_views": views, "videos": vids, "earn": SITE + "/earn",
-            "channel": SITE + "/cinema/@" + _slug(acct["name"])}, 200
+def _check_ts(ts, last_ts):
+    now = time.time()
+    if ts > now + SKEW_FUTURE:
+        return False, ("timestamp is %d seconds in the future; limit is %d"
+                       % (int(ts - now), SKEW_FUTURE))
+    if ts < now - SKEW_PAST:
+        return False, ("timestamp is %d seconds old; limit is %d"
+                       % (int(now - ts), SKEW_PAST))
+    if last_ts is not None and ts <= last_ts:
+        return False, ("timestamp %d is not later than the last one accepted "
+                       "for this name (%d) - a signature cannot be replayed "
+                       "and submissions must move forward"
+                       % (int(ts), int(last_ts)))
+    return True, None
 
 
-def a_delete(q, b, h):
-    acct = _acct(q, b)
-    if not acct:
-        return {"error": "bad_key"}, 403
-    v = _video(str(b.get("id") or ""))
-    if not v or v["account"] != acct["id"]:
-        return {"error": "not_found"}, 404
-    _remove(v, "creator")
-    return {"removed": True}, 200
+# ----------------------------------------------------------------------
+# routes
+# ----------------------------------------------------------------------
 
+def _enroll(ctx, data):
+    peer = _peer_name(data)
+    if not peer or len(peer) > 80:
+        return {"error": "chain_required",
+                "message": "A short stable identifier - a domain works well."}, 400
+    pubkey = str(data.get("pubkey") or data.get("public_key") or "").strip().lower()
+    if not HEX64.match(pubkey):
+        return {"error": "invalid_pubkey",
+                "message": "An Ed25519 public key is 32 bytes - 64 lowercase "
+                           "hex characters. Send the public half only. Never "
+                           "send us a private key; we have no use for one and "
+                           "no route that accepts one."}, 400
+    if _decodepoint(bytes.fromhex(pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "That value is 64 hex characters but is not a "
+                           "point on the curve, so it is not an Ed25519 "
+                           "public key."}, 400
 
-def _remove(v, by):
-    for kind in KINDS:
-        for part in (False, True):
-            try:
-                os.remove(_path(v["id"], kind, part))
-            except OSError:
-                pass
-    with _ctx["lock"]:
-        _ctx["conn"].execute("UPDATE studio_video SET status='removed' WHERE id=?", (v["id"],))
-        _ctx["conn"].commit()
-    _seal("studio_video_removed", "video=%s;by=%s" % (v["id"], by), {"video": v["id"], "by": by})
+    existing = _key_row(ctx, peer)
+    if existing:
+        if existing[0] == pubkey:
+            return {"already_enrolled": True, "chain": peer, "pubkey": pubkey,
+                    "enrolled_at": _iso(existing[1]),
+                    "block_index": existing[3],
+                    "latest_receipt_seq": _latest_seq(ctx, peer),
+                    "message": "This name is already bound to this key. "
+                               "Nothing changed."}, 200
+        return {"error": "name_already_enrolled", "chain": peer,
+                "enrolled_pubkey": existing[0],
+                "enrolled_at": _iso(existing[1]),
+                "message": "This name is bound to a different key. We do not "
+                           "overwrite a binding. If you hold the enrolled "
+                           "private key, use /x/signed/rotate. If you do not, "
+                           "this name is not available to you and this "
+                           "attempt is not sealed."}, 409
 
+    prior = _seen_in_open_lane(ctx, peer)
+    ts = time.time()
+    note = "enrolled"
+    if prior:
+        note = ("WARNING: this name had already been submitted %d time(s) to "
+                "the open witness lane before this key was enrolled, so it "
+                "was not a fresh name when it was claimed" % prior)
 
-# ------------------------------------------------------------------ viewers
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_enrolled", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ENROLLED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "pubkey": pubkey, "timestamp": ts, "detail": note}
+    h, idx, _seq, seal_error = _try_seal(ctx, ev, res, ts, FILED_UNDER)
 
-def _viewer_from(q, b):
-    viewer = str(b.get("viewer") or q.get("viewer") or "").strip()
-    return viewer if VIEWER_RE.match(viewer) else None
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT INTO signed_keys(peer,pubkey,enrolled,audit_hash,"
+            "block_index,rotations,last_ts,note) VALUES(?,?,?,?,?,0,NULL,?)",
+            (peer, pubkey, ts, h, idx, note))
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO signed_seq(peer,last_seq) VALUES(?,0)", (peer,))
+        ctx["conn"].commit()
 
-
-def a_state(q, b, h):
-    v = _video(str(q.get("id") or b.get("id") or ""))
-    if not v or v["status"] != "live":
-        return {"error": "not_found", "message": "That video isn't here any more."}, 404
-    viewer = _viewer_from(q, b)
-    packs = [p for p in PACKS if p >= v["price"]] or [v["price"]]
-    out = {"video": _public(v),
-           "packs": [{"pence": p, "label": _gbp(p), "views": p // max(1, v["price"]),
-                      "charge": _charge(p), "charge_label": _gbp(_charge(p)),
-                      "fee": _charge(p) - p, "fee_label": _gbp(_charge(p) - p)} for p in packs],
-           "pay_ready": bool(_credits()._stripe_key()),
-           "wallet_publishable": _pub_key()}
-    if viewer:
-        out["balance_pence"] = _ensure_viewer(viewer)
-        done, blk = _unlocked(v["id"], viewer)
-        out["unlocked"] = done
-        if done:
-            out["block_index"] = blk
-            out["full"] = "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer))
+    out = {"enrolled": True, "chain": peer, "pubkey": pubkey,
+           "enrolled_at": _iso(ts), "sealed_in_our_chain": h,
+           "block_index": idx, "signed_version": VERSION,
+           "sealed": seal_error is None,
+           "latest_receipt_seq": 0,
+           "message": MESSAGES["enrolled"],
+           "canonical_message": _canonical_help(peer),
+           "submit": "/x/signed/submit"}
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["seal_note"] = ("The key is enrolled and usable - it is a database "
+                            "row and a failed audit note does not un-enrol it. "
+                            "But the record of the enrolment did not seal, "
+                            "which is a fault worth chasing and is reported "
+                            "rather than hidden.")
+    if prior:
+        out["flag"] = note
     return out, 200
 
 
-def _period_fee(v, share, now):
-    period = int((now - (v["live_at"] or v["created"])) // FEE_PERIOD)
-    taken = v["fee_taken"] if v["fee_period"] == period else 0
-    fee = min(share, max(0, MONTHLY_FEE - taken))
-    return period, taken + fee, fee
+def _canonical_help(peer):
+    return {"format": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+            "example_for_this_name": MSG_PREFIX + "\\n" + peer +
+                                     "\\n<64 hex tip>\\n<integer epoch seconds>",
+            "encoding": "UTF-8, no trailing newline, lines joined with a "
+                        "single \\n",
+            "signature": "Ed25519 over those bytes, sent as 128 lowercase hex"}
 
 
-def _unlock(v, viewer):
-    """Spend the viewer's credit on one video. Returns (payload, code)."""
-    done, blk = _unlocked(v["id"], viewer)
-    if done:
-        return {"unlocked": True, "already": True, "block_index": blk,
-                "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer)),
-                "balance_pence": _ensure_viewer(viewer)}, 200
-    _ensure_viewer(viewer)
-    price = v["price"]
-    now = time.time()
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        cur = c.execute("UPDATE credit_viewer SET balance=balance-?,spent=spent+? WHERE id=? AND balance>=?",
-                        (price, price, viewer, price))
-        if cur.rowcount != 1:
-            bal = c.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()[0]
-            c.commit()
-            return {"unlocked": False, "reason": "not_enough_credit", "price_pence": price,
-                    "balance_pence": bal}, 402
-        ins = c.execute("INSERT OR IGNORE INTO credit_unlock(viewer,video,creator,price,at) VALUES(?,?,?,?,?)",
-                        (viewer, "st:" + v["id"], v["creator"], price, now))
-        if ins.rowcount != 1:
-            c.execute("UPDATE credit_viewer SET balance=balance+?,spent=spent-? WHERE id=?", (price, price, viewer))
-            c.commit()
-            return _unlock(v, viewer)
-        fresh = dict(zip(COLS.split(","), c.execute("SELECT " + COLS + " FROM studio_video WHERE id=?",
-                                                     (v["id"],)).fetchone()))
-        share = int(round(price * SHARE))
-        period, taken, fee = _period_fee(fresh, share, now)
-        net = share - fee
-        c.execute("INSERT OR IGNORE INTO credit_creator(name,balance,views) VALUES(?,0,0)", (v["creator"],))
-        c.execute("UPDATE credit_creator SET balance=balance+?,views=views+1 WHERE name=?", (net, v["creator"]))
-        c.execute("UPDATE studio_video SET unlocks=unlocks+1,earned=earned+?,fees=fees+?,fee_period=?,fee_taken=? "
-                  "WHERE id=?", (share, fee, period, taken, v["id"]))
-        bal = c.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()[0]
-        c.commit()
-    ah, blk = _seal("paid_view", "video=st:%s;creator=%s;price=%d;creator_share=%d;monthly_fee=%d"
-                    % (v["id"], v["creator"], price, net, fee),
-                    {"video": "st:" + v["id"], "creator": v["creator"], "price_pence": price,
-                     "creator_share_pence": share, "monthly_fee_pence": fee, "creator_pence": net,
-                     "platform_pence": price - net})
-    with _ctx["lock"]:
-        _ctx["conn"].execute("UPDATE credit_unlock SET audit_hash=?,block_index=? WHERE viewer=? AND video=?",
-                             (ah, blk, viewer, "st:" + v["id"]))
-        _ctx["conn"].commit()
-    return {"unlocked": True, "price_pence": price, "creator_pence": net, "balance_pence": bal,
-            "sealed_in_chain": ah, "block_index": blk,
-            "verify": SITE + "/x/walk/block?index=%s" % blk,
-            "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer))}, 200
+def _submit(ctx, data):
+    peer = _peer_name(data)
+    if not peer:
+        return {"error": "chain_required"}, 400
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer,
+                "message": "No public key is enrolled for this name. Enrol at "
+                           "/x/signed/enroll, or use the open lane at "
+                           "/x/witness/observe which needs nothing."}, 404
+    pubkey, _enrolled, _h, _idx, _rot, last_ts = row
 
-
-def a_unlock(q, b, h):
-    v = _video(str(b.get("id") or ""))
-    viewer = _viewer_from(q, b)
-    if not v or v["status"] != "live" or not viewer:
-        return {"error": "not_found"}, 404
-    if not _limit(viewer, "unlock", 20, 300):
-        return {"error": "slow_down", "message": "Slow down a moment."}, 429
-    return _unlock(v, viewer)
-
-
-def _pub_key():
-    return (os.environ.get("STRIPE_PUBLISHABLE_KEY", "").strip()
-            or os.environ.get("STRIPE_PUBLISHABLE", "").strip())
-
-
-def a_intent(q, b, h):
-    """Create a PaymentIntent so the wallet (Apple/Google Pay) can be tapped
-    on this page, with no redirect and no email box. Card still works too."""
-    v = _video(str(b.get("id") or ""))
-    viewer = _viewer_from(q, b)
-    if not v or v["status"] != "live" or not viewer:
-        return {"error": "not_found"}, 404
-    if not _limit(_ip(h), "pay", 6, 40):
-        return {"error": "slow_down", "message": "Wait a moment and tap again."}, 429
-    cr = _credits()
-    if not cr._stripe_key():
-        return {"error": "pay_off", "message": "Payments are being switched on. Try again shortly."}, 503
+    tip = str(data.get("tip", "")).strip().lower()
+    if not HEX64.match(tip):
+        return {"error": "invalid_tip",
+                "message": "A tip is 64 hex characters - a SHA-256 chain head."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format",
+                "message": "An Ed25519 signature is 64 bytes - 128 lowercase "
+                           "hex characters."}, 400
+    raw_ts = data.get("ts", data.get("peer_ts"))
     try:
-        pence = int(b.get("pence") or PACKS[0])
+        ts_int = int(raw_ts)
     except (TypeError, ValueError):
-        pence = PACKS[0]
-    if pence not in PACKS:
-        pence = PACKS[0]
-    pence = max(pence, v["price"])
-    charge = _charge(pence)
-    _ensure_viewer(viewer)
-    params = {
-        "amount": str(charge),
-        "currency": "gbp",
-        "payment_method_types[0]": "card",
-        "description": "10p Wing credit (sebbi.pro)",
-        "metadata[studio_video]": v["id"],
-        "metadata[viewer]": viewer,
-        "metadata[credit_pence]": str(pence),
-    }
-    data, err = cr._stripe("POST", "payment_intents", params,
-                           idem="pi-%s-%s-%d-%d" % (v["id"], viewer, charge, int(time.time() // 30)))
-    if err or not data or not data.get("client_secret"):
-        return {"error": "stripe", "message": "Couldn't start the payment: %s" % (err or "no intent")}, 502
-    return {"client_secret": data["client_secret"], "pi": data.get("id"),
-            "pence": pence, "charge": charge, "charge_label": _gbp(charge),
-            "publishable": _pub_key(), "currency": "gbp"}, 200
+        return {"error": "invalid_ts",
+                "message": "ts must be integer epoch seconds, and must be the "
+                           "same value you signed."}, 400
 
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
 
-def a_intent_done(q, b, h):
-    """Confirm a wallet/card PaymentIntent succeeded, then credit and unlock."""
-    v = _video(str(b.get("id") or ""))
-    viewer = _viewer_from(q, b)
-    pi = str(b.get("payment_intent") or "").strip()
-    if not v or not viewer or not PI_RE.match(pi):
-        return {"error": "bad_request"}, 400
-    cr = _credits()
-    d, err = cr._stripe("GET", "payment_intents/" + pi)
-    if err or not d:
-        return {"error": "stripe", "message": "Couldn't confirm the payment yet. Tap unlock again in a moment."}, 502
-    if d.get("status") != "succeeded":
-        return {"error": "not_paid", "message": "The payment hasn't gone through."}, 402
-    meta = d.get("metadata") or {}
-    if str(meta.get("viewer") or "") != viewer:
-        return {"error": "other_phone", "message": "That payment was made on another phone."}, 403
+    with ctx["lock"]:
+        dup = ctx["conn"].execute(
+            "SELECT observed FROM signed_log WHERE peer=? AND signature=? LIMIT 1",
+            (peer, signature)).fetchone()
+    if dup:
+        return {"error": "replayed_signature",
+                "message": "This exact signature was already accepted at %s."
+                           % _iso(dup[0])}, 409
+
+    message = "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(pubkey), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "chain": peer,
+                "message": "Nothing has been sealed. The signature does not "
+                           "verify against the key enrolled for this name. "
+                           "The usual cause is a canonical message built "
+                           "differently - check it byte for byte below.",
+                "we_verified_against": _canonical_help(peer),
+                "the_exact_bytes_we_hashed":
+                    "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+                "enrolled_pubkey": pubkey}, 400
+
+    observed = time.time()
+    detail = ("peer=" + peer + ";tip=" + tip + ";ts=" + str(ts_int) +
+              ";pubkey=" + pubkey + ";sig=" + signature)
+    ev = {"user_id": "sig:" + peer, "action": "signed_tip_observed", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "SIGNED_TIP_SEALED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "peer_tip": tip, "timestamp": observed,
+           "verification": "peer-signed", "detail": detail}
+
+    # Seal FIRST, and only claim success if it produced a hash. A signed
+    # submission that returns a receipt with no block behind it is worse than
+    # a refusal, because the peer has no way to tell the difference without
+    # going and looking at the chain.
+    h, idx, key_seq, seal_error = _try_seal(ctx, ev, res, observed, FILED_UNDER)
+    if seal_error:
+        return {"ok": False, "accepted": False, "error": "seal_failed",
+                "chain": peer, "tip": tip,
+                "detail": "Your signature verified correctly, but the audit "
+                          "chain did not seal the submission, so there is no "
+                          "receipt to give you. This is a fault on this "
+                          "deployment and not a problem with your submission.",
+                "seal_error": seal_error,
+                "recorded": False,
+                "retry": "Nothing was written. No sequence number was spent "
+                         "and your signature is not recorded as used, so a "
+                         "fresh submission with a later ts can be sent once "
+                         "this is fixed.",
+                "observed_at": _iso(observed)}, 500
+
+    # Issue the receipt number inside the same lock hold that writes the row.
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "INSERT OR IGNORE INTO signed_seq(peer,last_seq) VALUES(?,0)", (peer,))
+        ctx["conn"].execute(
+            "UPDATE signed_seq SET last_seq = COALESCE(last_seq,0) + 1 "
+            "WHERE peer=?", (peer,))
+        srow = ctx["conn"].execute(
+            "SELECT last_seq FROM signed_seq WHERE peer=?", (peer,)).fetchone()
+        receipt_seq = int(srow[0]) if srow and srow[0] is not None else None
+
+        ctx["conn"].execute(
+            "INSERT INTO signed_log(peer,tip,peer_ts,observed,signature,"
+            "pubkey,audit_hash,block_index) VALUES(?,?,?,?,?,?,?,?)",
+            (peer, tip, float(ts_int), observed, signature, pubkey, h, idx))
+        ctx["conn"].execute("UPDATE signed_keys SET last_ts=? WHERE peer=?",
+                            (float(ts_int), peer))
+        ctx["conn"].commit()
+
+    # Mirror into the open witness log so the peer appears on the public
+    # roster alongside everyone else. Guarded: the roster is a convenience
+    # and the seal above is the evidence, so a failure here must not turn a
+    # good submission into an error.
+    mirrored = False
     try:
-        paid = int(d.get("amount_received") or d.get("amount") or 0)
-        pence = int(meta.get("credit_pence") or 0)
-    except (TypeError, ValueError):
-        paid, pence = 0, 0
-    if pence <= 0 or paid < pence or str(d.get("currency") or "gbp").lower() != "gbp":
-        return {"error": "bad_amount"}, 400
-    credit = cr._credit_payment(pi, viewer, pence, "studio_wallet")
-    out, code = _unlock(v, viewer) if v["status"] == "live" else ({"unlocked": False}, 404)
-    out["payment"] = {"credit_pence": pence, "paid_pence": paid, "duplicate": credit.get("duplicate", False)}
-    return out, code
-
-
-def a_pay(q, b, h):
-    v = _video(str(b.get("id") or ""))
-    viewer = _viewer_from(q, b)
-    if not v or v["status"] != "live" or not viewer:
-        return {"error": "not_found"}, 404
-    if not _limit(_ip(h), "pay", 6, 40):
-        return {"error": "slow_down", "message": "Wait a moment and tap again."}, 429
-    cr = _credits()
-    if not cr._stripe_key():
-        return {"error": "pay_off", "message": "Payments are being switched on. Try again shortly."}, 503
-    try:
-        pence = int(b.get("pence") or PACKS[0])
-    except (TypeError, ValueError):
-        pence = PACKS[0]
-    if pence not in PACKS:
-        pence = PACKS[0]
-    pence = max(pence, v["price"])
-    charge = _charge(pence)
-    _ensure_viewer(viewer)
-    back = SITE + "/cinema/v/" + v["id"]
-    params = {
-        "mode": "payment",
-        "submit_type": "pay",
-        "success_url": back + "?paid={CHECKOUT_SESSION_ID}",
-        "cancel_url": back,
-        "line_items[0][quantity]": "1",
-        "line_items[0][price_data][currency]": "gbp",
-        "line_items[0][price_data][unit_amount]": str(charge),
-        "line_items[0][price_data][product_data][name]": "10p Wing credit %s + %s card fee" % (_gbp(pence), _gbp(charge - pence)),
-        "line_items[0][price_data][product_data][description]":
-            "%s credit unlocks \"%s\" now, the rest stays on this phone. The %s card fee is Stripe's charge "
-            "for taking the payment." % (_gbp(pence), v["title"][:50], _gbp(charge - pence)),
-        "metadata[studio_video]": v["id"],
-        "metadata[viewer]": viewer,
-        "metadata[credit_pence]": str(pence),
-        "payment_intent_data[description]": "10p Wing credit (sebbi.pro)",
-        "payment_intent_data[metadata][studio_video]": v["id"],
-    }
-    data, err = cr._stripe("POST", "checkout/sessions", params,
-                           idem="st-%s-%s-%d-%d" % (v["id"], viewer, charge, int(time.time() // 30)))
-    if err or not data or not data.get("url"):
-        return {"error": "stripe", "message": "Couldn't open the payment page: %s" % (err or "no link")}, 502
-    return {"checkout": data["url"], "pence": pence, "charge": charge}, 200
-
-
-def a_paid(q, b, h):
-    v = _video(str(b.get("id") or ""))
-    viewer = _viewer_from(q, b)
-    session = str(b.get("session") or "").strip()
-    if not v or not viewer or not SESSION_RE.match(session):
-        return {"error": "bad_request"}, 400
-    cr = _credits()
-    s, err = cr._stripe("GET", "checkout/sessions/" + session)
-    if err or not s:
-        return {"error": "stripe", "message": "Couldn't confirm the payment yet. Tap unlock again in a moment."}, 502
-    if s.get("payment_status") != "paid":
-        return {"error": "not_paid", "message": "The payment hasn't gone through."}, 402
-    meta = s.get("metadata") or {}
-    if str(meta.get("viewer") or s.get("client_reference_id") or "") != viewer:
-        return {"error": "other_phone", "message": "That payment was made on another phone."}, 403
-    try:
-        paid = int(s.get("amount_total") or 0)
-        pence = int(meta.get("credit_pence") or paid)
-    except (TypeError, ValueError):
-        paid, pence = 0, 0
-    if pence <= 0 or paid < pence or str(s.get("currency") or "gbp").lower() != "gbp":
-        return {"error": "bad_amount"}, 400
-    credit = cr._credit_payment(session, viewer, pence, "studio")
-    out, code = _unlock(v, viewer) if v["status"] == "live" else ({"unlocked": False}, 404)
-    out["payment"] = {"credit_pence": pence, "paid_pence": paid, "duplicate": credit.get("duplicate", False)}
-    return out, code
-
-
-def a_report(q, b, h):
-    v = _video(str(b.get("id") or ""))
-    if not v:
-        return {"error": "not_found"}, 404
-    if not _limit(_ip(h), "report", 3, 20):
-        return {"received": True}, 200
-    reason = TITLE_CLEAN.sub("", str(b.get("reason") or ""))[:300]
-    who = hashlib.sha256(_ip(h).encode()).hexdigest()[:16]
-    with _ctx["lock"]:
-        _ctx["conn"].execute("INSERT INTO studio_report(video,reason,at,who) VALUES(?,?,?,?)",
-                             (v["id"], reason, time.time(), who))
-        _ctx["conn"].commit()
-    _seal("studio_report", "video=%s" % v["id"], {"video": v["id"]})
-    return {"received": True, "message": "Thanks. It will be looked at."}, 200
-
-
-def a_admin(q, b, h):
-    key = os.environ.get("CREDITS_ADMIN_KEY", "").strip()
-    given = str(q.get("key") or b.get("key") or "")
-    if not key or not hmac.compare_digest(key, given):
-        return {"error": "not_allowed"}, 403
-    do = str(q.get("do") or b.get("do") or "list")
-    if do == "remove":
-        v = _video(str(q.get("id") or b.get("id") or ""))
-        if not v:
-            return {"error": "not_found"}, 404
-        _remove(v, "admin")
-        return {"removed": v["id"]}, 200
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        reps = c.execute("SELECT video,reason,at FROM studio_report ORDER BY id DESC LIMIT 100").fetchall()
-        vids = c.execute("SELECT id,creator,title,status,unlocks,earned,created FROM studio_video "
-                         "ORDER BY created DESC LIMIT 100").fetchall()
-    return {"reports": [{"video": r[0], "link": SITE + "/v/" + r[0], "reason": r[1],
-                         "at": time.strftime("%Y-%m-%d %H:%M", time.gmtime(r[2]))} for r in reps],
-            "videos": [{"id": r[0], "creator": r[1], "title": r[2], "status": r[3], "paid_views": r[4],
-                        "earned": r[5], "link": SITE + "/v/" + r[0],
-                        "remove": SITE + "/v/api/admin?key=KEY&do=remove&id=" + r[0]} for r in vids]}, 200
-
-
-API = {"join": a_join, "signin": a_signin, "new": a_new, "finish": a_finish, "mine": a_mine,
-       "delete": a_delete, "state": a_state, "unlock": a_unlock, "pay": a_pay, "paid": a_paid,
-       "intent": a_intent, "intent_done": a_intent_done,
-       "report": a_report, "admin": a_admin}
-
-
-# ------------------------------------------------------------------ transport
-
-def _send(h, obj, code=200):
-    body = json.dumps(obj).encode("utf-8")
-    h.send_response(code)
-    h.send_header("Content-Type", "application/json; charset=utf-8")
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Cache-Control", "no-store")
-    h.end_headers()
-    h.wfile.write(body)
-
-
-def _send_bytes(h, body, ctype, code=200, cache="no-cache", extra=None):
-    h.send_response(code)
-    h.send_header("Content-Type", ctype)
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Cache-Control", cache)
-    for k, val in (extra or {}).items():
-        h.send_header(k, val)
-    h.end_headers()
-    h.wfile.write(body)
-
-
-def _send_file(h, path, ctype, cache="public, max-age=86400"):
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        _send(h, {"error": "not_found"}, 404)
-        return
-    start, end, code = 0, size - 1, 200
-    m = re.match(r"^bytes=(\d*)-(\d*)$", (h.headers.get("Range") or "").strip())
-    if m and (m.group(1) or m.group(2)):
-        if m.group(1):
-            start = int(m.group(1))
-            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
-        else:
-            start = max(0, size - int(m.group(2)))
-        if start > end or start >= size:
-            h.send_response(416)
-            h.send_header("Content-Range", "bytes */%d" % size)
-            h.send_header("Content-Length", "0")
-            h.end_headers()
-            return
-        code = 206
-    h.send_response(code)
-    h.send_header("Content-Type", ctype)
-    h.send_header("Accept-Ranges", "bytes")
-    h.send_header("Content-Length", str(end - start + 1))
-    h.send_header("Cache-Control", cache)
-    if code == 206:
-        h.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
-    h.end_headers()
-    try:
-        with open(path, "rb") as f:
-            f.seek(start)
-            left = end - start + 1
-            while left > 0:
-                blk = f.read(min(262144, left))
-                if not blk:
-                    break
-                h.wfile.write(blk)
-                left -= len(blk)
-    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        with ctx["lock"]:
+            ctx["conn"].execute(
+                "INSERT INTO witness_log(api_key,peer,tip,peer_ts,observed,"
+                "audit_hash,block_index,note,url,liveness,name_status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (FILED_UNDER, peer, tip, float(ts_int), observed, h, idx,
+                 "signed submission - verified against enrolled Ed25519 key",
+                 None, "peer-signed", "key-bound"))
+            ctx["conn"].commit()
+        mirrored = True
+    except Exception:
         pass
 
-
-def _playable(mime):
-    return "video/mp4" if mime in ("video/quicktime", "video/x-m4v", "") else mime
-
-
-def _get(h, path, q):
-    if path in ("/create", "/create/"):
-        _send_bytes(h, CREATE_HTML, "text/html; charset=utf-8")
-        return True
-    if path.startswith("/v/api/"):
-        name = path[7:].strip("/")
-        if name in ("state", "admin"):
-            _api(h, name, q, {})
-            return True
-        _send(h, {"error": "use_post"}, 405)
-        return True
-    parts = [x for x in path.split("/") if x]
-    if len(parts) < 2 or parts[0] != "v":
-        return False
-    vid = parts[1].lower()
-    v = _video(vid)
-    if not v or v["status"] != "live":
-        if len(parts) == 2:
-            h.send_response(302)
-            h.send_header("Location", "/cinema?wing=ten")
-            h.send_header("Content-Length", "0")
-            h.end_headers()
-            return True
-        _send(h, {"error": "not_found"}, 404)
-        return True
-    if len(parts) == 2:
-        h.send_response(302)
-        h.send_header("Location", "/cinema/v/" + vid)
-        h.send_header("Cache-Control", "no-store")
-        h.send_header("Content-Length", "0")
-        h.end_headers()
-        return True
-    what = parts[2]
-    if what == "teaser":
-        if not h.headers.get("Range") or h.headers.get("Range", "").startswith("bytes=0-"):
-            with _ctx["lock"]:
-                _ctx["conn"].execute("UPDATE studio_video SET plays=plays+1 WHERE id=?", (vid,))
-                _ctx["conn"].commit()
-        _send_file(h, _path(vid, "teaser"), v["teaser_mime"] or "video/mp4")
-        return True
-    if what in ("poster.jpg", "poster"):
-        p = _path(vid, "poster")
-        if os.path.exists(p):
-            _send_file(h, p, "image/jpeg")
-        else:
-            _send_bytes(h, b"", "image/jpeg", 404)
-        return True
-    if what == "full":
-        viewer = str(q.get("viewer") or "")
-        t = str(q.get("t") or "")
-        good = (VIEWER_RE.match(viewer) or OWNER_RE.match(viewer)) and hmac.compare_digest(t, _token(vid, viewer))
-        if good and OWNER_RE.match(viewer):
-            good = viewer == "owner:" + v["account"]
-        elif good:
-            good = _unlocked(vid, viewer)[0]
-        if not good:
-            _send(h, {"error": "locked", "message": "Unlock this video to watch it."}, 403)
-            return True
-        _send_file(h, _path(vid, "full"), _playable(v["full_mime"] or ""), cache="private, max-age=3600")
-        return True
-    _send(h, {"error": "not_found"}, 404)
-    return True
+    return {"chain": peer, "witnessed_tip": tip, "observed_at": _iso(observed),
+            "peer_claimed_time": _iso(ts_int),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "receipt_seq": receipt_seq,
+            "receipt_seq_scope": "per-chain",
+            "key_seq": key_seq,
+            "verification": "peer-signed",
+            "verified_against_pubkey": pubkey,
+            "on_public_roster": mirrored,
+            "signed_version": VERSION,
+            "verify": "/x/signed/verify?peer=" + peer + "&tip=" + tip,
+            "gapless": MESSAGES["seq"],
+            "key_seq_note": MESSAGES["key_seq"],
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
 
 
-def _api(h, name, q, body):
-    if "conn" not in _ctx:
-        _send(h, {"error": "not_armed", "message": "Open /x/studio/status once."}, 503)
-        return
-    _setup()
-    fn = API.get(name)
-    if not fn:
-        _send(h, {"error": "not_found"}, 404)
-        return
+def _rotate(ctx, data):
+    peer = _peer_name(data)
+    row = _key_row(ctx, peer)
+    if not row:
+        return {"error": "not_enrolled", "chain": peer}, 404
+    current, _enrolled, _h, _idx, rotations, last_ts = row
+
+    new_pubkey = str(data.get("new_pubkey") or data.get("pubkey") or "").strip().lower()
+    if not HEX64.match(new_pubkey) or _decodepoint(bytes.fromhex(new_pubkey)) is None:
+        return {"error": "invalid_pubkey",
+                "message": "new_pubkey must be an Ed25519 public key - 64 "
+                           "lowercase hex characters."}, 400
+    if new_pubkey == current:
+        return {"error": "no_change",
+                "message": "That is already the enrolled key."}, 400
+    signature = str(data.get("signature") or data.get("sig") or "").strip().lower()
+    if not HEX128.match(signature):
+        return {"error": "invalid_signature_format"}, 400
     try:
-        out, code = fn(q, body, h)
-    except Exception as e:
-        print("STUDIO ERR %s: %s" % (name, e), flush=True)
-        out, code = {"error": "failed", "message": "Something went wrong. Try again."}, 500
-    _send(h, out, code)
+        ts_int = int(data.get("ts"))
+    except (TypeError, ValueError):
+        return {"error": "invalid_ts"}, 400
+    ok, why = _check_ts(ts_int, last_ts)
+    if not ok:
+        return {"error": "timestamp_rejected", "message": why,
+                "our_time": int(time.time())}, 400
+
+    message = "\n".join([ROTATE_PREFIX, peer, new_pubkey, str(ts_int)]).encode("utf-8")
+    if not ed25519_verify(bytes.fromhex(current), message, bytes.fromhex(signature)):
+        return {"error": "signature_did_not_verify",
+                "message": "Nothing has been changed. A rotation must be "
+                           "signed by the key being replaced. This is what "
+                           "stops anyone - including the operator of this "
+                           "deployment - swapping a peer's key.",
+                "we_verified_against": {
+                    "format": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                    "the_exact_bytes_we_hashed":
+                        "\n".join([ROTATE_PREFIX, peer, new_pubkey,
+                                   str(ts_int)])},
+                "signed_by_key_expected": current}, 400
+
+    ts = time.time()
+    ev = {"user_id": "sig:" + peer, "action": "signed_key_rotated", "amount": 0,
+          "country": "UK", "device_id": "signed", "anomaly": 0, "device_risk": 0}
+    res = {"decision": "KEY_ROTATED", "score": 0, "signed_version": VERSION,
+           "peer": peer, "timestamp": ts,
+           "detail": "from=" + current + ";to=" + new_pubkey +
+                     ";authorised_by=" + current}
+    h, idx, _seq, seal_error = _try_seal(ctx, ev, res, ts, FILED_UNDER)
+
+    with ctx["lock"]:
+        ctx["conn"].execute(
+            "UPDATE signed_keys SET pubkey=?,rotations=?,last_ts=? WHERE peer=?",
+            (new_pubkey, (rotations or 0) + 1, float(ts_int), peer))
+        ctx["conn"].commit()
+
+    out = {"rotated": True, "chain": peer, "previous_pubkey": current,
+           "pubkey": new_pubkey, "rotations": (rotations or 0) + 1,
+           "sealed_in_our_chain": h, "block_index": idx,
+           "sealed": seal_error is None,
+           "latest_receipt_seq": _latest_seq(ctx, peer),
+           "signed_version": VERSION,
+           "sequence_note": MESSAGES["seq_survives_rotation"],
+           "message": "Rotation sealed. Both keys are permanently in the "
+                      "chain, so the history of this name's keys is public "
+                      "and cannot be tidied up later."}
+    if seal_error:
+        out["seal_error"] = seal_error
+        out["message"] = ("The rotation took effect and the new key is live. "
+                          "The audit note about it did not seal, which is "
+                          "reported rather than hidden.")
+    return out, 200
 
 
-def _post(h, path, q):
-    name = path[7:].strip("/")
-    if "conn" not in _ctx:
-        _send(h, {"error": "not_armed"}, 503)
-        return True
-    _setup()
-    if name == "chunk":
-        try:
-            out, code = chunk(h, q)
-        except Exception as e:
-            print("STUDIO CHUNK ERR: %s" % e, flush=True)
-            out, code = {"error": "failed", "message": "Upload piece failed. Retrying."}, 500
-        _send(h, out, code)
-        return True
-    try:
-        n = min(int(h.headers.get("Content-Length") or 0), 20000)
-        raw = _read(h, n) if n else b""
-        body = json.loads((raw or b"{}").decode("utf-8") or "{}")
-        if not isinstance(body, dict):
-            body = {}
-    except Exception:
-        body = {}
-    _api(h, name, q, body)
-    return True
+def _keys(ctx):
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT k.peer,k.pubkey,k.enrolled,k.block_index,k.rotations,k.note,"
+            "COALESCE(s.last_seq,0) FROM signed_keys k "
+            "LEFT JOIN signed_seq s ON s.peer = k.peer "
+            "ORDER BY k.enrolled ASC LIMIT ?", (MAX_LIST,)).fetchall()
+    out = []
+    for peer, pubkey, enrolled, idx, rotations, note, seq in rows:
+        entry = {"chain": peer, "pubkey": pubkey, "algorithm": "ed25519",
+                 "enrolled_at": _iso(enrolled), "enrolment_block": idx,
+                 "rotations": rotations or 0,
+                 "latest_receipt_seq": seq or 0}
+        if note and note.startswith("WARNING"):
+            entry["flag"] = note
+        out.append(entry)
+    return {"count": len(out), "keys": out, "signed_version": VERSION,
+            "note": MESSAGES["keys_note"],
+            "receipt_seq_note": (
+                "latest_receipt_seq is the highest receipt number issued to "
+                "that name on this lane. A keyholder whose own highest "
+                "receipt is lower than this has not received one of them, and "
+                "can say exactly how many. Public on purpose - a gap you can "
+                "only see from the inside is not evidence of anything."),
+            "how_to_check_a_record": (
+                "Take the pubkey from here, rebuild the canonical message "
+                "from the record at /x/signed/verify, and check the signature "
+                "with any Ed25519 implementation. You do not need anything "
+                "from us to do it and you do not have to believe us.")}, 200
 
 
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
+def _verify(ctx, data):
+    peer = str(data.get("peer", "")).strip().lower()
+    tip = str(data.get("tip", "")).strip().lower()
+    if not peer or not tip:
+        return {"error": "peer_and_tip_required",
+                "usage": "/x/signed/verify?peer=<name>&tip=<64 hex>"}, 400
+    with ctx["lock"]:
+        rows = ctx["conn"].execute(
+            "SELECT observed,peer_ts,signature,pubkey,audit_hash,block_index "
+            "FROM signed_log WHERE peer=? AND tip=? ORDER BY id ASC",
+            (peer, tip)).fetchall()
+    if not rows:
+        return {"signed_observation": False, "peer": peer, "tip": tip,
+                "message": "We hold no signed observation of this tip from "
+                           "this name. It may still be in the open lane - "
+                           "check /x/witness/attest."}, 404
+    observed, peer_ts, signature, pubkey, h, idx = rows[0]
+    ts_int = int(peer_ts)
+    return {"signed_observation": True, "chain": peer, "tip": tip,
+            "observed_at": _iso(observed), "peer_claimed_time": _iso(peer_ts),
+            "sealed_in_our_chain": h, "block_index": idx,
+            "times_observed": len(rows),
+            "latest_receipt_seq": _latest_seq(ctx, peer),
+            "signature": signature, "pubkey": pubkey, "algorithm": "ed25519",
+            "canonical_message": "\n".join([MSG_PREFIX, peer, tip, str(ts_int)]),
+            "canonical_message_bytes_note": (
+                "Those four lines joined by a single newline, UTF-8, no "
+                "trailing newline. Hash nothing yourself - Ed25519 takes the "
+                "message, not a digest of it."),
+            "signed_version": VERSION,
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"],
+            "recheck_it_yourself": (
+                "python: pip install pynacl, then "
+                "nacl.signing.VerifyKey(bytes.fromhex(pubkey))"
+                ".verify(canonical_message.encode(), bytes.fromhex(signature))")}, 200
 
 
-def _split(h):
-    u = urllib.parse.urlparse(h.path)
-    return u.path, {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
-
-
-def _install(ctx):
-    global _patched
-    if isinstance(ctx, dict) and "conn" in ctx:
-        _ctx.update(ctx)
-        _setup()
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_studio4_patched", False):
-        _patched = True
-        return True
-    og = cls.do_GET
-    op = getattr(cls, "do_POST", None)
-
-    def do_GET(self):
-        path, q = _split(self)
-        if path in ("/create", "/create/") or path.startswith("/v/"):
-            try:
-                if _get(self, path, q):
-                    return
-            except (BrokenPipeError, ConnectionResetError):
-                return
-            except Exception as e:
-                print("STUDIO GET ERR: %s" % e, flush=True)
-                try:
-                    _send(self, {"error": "failed"}, 500)
-                except Exception:
-                    pass
-                return
-        return og(self)
-
-    def do_POST(self):
-        path, q = _split(self)
-        if path.startswith("/v/api/"):
-            _post(self, path, q)
-            return
-        return op(self) if op else None
-
-    cls.do_GET = do_GET
-    if op:
-        cls.do_POST = do_POST
-    cls._studio4_patched = True
-    _patched = True
-    return True
+def _spec():
+    return {"signed_version": VERSION,
+            "what_this_lane_is": (
+                "Submissions signed by a key this deployment does not hold. "
+                "The open lane at /x/witness/observe proves somebody handed "
+                "us a tip. This lane proves the holder of a specific private "
+                "key did - including against us, because we only ever hold "
+                "the public half."),
+            "why_it_exists": (
+                "The HMAC lane binds a name to a shared secret, and a shared "
+                "secret is held by both parties. It closes third-party "
+                "submission under your name and does not close operator "
+                "submission under your name. This lane closes both, and it "
+                "does so by arithmetic rather than by our promise."),
+            "steps": [
+                "1. Generate an Ed25519 keypair. Keep the private half. It "
+                "never leaves your side and we have no route that accepts one.",
+                "2. POST /x/signed/enroll with {\"chain\":\"<name>\","
+                "\"pubkey\":\"<64 hex>\"}.",
+                "3. Build the canonical message, sign it, and POST "
+                "/x/signed/submit with {\"chain\",\"tip\",\"ts\",\"signature\"}.",
+                "4. GET /x/signed/verify?peer=&tip= for the receipt, which "
+                "carries everything a third party needs to recheck it "
+                "without us.",
+            ],
+            "canonical_message": {
+                "submit": MSG_PREFIX + "\\n<chain>\\n<tip>\\n<ts>",
+                "rotate": ROTATE_PREFIX + "\\n<chain>\\n<new pubkey>\\n<ts>",
+                "encoding": "UTF-8, single \\n between lines, no trailing "
+                            "newline. ts is integer epoch seconds.",
+            },
+            "replay_controls": {
+                "max_age_seconds": SKEW_PAST,
+                "max_future_seconds": SKEW_FUTURE,
+                "monotonic": "ts must be strictly greater than the last ts "
+                             "accepted for the name",
+                "duplicate_signatures": "refused",
+            },
+            "on_acceptance": {
+                "receipt_seq": MESSAGES["seq"],
+                "receipt_seq_scope": {'values': ['per-peer', 'per-name', 'per-chain'], 'per-peer': 'issued per registered peer_id. Used by /x/peer/submit.', 'per-name': 'issued per bound name. Used by /x/bind/submit.', 'per-chain': 'issued per enrolled chain name. Used by /x/signed/submit.', 'why_it_is_here': 'The three signed lanes each count within their own scope, so a receipt carries the scope of its own sequence rather than requiring the holder to remember which lane produced it. The set is closed: a value outside this list is an error on our side, not a new scope you should widen a schema for.', 'not_comparable_across_scopes': 'Two receipts with different scopes are counting different things and their numbers say nothing about each other.'},
+                "key_seq": MESSAGES["key_seq"],
+                "sequence_survives_rotation": MESSAGES["seq_survives_rotation"],
+                "seal_failure": (
+                    "If the audit chain does not seal your submission you get "
+                    "500 seal_failed with the reason, and nothing is "
+                    "recorded - no sequence number, no log row, no receipt. "
+                    "Send a fresh submission with a later ts once the fault "
+                    "is fixed. A receipt you cannot verify is worse than no "
+                    "receipt, so this lane will not issue one."),
+                "two_different_completeness_claims": (
+                    "receipt_seq is about completeness of the receipts WE "
+                    "issued to you. It says nothing about completeness of the "
+                    "records YOUR chain sealed, which no signature can reach "
+                    "and which is listed under honest_limits."),
+            },
+            "this_lane_rejects": (
+                "Unlike the open lane, a submission that does not verify is "
+                "refused and nothing is sealed. Writing an unverifiable "
+                "signature into a name's history is the harm, not the "
+                "protection."),
+            "key_rotation": (
+                "A rotation must be signed by the key being replaced. Nobody "
+                "who lacks the current private key can rotate it, this "
+                "deployment included, and every rotation is sealed with both "
+                "keys recorded."),
+            "honest_limits": [
+                "Does not prove the records behind the tip are true.",
+                "Does not prove the peer's own chain is complete. Catching an "
+                "omission there needs an audit protocol, not cryptography.",
+                "Does not prove who the keyholder is in the world - only that "
+                "the same party signed each time.",
+                "Enrolment is open, so the first party to enrol a name gets "
+                "it. An enrolment over a name already seen in the open lane "
+                "is flagged permanently, which is detection and not "
+                "prevention.",
+                "receipt_seq proves you are missing a receipt. It does not "
+                "prove why, and it cannot distinguish a lost response from "
+                "one that was never sent.",
+            ],
+            "changed_in_1_1_1": [
+                "receipt_seq_scope is now a bare token from a closed set - "
+                "per-peer, per-name, per-chain - rather than a sentence, "
+                "and the set is published so a closed schema can pin an "
+                "enum. Asked for by Philip Pinol (PRAXIS). Value change "
+                "only; the response shape is unchanged from 1.1.",
+            ],
+            "changed_in_1_1": [
+                "receipt_seq is a real per-chain gapless sequence issued by "
+                "this module, not the api_key counter that was always null "
+                "here because this lane files under a label rather than a "
+                "key. The completeness property applies to this lane for the "
+                "first time.",
+                "The api_key counter is still returned, as key_seq, and is "
+                "null by design so the absence is stated rather than hidden.",
+                "A failed seal returns 500 and records nothing, instead of "
+                "returning a receipt with no block behind it.",
+                "Enrolment and rotation report sealed true or false with the "
+                "error, rather than sealing as a side effect and ignoring "
+                "the outcome.",
+                "/x/signed/keys publishes latest_receipt_seq per name.",
+            ],
+            "what_this_proves": MESSAGES["what_this_proves"],
+            "what_this_does_not_prove": MESSAGES["what_this_does_not_prove"]}, 200
 
 
 def handle(method, action, data, api_key, ctx):
-    armed = _install(ctx)
-    d, persistent = _storage()
-    counts = {}
-    if "conn" in _ctx:
-        with _ctx["lock"]:
-            c = _ctx["conn"]
-            counts = {"live_videos": c.execute("SELECT COUNT(*) FROM studio_video WHERE status='live'").fetchone()[0],
-                      "paid_views": c.execute("SELECT COALESCE(SUM(unlocks),0) FROM studio_video").fetchone()[0],
-                      "creator_earnings_pence": c.execute("SELECT COALESCE(SUM(earned),0) FROM studio_video").fetchone()[0],
-                      "reports": c.execute("SELECT COUNT(*) FROM studio_report").fetchone()[0]}
+    _setup(ctx)
+    if method == "POST":
+        if action == "enroll":
+            return _enroll(ctx, data)
+        if action == "submit":
+            return _submit(ctx, data)
+        if action == "rotate":
+            return _rotate(ctx, data)
+    else:
+        if action == "spec":
+            return _spec()
+        if action == "keys":
+            return _keys(ctx)
+        if action == "verify":
+            return _verify(ctx, data)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
+## `modules/sortition.py`
+
+789 lines, 33138 bytes
+
+```python
+"""
+sortition.py - selection by lot. The operator stops choosing who gets audited.
+
+THE HOLE THIS FILLS
+-------------------
+Every system claiming human oversight reviews a sample of decisions. In
+every one of them, the operator picks the sample. So the sample proves
+nothing: you can review the easy ones, or the ones you already know are
+clean, and nobody outside can tell the difference. It is the softest spot
+in every Article 14 claim in the industry, and it has stayed soft because
+there was no alternative.
+
+There is one now. heartbeat.py seals a public beacon value on a cadence -
+a number nobody, including the operator, can know before its tick. That is
+a dice roll no one owns.
+
+THE THREE LOCKS, IN ORDER. THE ORDER IS THE WHOLE POINT.
+--------------------------------------------------------
+1. COMMIT THE POOL. Every record eligible for review in a period is
+   listed, hashed into one pool digest, and sealed. The pool is now fixed.
+2. WAIT FOR A TICK. The draw may only use a beacon value sealed AFTER the
+   pool commit. This module refuses otherwise. So the pool was fixed
+   before the dice existed, and cannot be edited once they do.
+3. DRAW. The beacon value deterministically ranks the pool. The lowest k
+   ranks are selected. Anyone can recompute it from public values.
+
+Break any one and the sample is choosable again. Enforced here, not
+promised.
+
+WHAT IT CATCHES
+---------------
+A selected record with no review sealed against it is a permanent, visible
+hole with a name on it. You cannot quietly skip an awkward case, because
+the case was chosen for you in public, and its absence is the evidence.
+
+Refusal is allowed and is not hidden - it is sealed as a refusal with a
+reason. An honest refusal on the record is worth more than a silent gap.
+
+THE SELECTION FUNCTION, PUBLISHED SO IT IS NOT OURS
+---------------------------------------------------
+  seed = SHA256("AILEASH-SORTITION-v1" | period | pool_digest | beacon_value)
+  rank(i) = SHA256(seed | ":" | record_hash_i)
+  selected = the k records with the lowest rank, ties by record hash
+
+No random number generator, no language-specific behaviour, no library.
+Ten lines in any language. A stranger recomputes it and either gets our
+list or catches us.
+
+WHAT THIS DOES NOT DO
+---------------------
+- It does not prove the reviews were any good. It proves nobody chose
+  which ones happened.
+- It does not stop an operator declining to draw at all. A period with no
+  draw is a period with no sample, and /outstanding says so.
+- Pool membership is asserted by this server. What stops a record being
+  left out of the pool is complete.py, which commits the period's record
+  count in advance - separate module, separate check.
+- Selection is uniform. Risk-weighted sampling is deliberately not offered:
+  a weighting the operator sets is a choice the operator made.
+
+Contract: handle(method, action, data, api_key, ctx) -> (dict, status)
+Routes:
+  GET  spec         public  what this is and the exact selection function
+  GET  draws        public  every draw ever made
+  GET  draw         public  ?id= - one draw, its beacon value, its selection
+  GET  verify       public  ?id= - recompute the draw from scratch, here
+  GET  outstanding  public  selected records with no review yet, and how late
+  GET  status       public  coverage, response rate, oldest unanswered
+  POST pool         keyed   commit the pool for a period
+  POST draw         keyed   draw a sample against a sealed beacon tick
+  POST review       keyed   record a review, or a refusal with a reason
+"""
+
+import json
+import time
+import hashlib
+
+VERSION = "1.1.0"
+
+PUBLIC = {
+    ("GET", "spec"),
+    ("GET", "draws"),
+    ("GET", "draw"),
+    ("GET", "verify"),
+    ("GET", "outstanding"),
+    ("GET", "status"),
+}
+
+DOMAIN_SEED = b"AILEASH-SORTITION-v1"
+DOMAIN_POOL = b"AILEASH-POOL-v1"
+
+DEFAULT_RATE = 0.05          # 5 percent
+MIN_SELECT = 1
+MAX_SELECT = 500
+MAX_POOL = 200000
+REVIEW_DUE_HOURS = 72
+
+DDL = [
+    """CREATE TABLE IF NOT EXISTS sortition_pool (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        period       TEXT NOT NULL,
+        pool_digest  TEXT NOT NULL,
+        pool_size    INTEGER NOT NULL,
+        members      TEXT NOT NULL,
+        committed_at REAL NOT NULL,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_pool ON sortition_pool(period)",
+    """CREATE TABLE IF NOT EXISTS sortition_draw (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        period        TEXT NOT NULL,
+        pool_id       INTEGER NOT NULL,
+        pool_digest   TEXT NOT NULL,
+        pool_size     INTEGER NOT NULL,
+        rate          REAL NOT NULL,
+        select_count  INTEGER NOT NULL,
+        beacon_source TEXT,
+        beacon_round  INTEGER,
+        beacon_value  TEXT NOT NULL,
+        beacon_rowid  INTEGER,
+        seed          TEXT NOT NULL,
+        selected      TEXT NOT NULL,
+        drawn_at      REAL NOT NULL,
+        chain_rowid   INTEGER,
+        audit_hash    TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS sortition_review (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        draw_id      INTEGER NOT NULL,
+        record_hash  TEXT NOT NULL,
+        outcome      TEXT NOT NULL,
+        reviewer     TEXT,
+        reason       TEXT,
+        recorded_at  REAL NOT NULL,
+        chain_rowid  INTEGER,
+        audit_hash   TEXT
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sort_rev ON sortition_review(draw_id, record_hash)",
+]
+
+OUTCOMES = ("agreed", "disagreed", "escalated", "refused")
+
+VOCABULARY = {
+    "pool": "Every record eligible for review in a period, fixed and sealed before any dice exist.",
+    "draw": "The selection, computed from a beacon value that did not exist when the pool was sealed.",
+    "selected": "Chosen by the beacon, not by us. We could not have known which.",
+    "outstanding": "Selected and not yet answered. Visible, named, and counting.",
+    "refused": "Declined on the record with a reason. Not a gap - a decision that is now permanent.",
+    "gap": "Selected, past due, and never answered. The thing this module exists to make impossible to hide.",
+}
+
+WHAT_THIS_PROVES = (
+    "That nobody chose which records were reviewed. It does not prove the "
+    "reviews were competent, honest or useful. Those are different problems "
+    "and this module does not touch them."
+)
+
+
+# ---------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------
+
+def _ensure(conn, lock):
+    with lock:
+        cur = conn.cursor()
+        for stmt in DDL:
+            cur.execute(stmt)
+        conn.commit()
+
+
+def _cols(conn, table):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(%s)" % table)
+    return [r[1] for r in cur.fetchall()]
+
+
+def _hash_col(conn):
+    c = _cols(conn, "audit_log")
+    for n in ("audit_hash", "hash", "block_hash"):
+        if n in c:
+            return n
+    return None
+
+
+def _ts_col(conn):
+    c = _cols(conn, "audit_log")
+    for n in ("ts", "timestamp", "created", "observed"):
+        if n in c:
+            return n
+    return None
+
+
+def _period_bounds(period):
+    """YYYY, YYYY-MM, YYYY-MM-DD -> (start_epoch, end_epoch) UTC."""
+    p = str(period).strip()
     try:
-        free_gb = round(shutil.disk_usage(d).free / 1073741824, 1)
-    except Exception:
-        free_gb = None
-    stripe = False
+        if len(p) == 4:
+            s = time.strptime(p + "-01-01", "%Y-%m-%d")
+            e = time.strptime(str(int(p) + 1) + "-01-01", "%Y-%m-%d")
+        elif len(p) == 7:
+            s = time.strptime(p + "-01", "%Y-%m-%d")
+            y, m = int(p[:4]), int(p[5:7])
+            y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
+            e = time.strptime("%04d-%02d-01" % (y2, m2), "%Y-%m-%d")
+        elif len(p) == 10:
+            s = time.strptime(p, "%Y-%m-%d")
+            e = time.gmtime(_cal(s) + 86400)
+        else:
+            return None
+    except ValueError:
+        return None
+    return _cal(s), _cal(e)
+
+
+def _cal(st):
+    import calendar
+    return calendar.timegm(st)
+
+
+def _iso(t):
+    if t is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _human(seconds):
+    if seconds is None:
+        return None
+    s = int(round(seconds))
+    if s < 60:
+        return "%d seconds" % s
+    if s < 3600:
+        return "%d minutes" % (s // 60)
+    if s < 86400:
+        return "%d hours %d minutes" % (s // 3600, (s % 3600) // 60)
+    return "%d days %d hours" % (s // 86400, (s % 86400) // 3600)
+
+
+def _pool_digest(members):
+    h = hashlib.sha256()
+    h.update(DOMAIN_POOL + b"\n")
+    for m in members:
+        h.update(m.encode() + b"\n")
+    return h.hexdigest()
+
+
+def _seed(period, pool_digest, beacon_value):
+    h = hashlib.sha256()
+    h.update(DOMAIN_SEED + b"|")
+    h.update(str(period).encode() + b"|")
+    h.update(pool_digest.encode() + b"|")
+    h.update(str(beacon_value).encode())
+    return h.hexdigest()
+
+
+def select(members, seed, k):
+    """The published selection function. Deterministic, no RNG."""
+    ranked = []
+    for m in members:
+        r = hashlib.sha256((seed + ":" + m).encode()).hexdigest()
+        ranked.append((r, m))
+    ranked.sort()
+    return [m for _, m in ranked[:k]]
+
+
+def _seal(ctx, action, payload):
+    """Seal through the host's seal().
+
+    server.py: seal(event, result, ts, api_key=None) where EVENT IS A DICT
+    carrying user_id (subscripted inside), returning
+    (audit_hash, block_index, key_seq).
+    """
+    fn = ctx.get("seal")
+    if fn is None:
+        return None, None
+    ts = time.time()
+    event = {"user_id": "sortition", "action": action, "amount": 0,
+             "country": "UK", "device_id": "sortition", "anomaly": 0,
+             "device_risk": 0}
+    result = dict(payload)
+    result.setdefault("decision", "SORTITION")
+    result.setdefault("score", 0)
+    result.setdefault("version", VERSION)
+    result.setdefault("timestamp", ts)
+    for call in (lambda: fn(event, result, ts),
+                 lambda: fn(event, result, ts, None),
+                 lambda: fn(event, result)):
+        try:
+            out = call()
+        except TypeError:
+            continue
+        except Exception:
+            return None, None
+        h = idx = None
+        if isinstance(out, (tuple, list)):
+            for item in out:
+                if isinstance(item, str) and len(item) == 64 and h is None:
+                    h = item
+                elif isinstance(item, int) and idx is None:
+                    idx = item
+        elif isinstance(out, str):
+            h = out
+        return h, idx
+    return None, None
+
+
+def _backfill(conn, lock, table, rowid_field, pk):
+    hcol = _hash_col(conn)
+    with lock:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(rowid) FROM audit_log")
+        r = cur.fetchone()
+        rid = r[0] if r and r[0] is not None else None
+        h = None
+        if rid is not None and hcol:
+            cur.execute("SELECT %s FROM audit_log WHERE rowid=?" % hcol, (rid,))
+            r2 = cur.fetchone()
+            h = r2[0] if r2 else None
+        cur.execute("UPDATE %s SET chain_rowid=?, audit_hash=? WHERE id=?" % table,
+                    (rid, h, pk))
+        conn.commit()
+    return rid, h
+
+
+def _latest_beat_after(conn, rowid):
+    """The first heartbeat sealed strictly after a given chain row."""
     try:
-        stripe = bool(_credits()._stripe_key())
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT source, beacon_round, value, chain_rowid, fetched_at"
+            " FROM heartbeat_tick WHERE chain_rowid IS NOT NULL AND chain_rowid>?"
+            " ORDER BY chain_rowid DESC LIMIT 1", (rowid,))
+        return cur.fetchone()
     except Exception:
-        pass
-    return {"module": "studio", "version": VERSION, "armed": armed,
-            "serves": ["/create", "/v/<id>", "/v/api/*"],
-            "storage": {"folder": d, "survives_redeploys": persistent, "free_gb": free_gb},
-            "payments_ready": stripe, "packs_pence": PACKS,
-            "viewer_pays": {str(p): _charge(p) for p in PACKS}, "prices_pence": list(PRICES),
-            "max_upload_mb": MAX_BYTES // 1048576, "monthly_fee_pence": MONTHLY_FEE,
-            "creator_share": SHARE, "counts": counts,
-            "create": SITE + "/create", "wing": SITE + "/cinema?wing=ten"}, 200
+        return None
+
+
+def _beats_available(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM heartbeat_tick")
+        return cur.fetchone()[0]
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------
+# handle
+# ---------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    conn, lock = ctx["conn"], ctx["lock"]
+    _ensure(conn, lock)
+
+    if method == "GET" and action == "spec":
+        return _spec(), 200
+
+    # -------------------------------------------------- pool
+    if method == "POST" and action == "pool":
+        period = data.get("period")
+        bounds = _period_bounds(period) if period else None
+        if not bounds:
+            return {"error": "period_required",
+                    "formats": ["YYYY", "YYYY-MM", "YYYY-MM-DD"]}, 400
+        start, end = bounds
+        if end > time.time():
+            return {"error": "period_not_closed",
+                    "note": ("A pool can only be committed for a period that "
+                             "has ended. Committing a live period would let "
+                             "records arrive after the pool was fixed."),
+                    "period_ends": _iso(end)}, 409
+
+        hcol, tcol = _hash_col(conn), _ts_col(conn)
+        if not hcol or not tcol:
+            return {"error": "audit_log_schema_unrecognised"}, 500
+
+        cur = conn.cursor()
+        kind = data.get("event")
+        if kind:
+            cur.execute(
+                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? AND event=?"
+                " ORDER BY rowid" % (hcol, tcol, tcol), (start, end, kind))
+        else:
+            cur.execute(
+                "SELECT %s FROM audit_log WHERE %s>=? AND %s<? ORDER BY rowid"
+                % (hcol, tcol, tcol), (start, end))
+        members = sorted({r[0] for r in cur.fetchall() if r[0]})
+        if not members:
+            return {"error": "empty_period", "period": period}, 404
+        if len(members) > MAX_POOL:
+            return {"error": "pool_too_large", "size": len(members),
+                    "max": MAX_POOL}, 413
+
+        digest = _pool_digest(members)
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute("SELECT id, pool_digest FROM sortition_pool WHERE period=?",
+                        (period,))
+            prior = cur.fetchone()
+            if prior:
+                return {"error": "pool_already_committed", "period": period,
+                        "pool_digest": prior[1],
+                        "note": "A pool commits once. That is what makes it a pool."}, 409
+            cur.execute(
+                "INSERT INTO sortition_pool (period, pool_digest, pool_size,"
+                " members, committed_at) VALUES (?,?,?,?,?)",
+                (period, digest, len(members), json.dumps(members), now))
+            pid = cur.lastrowid
+            conn.commit()
+
+        sh, sidx = _seal(ctx, "sortition_pool", {
+            "period": period, "pool_digest": digest, "pool_size": len(members),
+            "event_filter": kind,
+            "note": ("Pool fixed. Any draw against it must use a beacon value "
+                     "sealed after this block."),
+        })
+        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_pool", "chain_rowid", pid)
+        if sidx and sh:
+            with lock:
+                conn.execute("UPDATE sortition_pool SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, pid))
+                conn.commit()
+
+        return {"pool_id": pid, "period": period, "pool_digest": digest,
+                "pool_size": len(members), "sealed_at_chain_rowid": rid,
+                "audit_hash": h,
+                "next": ("Wait for a heartbeat sealed after block %s, then "
+                         "POST /x/sortition/draw." % rid)}, 200
+
+    # -------------------------------------------------- draw
+    if method == "POST" and action == "draw":
+        period = data.get("period")
+        cur = conn.cursor()
+        cur.execute("SELECT id, pool_digest, pool_size, members, chain_rowid"
+                    " FROM sortition_pool WHERE period=?", (period,))
+        pool = cur.fetchone()
+        if not pool:
+            return {"error": "no_pool_for_period", "period": period,
+                    "next": "POST /x/sortition/pool first"}, 404
+        pid, digest, size, members_json, pool_rowid = pool
+
+        cur.execute("SELECT id FROM sortition_draw WHERE period=?", (period,))
+        if cur.fetchone():
+            return {"error": "already_drawn", "period": period,
+                    "note": "One draw per pool. A second draw is a second chance."}, 409
+
+        if pool_rowid is None:
+            return {"error": "pool_not_located_in_chain"}, 500
+
+        beat = _latest_beat_after(conn, pool_rowid)
+        if not beat:
+            n = _beats_available(conn)
+            return {"error": "no_beacon_since_pool_commit",
+                    "beats_in_system": n,
+                    "why": ("The draw must use a value that did not exist when "
+                            "the pool was sealed. Wait for the next heartbeat."),
+                    "check": "/x/heartbeat/latest"}, 409
+
+        b_source, b_round, b_value, b_rowid, b_at = beat
+        members = json.loads(members_json)
+
+        try:
+            rate = float(data.get("rate", DEFAULT_RATE))
+        except (TypeError, ValueError):
+            rate = DEFAULT_RATE
+        rate = max(0.0001, min(1.0, rate))
+        k = int(round(size * rate))
+        k = max(MIN_SELECT, min(k, MAX_SELECT, size))
+
+        seed = _seed(period, digest, b_value)
+        chosen = select(members, seed, k)
+        now = time.time()
+
+        with lock:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO sortition_draw (period, pool_id, pool_digest,"
+                " pool_size, rate, select_count, beacon_source, beacon_round,"
+                " beacon_value, beacon_rowid, seed, selected, drawn_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (period, pid, digest, size, rate, k, b_source, b_round,
+                 b_value, b_rowid, seed, json.dumps(chosen), now))
+            did = cur.lastrowid
+            conn.commit()
+
+        sh, sidx = _seal(ctx, "sortition_draw", {
+            "draw_id": did, "period": period, "pool_digest": digest,
+            "pool_size": size, "rate": rate, "selected_count": k,
+            "beacon": {"source": b_source, "round": b_round, "value": b_value,
+                       "sealed_at_block": b_rowid},
+            "seed": seed, "selected": chosen,
+            "note": ("Selection is recomputable by anyone from pool_digest and "
+                     "the beacon value. See /x/sortition/spec."),
+        })
+        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_draw", "chain_rowid", did)
+        if sidx and sh:
+            with lock:
+                conn.execute("UPDATE sortition_draw SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, did))
+                conn.commit()
+
+        return {"draw_id": did, "period": period, "pool_size": size,
+                "rate": rate, "selected_count": k, "selected": chosen,
+                "beacon": {"source": b_source, "round": b_round,
+                           "value": b_value, "sealed_at_block": b_rowid,
+                           "sealed_at": _iso(b_at)},
+                "seed": seed, "sealed_at_chain_rowid": rid, "audit_hash": h,
+                "review_due": _iso(now + REVIEW_DUE_HOURS * 3600),
+                "recompute_this_yourself": "/x/sortition/verify?id=%d" % did}, 200
+
+    # -------------------------------------------------- review
+    if method == "POST" and action == "review":
+        did = data.get("draw_id")
+        rec = data.get("record")
+        outcome = str(data.get("outcome", "")).lower()
+        if not did or not rec:
+            return {"error": "draw_id_and_record_required"}, 400
+        if outcome not in OUTCOMES:
+            return {"error": "outcome_invalid", "allowed": list(OUTCOMES)}, 400
+        if outcome == "refused" and not data.get("reason"):
+            return {"error": "reason_required_to_refuse",
+                    "why": ("A refusal without a reason is a gap wearing a "
+                            "label. The reason is sealed and permanent.")}, 400
+
+        cur = conn.cursor()
+        cur.execute("SELECT selected FROM sortition_draw WHERE id=?", (did,))
+        row = cur.fetchone()
+        if not row:
+            return {"error": "unknown_draw", "draw_id": did}, 404
+        if rec not in json.loads(row[0]):
+            return {"error": "record_not_selected",
+                    "note": ("Reviews can only be filed against records the "
+                             "beacon chose. Volunteering extra reviews does "
+                             "not count toward the sample.")}, 409
+
+        now = time.time()
+        with lock:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM sortition_review WHERE draw_id=? AND record_hash=?",
+                        (did, rec))
+            if cur.fetchone():
+                return {"error": "already_reviewed",
+                        "note": "A review is filed once and cannot be replaced."}, 409
+            cur.execute(
+                "INSERT INTO sortition_review (draw_id, record_hash, outcome,"
+                " reviewer, reason, recorded_at) VALUES (?,?,?,?,?,?)",
+                (did, rec, outcome, data.get("reviewer"), data.get("reason"), now))
+            rvid = cur.lastrowid
+            conn.commit()
+
+        sh, sidx = _seal(ctx, "sortition_review", {
+            "draw_id": did, "record": rec, "outcome": outcome,
+            "reviewer": data.get("reviewer"), "reason": data.get("reason"),
+        })
+        rid, h = (sidx, sh) if (sidx and sh) else _backfill(conn, lock, "sortition_review", "chain_rowid", rvid)
+        if sidx and sh:
+            with lock:
+                conn.execute("UPDATE sortition_review SET chain_rowid=?, audit_hash=? WHERE id=?", (rid, h, rvid))
+                conn.commit()
+        return {"recorded": True, "review_id": rvid, "outcome": outcome,
+                "sealed_at_chain_rowid": rid, "audit_hash": h}, 200
+
+    # -------------------------------------------------- draws
+    if method == "GET" and action == "draws":
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, period, pool_size, rate, select_count, beacon_source,"
+            " beacon_round, drawn_at, audit_hash FROM sortition_draw"
+            " ORDER BY id DESC LIMIT 100")
+        out = []
+        for r in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT COUNT(*) FROM sortition_review WHERE draw_id=?", (r[0],))
+            done = cur2.fetchone()[0]
+            out.append({"draw_id": r[0], "period": r[1], "pool_size": r[2],
+                        "rate": r[3], "selected": r[4], "reviewed": done,
+                        "outstanding": r[4] - done,
+                        "beacon": {"source": r[5], "round": r[6]},
+                        "drawn_at": _iso(r[7]), "audit_hash": r[8]})
+        return {"count": len(out), "draws": out, "vocabulary": VOCABULARY}, 200
+
+    # -------------------------------------------------- one draw
+    if method == "GET" and action == "draw":
+        did = data.get("id")
+        if not did:
+            return {"error": "id_required"}, 400
+        d = _draw_row(conn, did)
+        if not d:
+            return {"error": "unknown_draw"}, 404
+        cur = conn.cursor()
+        cur.execute("SELECT record_hash, outcome, reviewer, reason, recorded_at"
+                    " FROM sortition_review WHERE draw_id=?", (did,))
+        revs = {r[0]: {"outcome": r[1], "reviewer": r[2], "reason": r[3],
+                       "at": _iso(r[4])} for r in cur.fetchall()}
+        items = []
+        for m in json.loads(d["selected_json"]):
+            items.append({"record": m, "review": revs.get(m),
+                          "state": "answered" if m in revs else "outstanding"})
+        return {"draw_id": did, "period": d["period"],
+                "pool_digest": d["pool_digest"], "pool_size": d["pool_size"],
+                "rate": d["rate"], "selected_count": d["select_count"],
+                "beacon": {"source": d["beacon_source"], "round": d["beacon_round"],
+                           "value": d["beacon_value"],
+                           "sealed_at_block": d["beacon_rowid"]},
+                "seed": d["seed"], "drawn_at": _iso(d["drawn_at"]),
+                "items": items,
+                "what_this_proves": WHAT_THIS_PROVES,
+                "recompute": "/x/sortition/verify?id=%s" % did}, 200
+
+    # -------------------------------------------------- verify
+    if method == "GET" and action == "verify":
+        did = data.get("id")
+        if not did:
+            return {"error": "id_required"}, 400
+        d = _draw_row(conn, did)
+        if not d:
+            return {"error": "unknown_draw"}, 404
+        cur = conn.cursor()
+        cur.execute("SELECT members FROM sortition_pool WHERE id=?", (d["pool_id"],))
+        row = cur.fetchone()
+        members = json.loads(row[0]) if row else []
+        recomputed_digest = _pool_digest(members)
+        recomputed_seed = _seed(d["period"], d["pool_digest"], d["beacon_value"])
+        recomputed = select(members, recomputed_seed, d["select_count"])
+        stored = json.loads(d["selected_json"])
+        ok = (recomputed_digest == d["pool_digest"]
+              and recomputed_seed == d["seed"]
+              and sorted(recomputed) == sorted(stored))
+        return {
+            "draw_id": did,
+            "matches": ok,
+            "pool_digest_recomputed": recomputed_digest,
+            "pool_digest_sealed": d["pool_digest"],
+            "seed_recomputed": recomputed_seed,
+            "seed_sealed": d["seed"],
+            "selection_matches": sorted(recomputed) == sorted(stored),
+            "beacon_value": d["beacon_value"],
+            "beacon_check": ("Confirm this value independently at "
+                             "/x/heartbeat/verify?round=%s, then at the beacon "
+                             "operator's own endpoint." % d["beacon_round"]),
+            "do_it_without_us": {
+                "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
+                "rank": 'SHA256(seed + ":" + record_hash)',
+                "select": "lowest k ranks, ascending",
+                "note": ("This route runs the same function on our server, so "
+                         "it is a convenience, not the proof. The proof is you "
+                         "running those three lines yourself."),
+            },
+        }, 200
+
+    # -------------------------------------------------- outstanding
+    if method == "GET" and action == "outstanding":
+        now = time.time()
+        cur = conn.cursor()
+        cur.execute("SELECT id, period, selected, drawn_at FROM sortition_draw"
+                    " ORDER BY id DESC")
+        items = []
+        for did, period, sel, drawn in cur.fetchall():
+            cur2 = conn.cursor()
+            cur2.execute("SELECT record_hash FROM sortition_review WHERE draw_id=?", (did,))
+            done = {r[0] for r in cur2.fetchall()}
+            due = drawn + REVIEW_DUE_HOURS * 3600
+            for m in json.loads(sel):
+                if m in done:
+                    continue
+                items.append({
+                    "draw_id": did, "period": period, "record": m,
+                    "drawn_at": _iso(drawn), "due": _iso(due),
+                    "state": "gap" if now > due else "outstanding",
+                    "late_by": _human(now - due) if now > due else None,
+                })
+        gaps = [i for i in items if i["state"] == "gap"]
+        return {"outstanding_count": len(items), "gap_count": len(gaps),
+                "due_after_hours": REVIEW_DUE_HOURS,
+                "items": items[:500],
+                "meaning": VOCABULARY["gap"]}, 200
+
+    # -------------------------------------------------- status
+    if method == "GET" and action == "status":
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), SUM(select_count) FROM sortition_draw")
+        ndraws, nsel = cur.fetchone()
+        nsel = nsel or 0
+        cur.execute("SELECT COUNT(*) FROM sortition_review")
+        nrev = cur.fetchone()[0]
+        cur.execute("SELECT outcome, COUNT(*) FROM sortition_review GROUP BY outcome")
+        mix = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) FROM sortition_pool")
+        npool = cur.fetchone()[0]
+        beats = _beats_available(conn)
+        return {
+            "version": VERSION,
+            "pools_committed": npool,
+            "draws": ndraws,
+            "records_selected": nsel,
+            "reviews_recorded": nrev,
+            "response_rate": round(nrev / nsel, 4) if nsel else None,
+            "outcome_mix": mix,
+            "beacon_available": beats is not None,
+            "beats_in_system": beats,
+            "depends_on": {
+                "heartbeat": ("supplies the dice. Without a beacon sealed "
+                              "after the pool, no draw is possible."),
+                "complete": ("commits the period's record count in advance. "
+                             "Without it, a record could be kept out of the "
+                             "pool. Separate module, separate check: "
+                             "/x/complete/periods"),
+            },
+            "what_this_proves": WHAT_THIS_PROVES,
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "actions": ["spec", "draws", "draw", "verify", "outstanding",
+                        "status", "pool", "review"]}, 404
+
+
+def _draw_row(conn, did):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, period, pool_id, pool_digest, pool_size, rate, select_count,"
+        " beacon_source, beacon_round, beacon_value, beacon_rowid, seed,"
+        " selected, drawn_at FROM sortition_draw WHERE id=?", (did,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    keys = ["id", "period", "pool_id", "pool_digest", "pool_size", "rate",
+            "select_count", "beacon_source", "beacon_round", "beacon_value",
+            "beacon_rowid", "seed", "selected_json", "drawn_at"]
+    return dict(zip(keys, r))
+
+
+def _spec():
+    return {
+        "module": "sortition",
+        "version": VERSION,
+        "name_means": "selection by lot - the ancient method for stopping the powerful choosing who gets scrutinised",
+        "the_hole": (
+            "Every system claiming human oversight reviews a sample. In every "
+            "one, the operator picks the sample, so the sample proves nothing."
+        ),
+        "the_three_locks": [
+            "1. The pool of eligible records is fixed and sealed first.",
+            "2. The draw may only use a beacon value sealed AFTER the pool. "
+            "Refused otherwise. So the pool was fixed before the dice existed.",
+            "3. The beacon value ranks the pool. Lowest k are selected. "
+            "Anyone recomputes it from public values.",
+        ],
+        "selection_function": {
+            "seed": 'SHA256("AILEASH-SORTITION-v1|" + period + "|" + pool_digest + "|" + beacon_value)',
+            "rank": 'SHA256(seed + ":" + record_hash)',
+            "select": "the k lowest ranks in ascending order",
+            "why_no_rng": ("A random number generator is a library, a version "
+                           "and a seed we control. Two SHA-256 calls are none "
+                           "of those and run in any language."),
+        },
+        "uniform_only": (
+            "Risk-weighted sampling is deliberately not offered. A weighting "
+            "the operator sets is a choice the operator made, which is the "
+            "thing this module exists to remove."
+        ),
+        "refusal": (
+            "A reviewer may refuse a selected case, with a reason, sealed. "
+            "An honest refusal on the record beats a silent gap. A selection "
+            "left unanswered past the due window is published as a gap with "
+            "the record named."
+        ),
+        "vocabulary": VOCABULARY,
+        "what_this_proves": WHAT_THIS_PROVES,
+        "limits": [
+            "It does not prove the reviews were any good.",
+            "It does not force anyone to draw at all. A period with no draw "
+            "is a period with no sample and status says so.",
+            "Pool membership is asserted by this server; completeness of the "
+            "pool is complete.py's job, not this module's.",
+            "The beacon is a third party. If drand and Bitcoin both vanish, "
+            "new draws stop. Old draws stay verifiable.",
+        ],
+        "routes": {
+            "POST /x/sortition/pool": "keyed - commit the pool for a closed period",
+            "POST /x/sortition/draw": "keyed - draw against a beacon sealed after the pool",
+            "POST /x/sortition/review": "keyed - file a review or a refusal with a reason",
+            "GET /x/sortition/draws": "every draw",
+            "GET /x/sortition/draw?id=": "one draw and its answers",
+            "GET /x/sortition/verify?id=": "recompute the draw",
+            "GET /x/sortition/outstanding": "selected and unanswered, with gaps named",
+            "GET /x/sortition/status": "coverage and response rate",
+        },
+    }
 
 ```

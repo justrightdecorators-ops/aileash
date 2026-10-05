@@ -1,1173 +1,1238 @@
-# Codebase — part 18 of 45
+# Codebase — part 18 of 47
 
 Contains:
-- `modules/plugin.py`
-- `modules/praxis.py`
+- `modules/passport.py`
+- `modules/passportpage.py`
 
 
-## `modules/plugin.py`
+## `modules/passport.py`
 
-1270 lines, 67505 bytes
+806 lines, 39265 bytes
 
 ```python
+#!/usr/bin/env python3
 """
-modules/plugin.py  v3.0.0
-The public proof log: legacy systems send sebbi.pro the SHA-256 of a state
-change, and get back a receipt proving that hash is in an append-only log.
+modules/passport.py  -  the Agent Passport
+==========================================
 
-  * An RFC 6962 Merkle tree (the Certificate Transparency construction):
-        leaf hash  = SHA-256(0x00 || entry)      entry = the 32-byte state hash
-        node hash  = SHA-256(0x01 || left || right)
-    so any receipt can be checked by anyone, with any RFC 6962 verifier,
-    without trusting this server.
-  * Receipts come back straight away: leaf index, tree size, root and the
-    inclusion (audit) path.
-  * Tree heads are sealed into the sebbi.pro chain on a schedule (every 60s or
-    every 1,000 leaves, whichever comes first). That chain is walkable at
-    /x/walk and its tip is timestamped in Bitcoin with OpenTimestamps by the
-    existing anchor, so a leaf becomes Bitcoin-anchored once a confirmed
-    anchored tip is at or after the block that sealed its tree head.
-  * Hash-only. No payloads, labels or customer data are sent or stored.
-  * Idempotent: the client sends its own id with each hash, so a retry after a
-    lost response returns the original leaf instead of adding a duplicate.
+An AI agent that wants to act somewhere - pay, book, send, change a record -
+asks sebbi.pro first. sebbi.pro derives its authority from a human grant,
+checks nothing upstream has been revoked or expired, and hands back a
+PASSPORT: a short signed token naming exactly what may be done, where, and
+for how long.
 
-Routes (clean /p/ prefix, armed by /x/plugin/status):
+The site the agent is acting on does not have to trust the agent, the model,
+or the company that built it. It checks the passport:
 
-    POST /p/submit        {"items":[{"hash":"<64 hex>","cid":"<client id>"}]}
-                          or {"hash":"<64 hex>"}      needs an API key
-    GET  /p/receipt?leaf=N        receipt against the sealed tree head
-    GET  /p/proof?leaf=N&size=M   inclusion path at tree size M
-    GET  /p/consistency?first=M&second=N   RFC 6962 consistency proof
-    GET  /p/sth                   latest sealed tree head + current size
-    GET  /p/find?hash=<64 hex>    leaf indexes holding that entry hash
-    GET  /p/                      what this log is and how to check it
+  OFFLINE   verify the Ed25519 signature against the published key. No call
+            to sebbi.pro, nothing installed, milliseconds.
+  LIVE      ask sebbi.pro whether the authority behind it still stands at
+            this instant - revocation, expiry, integrity, the whole lineage.
+  REDEEM    spend it. Once. Against the exact parameters it was issued for.
+            Standing is re-derived at the moment of redemption, so a passport
+            whose authority was pulled a second ago does not bind. The
+            redemption, or the refusal, is sealed in the chain.
 
-The customer journey (2.0.0), reached from the "plug in" bubble on the homepage:
+The forcing does not come from controlling the AI. Nobody can. It comes from
+the other side: a site publishes one small file saying which actions need a
+passport, and an agent without one is simply not served. That works for
+every model from every vendor, and no AI company controls it.
 
-    GET  /plugin              the product page: price, sign-up, set-up for Python,
-                              JavaScript or any language, account, pricing,
-                              receipt checker
-    POST /p/signup            {name,email,org} -> a new key on the page and by email
-                              (free 90 days; an existing email gets its key re-sent
-                              to that inbox only)
-    POST /p/account           {key} -> devices this month, bill, trial days, records
-    POST /p/pay               {key} -> Stripe checkout for the real device count, or
-                              the Stripe billing page for customers already paying
-    GET  /p/sebbi_adapter.py  the Python adapter download
-    POST /p/decide            (3.0.0) permission before acting: the sebbi.pro engine
-                              decides ALLOW / CHALLENGE / BLOCK, sealed in the chain
+Machine-native from the ground up:
+  - one public discovery document a site hosts (the "actions.txt" of agents)
+  - a token any language can verify with a standard Ed25519 library
+  - an MCP endpoint, so an agent requests and checks passports as tools
 
-Permission before, proof after (3.0.0): /p/decide runs the engine's own govern()
-- trust, velocity, amount, country shift, device risk - and seals every decision
-in the chain. Limits per key: 60 decisions a minute on trial, 1,200 a minute on
-a paid key (PLUGIN_DECIDE_TRIAL_PER_MIN / PLUGIN_DECIDE_PAID_PER_MIN). The device
-is metered with the same id the log uses, so a device that is both governed and
-recorded counts once. Customer ids arrive already one-way hashed.
+Built entirely on continuity.py (v1.6.0+). No second authority system, no
+second chain, no second key: the passport is signed with the same key that
+signs authority proofs, and every step is sealed into the same chain.
 
-Keys are ordinary sebbi.pro keys (server.py's create_key, product "aileash"), so
-the trial, the 50p device meter, the Stripe webhook and the 6-hourly quantity
-sync all apply exactly as for the engine.
-
-Billing (1.4.0): the same meter as the engine - 50p per device per month.
-Each fingerprint can say which device it is about (a phone, terminal, till,
-car...), sent as a one-way hash. Every distinct device seen on the key in a
-calendar month counts once, through server.py's own record_device(), so a
-customer running one central server for 20 million phones is billed for 20
-million devices. Fingerprints with no device named count the installation
-that sent them. Free for the key's 90-day trial. When a key's trial ends unpaid, /p/submit
-answers 402 with the same Stripe checkout the engine gives (server.py's own
-trial_checkout, quantity = real devices). Receipts, proofs and every GET route
-stay free for good; the client keeps queuing and sends once paid.
-
-The API key goes in the X-Sebbi-Key header (or "key" in the body). Set
-ADAPTER_OPEN=1 in Railway to accept submissions without a key (not advised).
-
-Size: kept well under 100,000 characters (the page and the adapter download are
-stored compressed), because longer files get cut off when pasted into GitHub.
-
-Loading: the live server loads modules through modules/router.py and calls
-handle(). ALIASES and register(MODULE_MAP) are also provided so a loader that
-maps modules by name (e.g. brain.py) can pick it up under "adapter",
-"sidecar" or "anchor".
-
-Assumes one server process (as on Railway today). If a second process ever
-writes the same database, appends detect it and reload before continuing.
+    GET  /x/passport/status               module status                 (public)
+    GET  /x/passport/spec                 token format, offline rules   (public)
+    GET  /x/passport/demo                 full live story in one tap    (public)
+    GET  /x/passport/verify?token=&audience=   offline + live check     (public)
+    POST /x/passport/redeem               spend once, sealed, and hand back a
+                                          signed redemption receipt     (public)
+    GET  /x/passport/receipt?pid=         the signed receipts for a passport
+    GET  /x/passport/receipt?receipt=     check a receipt offline + against the chain
+    GET  /x/passport/sitefile?domain=&require=  the file a site hosts   (public)
+    POST /x/passport/issue                mint a passport               (keyed)
+    POST /x/passport/mcp                  MCP JSON-RPC endpoint         (public;
+                                          request tool needs a bearer key)
 """
 
 import base64
 import hashlib
-import zlib
+import importlib.util
 import json
 import os
-import re
-import sqlite3
 import sys
-import threading
 import time
-import urllib.parse
+import uuid
+from datetime import datetime, timezone
 
-VERSION = "3.0.0"
-ALIASES = ["adapter", "sidecar", "anchor"]
-PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "sth"), ("GET", "proof"),
-          ("GET", "receipt"), ("GET", "consistency"), ("GET", "find")}
+VERSION = "1.1.0"
 
-KEY = "public-proof-adapter"
-SITE = "https://sebbi.pro"
-MAX_ITEMS = 500
-MAX_BODY = 262144
-CHECKPOINT_SECONDS = max(10, int(os.environ.get("ADAPTER_CHECKPOINT_SECONDS", "60") or 60))
-CHECKPOINT_EVERY = max(1, int(os.environ.get("ADAPTER_CHECKPOINT_EVERY", "1000") or 1000))
-OPEN = os.environ.get("ADAPTER_OPEN", "0") == "1"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-CID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
-SPEC = ("RFC 6962 Merkle tree, SHA-256. leaf_hash = SHA256(0x00 || entry); "
-        "node = SHA256(0x01 || left || right); entry = the 32 raw bytes of the submitted hash.")
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "demo"), ("GET", "verify"),
+          ("POST", "verify"), ("POST", "redeem"), ("GET", "sitefile"), ("POST", "mcp"),
+          ("GET", "mcp"), ("GET", "receipt"), ("POST", "receipt")}
 
-_PAGE_B64 = (
-    "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"
-    "6lTp/FD9BZtD/h8C7P0fi7Sq8Q=="
-)
-_ADAPTER_B64 = (
-    "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"
-    "RvGSqDrq/X9IKHBi"
-)
+BASE = "https://sebbi.pro/x/passport/"
+TOKEN_TAG = "sbp1"
+SIG_PREFIX = b"AILEASH-PASSPORT-v1:"
+RECEIPT_TAG = "sbr1"
+RECEIPT_PREFIX = b"AILEASH-PASSPORT-RECEIPT-v1:"   # a receipt can never pass as a passport
+MCP_PROTOCOL = "2025-06-18"
 
+DEMO_KEY = "public-passport-demo"
+DEMO_GAP = 60            # seconds between demo runs
+DEMO_PER_DAY = 40
 
-def _d(b):
-    return zlib.decompress(base64.b64decode("".join(b.split())))
-
-
-_FILES = {
-    "/plugin": (_d(_PAGE_B64), "text/html; charset=utf-8", None),
-    "/p/sebbi_adapter.py": (_d(_ADAPTER_B64), "text/x-python; charset=utf-8", "sebbi_adapter.py"),
-}
-
-_ctx = {}
 _ready = False
-_patched = False
-_loaded = False
-_leaves = []            # leaf hashes (bytes), index = leaf index
-_cache = {}             # (start, size) -> hash, for complete power-of-two subtrees
-_tree_lock = threading.Lock()
-_cp_lock = threading.Lock()
-_loop_started = False
+_last_demo = [0.0]
 
 
-# ---------------------------------------------------------------- RFC 6962
-
-def _h(b):
-    return hashlib.sha256(b).digest()
+def _iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
 
 
-def _leaf_hash(entry):
-    return _h(b"\x00" + entry)
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _node(left, right):
-    return _h(b"\x01" + left + right)
+def _b64e(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 
-def _split(n):
-    """Largest power of two strictly less than n (n >= 2)."""
-    k = 1
-    while k * 2 < n:
-        k *= 2
-    return k
+def _b64d(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
-def _mth(start, n):
-    """Merkle Tree Hash of leaves[start:start+n]."""
-    if n == 0:
-        return _h(b"")
-    if n == 1:
-        return _leaves[start]
-    full = n >= 16 and (n & (n - 1)) == 0
-    if full:
-        hit = _cache.get((start, n))
-        if hit is not None:
-            return hit
-    k = _split(n)
-    out = _node(_mth(start, k), _mth(start + k, n - k))
-    if full:
-        _cache[(start, n)] = out
-    return out
+def _continuity():
+    for m in list(sys.modules.values()):
+        f = getattr(m, "__file__", "") or ""
+        if f.endswith("continuity.py") and hasattr(m, "_confirm") and hasattr(m, "_evaluate"):
+            return m
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "continuity.py")
+    spec = importlib.util.spec_from_file_location("passport_continuity", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
 
 
-def _path(m, start, n):
-    """Audit path for leaf m within leaves[start:start+n]."""
-    if n <= 1:
-        return []
-    k = _split(n)
-    if m < k:
-        return _path(m, start, k) + [_mth(start + k, n - k)]
-    return _path(m - k, start + k, n - k) + [_mth(start, k)]
-
-
-def _subproof(m, start, n, b):
-    if m == n:
-        return [] if b else [_mth(start, n)]
-    k = _split(n)
-    if m <= k:
-        return _subproof(m, start, k, b) + [_mth(start + k, n - k)]
-    return _subproof(m - k, start + k, n - k, False) + [_mth(start, k)]
-
-
-def _consistency(m, n):
-    if m <= 0 or m >= n:
-        return []
-    return _subproof(m, 0, n, True)
-
-
-# ---------------------------------------------------------------- storage
-
-def _setup():
+def _setup(ctx):
     global _ready
-    if _ready or "conn" not in _ctx:
+    if _ready:
         return
-    with _ctx["lock"]:
-        c = _ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS ppa_leaf(idx INTEGER PRIMARY KEY,entry_hash TEXT NOT NULL,"
-                  "leaf_hash TEXT NOT NULL,client TEXT,cid TEXT,ts REAL,UNIQUE(client,cid))")
-        c.execute("CREATE INDEX IF NOT EXISTS ppa_leaf_entry ON ppa_leaf(entry_hash)")
-        c.execute("CREATE TABLE IF NOT EXISTS ppa_sth(tree_size INTEGER PRIMARY KEY,root TEXT NOT NULL,"
-                  "ts REAL,audit_hash TEXT,block_index INTEGER)")
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS passport(id TEXT PRIMARY KEY,evaluation TEXT,"
+                  "grant_id TEXT,audience TEXT,action TEXT,params_digest TEXT,"
+                  "lineage_digest TEXT,issued REAL,expires REAL,token_digest TEXT,"
+                  "audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS passport_use(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                  "passport_id TEXT,outcome TEXT,reasons TEXT,at REAL,audit_hash TEXT,"
+                  "block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS passport_receipt(id INTEGER PRIMARY KEY "
+                  "AUTOINCREMENT,passport_id TEXT,outcome TEXT,receipt TEXT,digest TEXT,"
+                  "at_ms INTEGER,block_index INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_psp_receipt ON passport_receipt(passport_id)")
+        c.execute("CREATE TABLE IF NOT EXISTS passport_demo(id INTEGER PRIMARY KEY "
+                  "AUTOINCREMENT,at REAL)")
         c.commit()
     _ready = True
 
 
-def _reload_locked(c):
-    """Rebuild the in-memory tree from the database. Caller holds _ctx['lock']."""
-    rows = c.execute("SELECT idx,leaf_hash FROM ppa_leaf ORDER BY idx").fetchall()
-    fresh = []
-    for i, (idx, lh) in enumerate(rows):
-        if idx != i:
-            raise RuntimeError("leaf index gap at %d" % i)
-        fresh.append(bytes.fromhex(lh))
-    _cache.clear()
-    _leaves[:] = fresh
-
-
-def _load():
-    global _loaded
-    if _loaded:
-        return
-    with _tree_lock:
-        if _loaded:
-            return
-        with _ctx["lock"]:
-            _reload_locked(_ctx["conn"])
-        _loaded = True
-
-
-def _seal(kind, detail, extra):
-    ev = {"user_id": "ppa:" + kind[:20], "action": kind, "amount": 0, "country": "UK",
-          "device_id": "public-proof-adapter", "anomaly": 0, "device_risk": 0}
-    res = {"decision": kind.upper(), "score": 0, "adapter_version": VERSION, "detail": detail}
-    res.update(extra or {})
-    out = _ctx["seal"](ev, res, time.time(), KEY)
+def _seal(ctx, kind, res_extra, key):
+    now = time.time()
+    ev = {"user_id": "psp:" + kind[:24], "action": kind, "amount": 0, "country": "UK",
+          "device_id": "passport", "anomaly": 0, "device_risk": 0}
+    res = {"decision": kind.upper(), "score": 0, "passport_version": VERSION}
+    res.update(res_extra)
+    out = ctx["seal"](ev, res, now, key)
     if isinstance(out, (list, tuple)):
         return out[0], (out[1] if len(out) > 1 else None)
     return out, None
 
 
-def _sth_rows(sql, args=()):
-    with _ctx["lock"]:
-        return _ctx["conn"].execute(sql, args).fetchall()
+# ----------------------------------------------------------------------
+# the token
+# ----------------------------------------------------------------------
+
+def _sign(ctx, C, body):
+    seed, pk, _src = C._keys(ctx)
+    raw = _canon(body).encode("utf-8")
+    sig = C._ed_signature(SIG_PREFIX + raw, seed, pk)
+    return "%s.%s.%s" % (TOKEN_TAG, _b64e(raw), _b64e(sig))
 
 
-def _latest_sth():
-    r = _sth_rows("SELECT tree_size,root,ts,audit_hash,block_index FROM ppa_sth ORDER BY tree_size DESC LIMIT 1")
-    return _sth_dict(r[0]) if r else None
-
-
-def _covering_sth(idx):
-    r = _sth_rows("SELECT tree_size,root,ts,audit_hash,block_index FROM ppa_sth WHERE tree_size>? "
-                  "ORDER BY tree_size ASC LIMIT 1", (idx,))
-    return _sth_dict(r[0]) if r else None
-
-
-def _sth_dict(r):
-    return {"tree_size": r[0], "root": r[1],
-            "sealed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[2] or 0)),
-            "audit_hash": r[3], "block_index": r[4],
-            "walk": SITE + "/x/walk/block?index=%s" % r[4] if r[4] is not None else None,
-            "ts": r[2] or 0}
-
-
-# ---------------------------------------------------------------- appends and checkpoints
-
-def _append(client, items):
-    """items: list of (entry_hex, cid or None). Returns list of (idx, entry_hex, replayed, error)."""
-    for attempt in range(3):
-        out = []
-        with _ctx["lock"]:
-            c = _ctx["conn"]
-            top = c.execute("SELECT COALESCE(MAX(idx),-1) FROM ppa_leaf").fetchone()[0]
-            if top + 1 != len(_leaves):
-                _reload_locked(c)
-            start_len = len(_leaves)
-            try:
-                for eh, cid in items:
-                    if cid:
-                        row = c.execute("SELECT idx,entry_hash FROM ppa_leaf WHERE client=? AND cid=?",
-                                        (client, cid)).fetchone()
-                        if row:
-                            if row[1] != eh:
-                                out.append((None, eh, False, "cid_reused_for_a_different_hash"))
-                            else:
-                                out.append((row[0], eh, True, None))
-                            continue
-                    idx = len(_leaves)
-                    lh = _leaf_hash(bytes.fromhex(eh))
-                    c.execute("INSERT INTO ppa_leaf(idx,entry_hash,leaf_hash,client,cid,ts) VALUES(?,?,?,?,?,?)",
-                              (idx, eh, lh.hex(), client, cid or None, time.time()))
-                    _leaves.append(lh)
-                    out.append((idx, eh, False, None))
-                c.commit()
-                return out
-            except sqlite3.IntegrityError:
-                c.rollback()
-                del _leaves[start_len:]
-                _reload_locked(c)
-            except Exception:
-                c.rollback()
-                del _leaves[start_len:]
-                raise
-    raise RuntimeError("could not append after retries")
-
-
-def _checkpoint(force=False):
-    """Seal the current tree head into the chain if it is due. Never runs twice at once."""
-    if "conn" not in _ctx or not _cp_lock.acquire(blocking=False):
-        return None
+def _open(ctx, C, token):
+    """Offline check only: format and signature. Returns (body, problems)."""
     try:
-        _load()
-        n = len(_leaves)
-        last = _latest_sth()
-        last_size = last["tree_size"] if last else 0
-        if n == 0 or n == last_size:
-            return last
-        due = force or (n - last_size) >= CHECKPOINT_EVERY or \
-            (time.time() - (last["ts"] if last else 0)) >= CHECKPOINT_SECONDS
-        if not due:
-            return last
-        root = _mth(0, n).hex()
-        ah, blk = _seal("tree_head", "size=%d;root=%s" % (n, root),
-                        {"tree_size": n, "root": root, "prev_tree_size": last_size,
-                         "log": "sebbi public proof log", "spec": "RFC6962-SHA256"})
-        with _ctx["lock"]:
-            _ctx["conn"].execute("INSERT OR IGNORE INTO ppa_sth(tree_size,root,ts,audit_hash,block_index) "
-                                 "VALUES(?,?,?,?,?)", (n, root, time.time(), ah, blk))
-            _ctx["conn"].commit()
-        return _latest_sth()
-    finally:
-        _cp_lock.release()
-
-
-def _loop():
-    while True:
-        time.sleep(10)
-        try:
-            _checkpoint()
-        except Exception as e:
-            print("plugin checkpoint: " + str(e)[:160], flush=True)
-
-
-def _start_loop():
-    global _loop_started
-    if _loop_started:
-        return
-    _loop_started = True
-    threading.Thread(target=_loop, name="ppa-checkpoint", daemon=True).start()
-
-
-# ---------------------------------------------------------------- receipts
-
-def _anchoring_note(cp):
-    if not cp:
-        return ("pending: this leaf is covered by the next tree head, sealed into the chain within about "
-                "%d seconds. Fetch /p/receipt?leaf=N again after that." % CHECKPOINT_SECONDS)
-    return ("tree head sealed in chain block %s. The chain tip is timestamped in Bitcoin via OpenTimestamps; "
-            "once a confirmed anchored tip is at or after that block, this leaf is Bitcoin-anchored. "
-            "Check: %s/x/ots/latest_confirmed" % (cp["block_index"], SITE))
-
-
-def _receipt(idx, size=None):
-    _load()
-    n = len(_leaves)
-    if idx < 0 or idx >= n:
-        return None
-    with _ctx["lock"]:
-        row = _ctx["conn"].execute("SELECT entry_hash FROM ppa_leaf WHERE idx=?", (idx,)).fetchone()
-    cp = _covering_sth(idx) if size is None else None
-    tsize = size if size is not None else (cp["tree_size"] if cp else n)
-    tsize = max(idx + 1, min(tsize, n))
-    root = _mth(0, tsize).hex()
-    rec = {"log": "sebbi.pro public proof log", "spec": SPEC,
-           "entry_hash": row[0] if row else None, "leaf_index": idx,
-           "leaf_hash": _leaves[idx].hex(), "tree_size": tsize, "root": root,
-           "audit_path": [p.hex() for p in _path(idx, 0, tsize)],
-           "checkpoint": None, "anchoring": _anchoring_note(cp)}
-    if cp:
-        c2 = dict(cp)
-        c2.pop("ts", None)
-        c2["root_matches"] = (cp["root"] == root)
-        rec["checkpoint"] = c2
-    return rec
-
-
-# ---------------------------------------------------------------- commands
-
-def _meter(key, devices):
-    """Count each distinct device on the key's monthly meter - the engine's own record_device()."""
-    key = str(key or "").strip()
-    devices = [d for d in dict.fromkeys(devices) if d and CID_RE.match(d)]
-    if not key or not devices:
-        return None
-    rd = _server_fn("record_device")
-    n = None
-    for d in devices:
-        dev_id = "adapter:" + d
-        if rd:
-            try:
-                n = rd(key, dev_id)
-                continue
-            except Exception:
-                pass
-        try:
-            with _ctx["lock"]:
-                c = _ctx["conn"]
-                c.execute("INSERT OR IGNORE INTO device_seen(api_key,device_id,first_seen) VALUES(?,?,?)",
-                          (key, dev_id, time.time()))
-                c.commit()
-                n = c.execute("SELECT COUNT(*) FROM device_seen WHERE api_key=?", (key,)).fetchone()[0]
-        except Exception:
-            try:
-                _ctx["conn"].rollback()
-            except Exception:
-                pass
-    return n
-
-
-TRIAL_DAYS = 90
-
-
-def _server_fn(name):
-    """Borrow a function from the running server (server.py) if it is there."""
-    for modname in ("__main__", "server"):
-        m = sys.modules.get(modname)
-        fn = getattr(m, name, None) if m else None
-        if callable(fn):
-            return fn
-    return None
-
-
-def _trial_gate(key):
-    """None if the key may submit; otherwise the same 402 answer the engine gives at trial end."""
-    try:
-        with _ctx["lock"]:
-            row = _ctx["conn"].execute("SELECT email,is_paid,created,product FROM api_keys WHERE key=?",
-                                       (key,)).fetchone()
+        tag, b, s = str(token).strip().split(".")
+        if tag != TOKEN_TAG:
+            return None, ["not a sebbi.pro passport (expected prefix %s.)" % TOKEN_TAG]
+        raw, sig = _b64d(b), _b64d(s)
+        body = json.loads(raw)
     except Exception:
-        return None
-    if not row:
-        return None
-    email, is_paid, created, product = row
-    ts = _server_fn("trial_state")
-    in_trial = ts(created, is_paid)[0] if ts else (bool(is_paid) or time.time() - (created or 0) <= TRIAL_DAYS * 86400)
-    if in_trial:
-        return None
-    dc = _server_fn("device_count")
-    tc = _server_fn("trial_checkout")
-    try:
-        devices = dc(key) if dc else None
-    except Exception:
-        devices = None
-    try:
-        url = tc(key, email, product or "aileash") if tc else SITE + "/#signup"
-    except Exception:
-        url = SITE + "/#signup"
-    return {"error": "trial_expired",
-            "message": "Your 90-day free trial has ended. Your receipts, proofs and queued fingerprints are "
-                       "untouched - pay to continue exactly where you left off. The bill is 50p for each real "
-                       "device that used your key.",
-            "billable_devices": devices, "rate_per_device_gbp": 0.50, "checkout_url": url}
+        return None, ["malformed token"]
+    _seed, pk, _src = C._keys(ctx)
+    if not C._ed_checkvalid(sig, SIG_PREFIX + raw, pk):
+        return body, ["signature does not verify against the published key"]
+    return body, []
 
 
-def _client_for(key):
-    key = str(key or "").strip()
-    if key:
-        try:
-            with _ctx["lock"]:
-                row = _ctx["conn"].execute("SELECT active FROM api_keys WHERE key=?", (key,)).fetchone()
-        except Exception:
-            row = None
-        if row and row[0] in (1, None):
-            return "k_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-    return "open" if OPEN else None
+def _mint(ctx, C, api_key, data):
+    """Evaluate through continuity, and only on ALLOW issue a passport."""
+    audience = str(data.get("audience", "")).strip().lower()
+    if not audience or not C.ID_RE.match(audience):
+        return {"error": "audience_required",
+                "message": "Name the site or service the action is for, e.g. shop.example.com. "
+                           "A passport is only good at the audience it names."}, 400
+    ev, status = C._evaluate(ctx, api_key, {"grant": data.get("grant"),
+                                            "action": data.get("action"),
+                                            "params": data.get("params") or {},
+                                            "purpose_tag": data.get("purpose_tag")})
+    if status != 200:
+        return ev, status
+    if ev["verdict"] != "ALLOW":
+        return {"issued": False, "verdict": ev["verdict"], "reasons": ev["reasons"],
+                "evaluation": ev["evaluation"],
+                "proof_of_refusal": "https://sebbi.pro/x/continuity/proof?evaluation="
+                                    + ev["evaluation"],
+                "note": "No passport. The refusal is sealed and provable, which is the "
+                        "point: an agent can show it was NOT authorised."}, 200
 
-
-# ---------------------------------------------------------------- sign-up, account, payment
-
-_signups = {}
-_signup_lock = threading.Lock()
-EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,24}$")
-
-
-def _esc(x):
-    return (str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
-
-
-def _welcome_html(name, key, trial_ends):
-    k = _esc(key)
-    return ("<div style='font-family:Arial,sans-serif;max-width:560px;color:#1f2937'>"
-            "<h2 style='color:#0b1220'>Your sebbi.pro plug-in key</h2>"
-            "<p>Hi " + _esc(name or "there") + ", your key is below. Keep it private.</p>"
-            "<p style='font-family:monospace;font-size:15px;background:#f1f5f9;padding:12px;border-radius:8px;"
-            "word-break:break-all'>" + k + "</p>"
-            "<h3>Plug it in</h3><ol>"
-            "<li>Download the adapter: <a href='" + SITE + "/p/sebbi_adapter.py'>" + SITE + "/p/sebbi_adapter.py</a></li>"
-            "<li>Set <code>SEBBI_API_KEY=" + k + "</code></li>"
-            "<li>Add <code>@anchor_state(\"orders.update\", device=\"handset\")</code> above any function "
-            "that changes something important.</li></ol>"
-            "<p>Other languages, your account and your bill: <a href='" + SITE + "/plugin'>" + SITE + "/plugin</a></p>"
-            "<p><b>Free until " + _esc(trial_ends) + "</b>, then 50p per device per month - every phone, till "
-            "or machine you record for, counted once a month.</p>"
-            "<p style='color:#64748b;font-size:13px'>Questions: justrightdecorators@gmail.com</p></div>")
-
-
-def _send_mail(to, name, subject, html):
-    fn = _server_fn("send_email")
-    if fn:
-        threading.Thread(target=fn, args=(to, name or "", subject, html), daemon=True).start()
-        return True
-    return False
-
-
-def _trial_end(created):
-    return time.strftime("%d %B %Y", time.gmtime((created or time.time()) + TRIAL_DAYS * 86400))
-
-
-def c_signup(q, body, key, ip=""):
-    email = str(body.get("email") or "").strip().lower()
-    name = str(body.get("name") or "").strip()[:80]
-    org = str(body.get("org") or "").strip()[:120]
-    if not EMAIL_RE.match(email):
-        return {"error": "invalid_email", "message": "Please enter a valid email address."}, 400
     now = time.time()
-    with _signup_lock:
-        hits = [t for t in _signups.get(ip, []) if now - t < 3600]
-        if len(hits) >= 5:
-            return {"error": "slow_down", "message": "Too many sign-ups from here. Try again in an hour."}, 429
-        hits.append(now)
-        _signups[ip] = hits
-    create = _server_fn("create_key")
-    if not create:
-        return {"error": "unavailable", "message": "Sign-up isn't available just now."}, 503
-    new_key, err = create(email, "", name, org, "plugin", "aileash", 1)
-    if err == "email_exists":
-        with _ctx["lock"]:
-            row = _ctx["conn"].execute("SELECT key,name,created FROM api_keys WHERE email=? AND product='aileash'",
-                                       (email,)).fetchone()
-        if row:
-            _send_mail(email, row[1] or name, "Your sebbi.pro key", _welcome_html(row[1] or name, row[0], _trial_end(row[2])))
-        return {"error": "email_exists",
-                "message": "That email already has a sebbi.pro key. We've emailed it to you - the same key works here."}, 409
-    if err or not new_key:
-        return {"error": err or "failed", "message": "Couldn't create a key just now."}, 400
-    ends = _trial_end(now)
-    _send_mail(email, name, "Your sebbi.pro plug-in key", _welcome_html(name, new_key, ends))
-    _send_mail("justrightdecorators@gmail.com", "sebbi.pro", "New plug-in sign-up: " + (org or email),
-               "<p>New plug-in customer: " + _esc(name) + " &middot; " + _esc(email) + " &middot; " + _esc(org) + "</p>")
-    return {"key": new_key, "trial_ends": ends, "rate_per_device_gbp": 0.50}, 200
-
-
-def _key_row(key):
-    key = str(key or "").strip()
-    if not key:
-        return None
     try:
-        with _ctx["lock"]:
-            return _ctx["conn"].execute("SELECT email,is_paid,created,product,stripe_customer,active FROM api_keys "
-                                        "WHERE key=?", (key,)).fetchone()
+        expires = datetime.fromisoformat(ev["valid_until"]).timestamp()
     except Exception:
-        return None
+        expires = now + 300
+    pid = "p_" + uuid.uuid4().hex[:20]
+    body = {
+        "v": 1, "pid": pid, "iss": "sebbi.pro",
+        "aud": audience,
+        "act": ev["action"],
+        "pd": ev["params_digest"],
+        "grant": ev["grant"],
+        "ld": ev["lineage_digest"],
+        "eval": ev["evaluation"],
+        "by": ev["authorised_by"],
+        "agent": ev["executed_by"],
+        "risk": ev["risk_accepted_by"],
+        "iat": int(now), "iat_ms": int(now * 1000), "exp": int(expires),
+        "blk": ev.get("block_index"),
+        "nonce": uuid.uuid4().hex[:16],
+    }
+    token = _sign(ctx, C, body)
+    tdig = hashlib.sha256(token.encode()).hexdigest()
+    audit_hash, block = _seal(ctx, "passport_issued",
+                              {"passport": pid, "evaluation": ev["evaluation"],
+                               "audience": audience, "token_digest": tdig,
+                               "detail": "pid=%s;aud=%s;eval=%s;token=%s"
+                                         % (pid, audience, ev["evaluation"], tdig)}, api_key)
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO passport VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (pid, ev["evaluation"], ev["grant"], audience, ev["action"],
+                             ev["params_digest"], ev["lineage_digest"], now, expires, tdig,
+                             audit_hash, block))
+        ctx["conn"].commit()
+    return {"issued": True, "passport": token, "pid": pid, "audience": audience,
+            "action": ev["action"], "expires_at": _iso(expires),
+            "authorised_by": ev["authorised_by"], "agent": ev["executed_by"],
+            "risk_accepted_by": ev["risk_accepted_by"],
+            "sealed_in_chain": audit_hash, "block_index": block,
+            "verify": BASE + "verify?token=" + token,
+            "present_it": "Send it to the site in the header  Agent-Passport: <token>"}, 200
 
 
-def _devices_this_month(key):
-    m = sys.modules.get("modules.meter") or sys.modules.get("meter")
-    if m is not None and hasattr(m, "month_count"):
-        try:
-            return m.month_count(key)
-        except Exception:
-            pass
-    dc = _server_fn("device_count")
-    try:
-        return dc(key) if dc else 0
-    except Exception:
-        return 0
-
-
-def _billable(key):
-    dc = _server_fn("device_count")
-    try:
-        return dc(key) if dc else _devices_this_month(key)
-    except Exception:
-        return _devices_this_month(key)
-
-
-def c_account(q, body, key):
-    key = str(body.get("key") or key or "").strip()
-    row = _key_row(key)
-    if not row:
-        return {"error": "bad_key", "message": "That key wasn't recognised."}, 404
-    email, is_paid, created, product, cust, active = row
-    ts = _server_fn("trial_state")
-    in_trial, left = ts(created, is_paid) if ts else (time.time() - (created or 0) <= TRIAL_DAYS * 86400,
-                                                       max(0, TRIAL_DAYS - int((time.time() - (created or 0)) // 86400)))
-    billable = _billable(key)
-    client = "k_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-    rows = _sth_rows("SELECT COUNT(*) FROM ppa_leaf WHERE client=?", (client,))
-    return {"email_hint": (email[:2] + "***" + email[email.find("@"):]) if email and "@" in email else "",
-            "paid": bool(is_paid), "in_trial": bool(in_trial) and not is_paid,
-            "trial_days_left": None if is_paid else left, "trial_ends": _trial_end(created),
-            "devices_this_month": _devices_this_month(key), "billable_devices": billable,
-            "monthly_bill_gbp": round(billable * 0.50, 2), "rate_per_device_gbp": 0.50,
-            "records_logged": rows[0][0] if rows else 0,
-            "decisions_today": _decisions.get((client, time.strftime("%Y-%m-%d", time.gmtime())), 0),
-            "active": bool(active)}, 200
-
-
-def c_pay(q, body, key):
-    key = str(body.get("key") or key or "").strip()
-    row = _key_row(key)
-    if not row:
-        return {"error": "bad_key", "message": "That key wasn't recognised."}, 404
-    email, is_paid, created, product, cust, active = row
-    if is_paid and cust:
-        call = _server_fn("stripe_call")
-        r = call("POST", "/billing_portal/sessions", {"customer": cust, "return_url": SITE + "/plugin#account"}) if call else None
-        if r and r.get("url"):
-            return {"url": r["url"]}, 200
-        return {"error": "portal_unavailable", "message": "Your account is paid. To change billing, email "
-                                                         "justrightdecorators@gmail.com."}, 200
-    tc = _server_fn("trial_checkout")
-    if not tc:
-        return {"error": "unavailable", "message": "Payments aren't available just now."}, 503
-    try:
-        url = tc(key, email, product or "aileash")
-    except Exception:
-        url = None
-    if not url or "stripe.com" not in url:
-        return {"error": "unavailable", "message": "Payments aren't available just now - try again shortly."}, 503
-    return {"url": url}, 200
-
-
-_rate = {}
-_rate_lock = threading.Lock()
-DECIDE_TRIAL = int(os.environ.get("PLUGIN_DECIDE_TRIAL_PER_MIN", "60") or 60)
-DECIDE_PAID = int(os.environ.get("PLUGIN_DECIDE_PAID_PER_MIN", "1200") or 1200)
-_decisions = {}
-
-
-def _rate_ok(key, paid):
-    limit = DECIDE_PAID if paid else DECIDE_TRIAL
+def _check(ctx, C, token, audience=None):
+    """Offline + live. Never seals - checking is free and unlimited in spirit."""
+    body, problems = _open(ctx, C, token)
+    out = {"offline": {"signature": "ok" if body and not problems else "FAILED"}}
+    if body is None or problems:
+        out["valid"] = False
+        out["problems"] = problems
+        return out, body
     now = time.time()
-    with _rate_lock:
-        q = [t for t in _rate.get(key, []) if now - t < 60]
-        if len(q) >= limit:
-            _rate[key] = q
-            return False, limit
-        q.append(now)
-        _rate[key] = q
-    return True, limit
+    if now > body.get("exp", 0):
+        problems.append("expired at %s" % _iso(body.get("exp")))
+    if audience and audience.strip().lower() != body.get("aud"):
+        problems.append("issued for %s, presented at %s" % (body.get("aud"), audience))
+    out["offline"]["expiry"] = "ok" if now <= body.get("exp", 0) else "EXPIRED"
+
+    standing, lineage = C._standing_at_bind(ctx, body.get("grant"), body.get("ld"), now)
+    with ctx["lock"]:
+        spent = ctx["conn"].execute(
+            "SELECT confirmed FROM auth_exec WHERE eval_id=? AND outcome<>'rejected' "
+            "LIMIT 1", (body.get("eval"),)).fetchone()
+    if spent:
+        problems.append("already redeemed at %s" % _iso(spent[0]))
+    problems.extend(standing)
+    out["live"] = {"standing": "holds" if not standing else "LOST",
+                   "checked_at": _iso(now), "lineage": lineage,
+                   "redeemed": bool(spent)}
+    out["valid"] = not problems
+    out["problems"] = problems
+    out["passport"] = body
+    return out, body
 
 
-def _f01(v):
+def _rev_head(ctx):
+    """Where the revocation log stood just before a decision was taken.
+
+    continuity re-reads revocations after this point, so everything up to and
+    including this entry was certainly in front of the decision. Order is then
+    proven by chain position, not by comparing two clocks.
+    """
+    with ctx["lock"]:
+        row = ctx["conn"].execute("SELECT id,block_index FROM auth_revoke "
+                                  "ORDER BY id DESC LIMIT 1").fetchone()
+    return {"entries_read_through": row[0] if row else 0,
+            "last_revocation_block": row[1] if row else None}
+
+
+def _lineage_revocations(ctx, C, grant_id):
+    out = []
+    chain, _err = C._walk(ctx, grant_id) if grant_id else (None, None)
+    for g in chain or []:
+        rev = C._revocation(ctx, g["id"])
+        out.append({"grant": g["id"],
+                    "revoked": bool(rev),
+                    "revocation_block": rev["block_index"] if rev else None,
+                    "revoked_at_ms": int(rev["revoked_ts"] * 1000) if rev else None})
+    return out
+
+
+def _ms(iso_text, fallback):
     try:
-        return max(0.0, min(1.0, float(v)))
-    except (TypeError, ValueError):
-        return 0.0
+        return int(datetime.fromisoformat(iso_text).timestamp() * 1000)
+    except Exception:
+        return int(fallback * 1000)
 
 
-def c_decide(q, body, key):
-    key = str(key or "").strip()
-    client = _client_for(key)
-    if not client or client == "open":
-        return {"error": "api_key_required", "message": "Send your sebbi.pro key in the X-Sebbi-Key header."}, 401
-    gate = _trial_gate(key)
-    if gate:
-        return gate, 402
-    row = _key_row(key)
-    ok, limit = _rate_ok(key, bool(row and row[1]))
-    if not ok:
-        return {"error": "rate_limited", "limit_per_minute": limit,
-                "message": "Decision limit reached for this minute (%d). Paid keys allow more." % limit}, 429
-    govern = _server_fn("govern")
-    if not govern:
-        return {"error": "unavailable", "message": "The decision engine isn't available just now."}, 503
-    action = re.sub(r"[^A-Za-z0-9 ._:/-]", "", str(body.get("action") or "action"))[:80] or "action"
-    user = str(body.get("user") or "").strip()
-    dev = str(body.get("device") or "").strip()
-    if user and not CID_RE.match(user):
-        return {"error": "bad_user", "message": "user must be 1-80 letters, numbers, _ . : -"}, 400
-    if dev and not CID_RE.match(dev):
-        return {"error": "bad_device", "message": "device must be 1-80 letters, numbers, _ . : -"}, 400
-    try:
-        amount = max(0.0, float(body.get("amount") or 0))
-    except (TypeError, ValueError):
-        amount = 0.0
-    country = re.sub(r"[^A-Za-z]", "", str(body.get("country") or "UK"))[:2].upper() or "UK"
-    if country == "GB":
-        country = "UK"
-    event = {"user_id": "plugin:" + (user or dev or client), "action": action, "amount": amount,
-             "country": country, "device_id": "adapter:" + (dev or client),
-             "anomaly": _f01(body.get("anomaly")), "device_risk": _f01(body.get("device_risk"))}
-    try:
-        result, status = govern(event, None)
-    except Exception as e:
-        return {"error": "engine_error", "message": "The engine couldn't decide: " + str(e)[:120]}, 500
-    if status != 200 or not isinstance(result, dict):
-        return {"error": "engine_error", "detail": result}, 502
-    _meter(key, [dev or client.replace("k_", "key_")])
-    day = time.strftime("%Y-%m-%d", time.gmtime())
-    with _rate_lock:
-        _decisions[(client, day)] = _decisions.get((client, day), 0) + 1
-    out = {"decision": result.get("decision"), "action": action, "score": result.get("score"),
-           "reasons": result.get("reasons") or [], "audit_hash": result.get("audit_hash"),
-           "block_index": result.get("block_index"),
-           "verify": SITE + "/x/walk/block?index=%s" % result.get("block_index"),
-           "timestamp": result.get("timestamp")}
-    for k in ("challenge_url", "challenge_status_url", "challenge_expires_in"):
-        if k in result:
-            out[k] = result[k]
-    return out, 200
+CHECKS = ["signature", "audience", "expiry", "single_use", "exact_parameters",
+          "lineage_integrity", "lineage_revocation", "lineage_validity_window",
+          "lineage_unchanged_since_evaluation"]
 
 
-def c_submit(q, body, key):
-    client = _client_for(key)
-    if not client:
-        return {"error": "api_key_required",
-                "message": "Send your sebbi.pro API key in the X-Sebbi-Key header."}, 401
-    if client != "open":
-        gate = _trial_gate(str(key).strip())
-        if gate:
-            return gate, 402
-    raw = body.get("items")
-    if raw is None and body.get("hashes") is not None:
-        raw = [{"hash": h} for h in body.get("hashes") or []]
-    if raw is None and body.get("hash") is not None:
-        raw = [{"hash": body.get("hash"), "cid": body.get("cid")}]
-    if not isinstance(raw, list) or not raw:
-        return {"error": "nothing_to_submit", "message": 'Send {"items":[{"hash":"<64 hex>","cid":"..."}]}'}, 400
-    if len(raw) > MAX_ITEMS:
-        return {"error": "too_many", "max_items": MAX_ITEMS}, 413
-    items, bad, devs = [], [], []
-    install = str(body.get("device") or "").strip()
-    for i, it in enumerate(raw):
-        it = it if isinstance(it, dict) else {"hash": it}
-        h = str(it.get("hash") or "").strip().lower()
-        cid = str(it.get("cid") or "").strip() or None
-        dev = str(it.get("device") or "").strip() or install
-        if not HEX64.match(h):
-            bad.append({"position": i, "error": "hash must be 64 hex characters (SHA-256)"})
-        elif cid and not CID_RE.match(cid):
-            bad.append({"position": i, "error": "cid must be 1-80 letters, numbers, _ . : -"})
-        elif dev and not CID_RE.match(dev):
-            bad.append({"position": i, "error": "device must be 1-80 letters, numbers, _ . : -"})
+def _receipt(ctx, C, token, body, audience, outcome, problems, decided_ms,
+             block, audit_hash, seq, rev_head, params):
+    """A signed, self-contained record of one redemption decision.
+
+    It answers the three questions an outside auditor asks of any "it was
+    still valid when used" claim:
+      A  which exact event    - passport, token digest, site, action, parameters
+      B  in what order        - chain block of this decision against the chain
+                                block of every revocation in the lineage
+      C  what was checked     - the complete, closed list of conditions redemption
+                                depends on, each with its result
+    """
+    pd = hashlib.sha256(C.EVAL_PREFIX + _canon(
+        {"action": body.get("act"), "params": params}).encode("utf-8")).hexdigest() \
+        if hasattr(C, "EVAL_PREFIX") else None
+    lineage = _lineage_revocations(ctx, C, body.get("grant"))
+    order = []
+    for item in lineage:
+        rb = item["revocation_block"]
+        if rb is None:
+            rel = "no revocation recorded"
+        elif block is not None and rb < block:
+            rel = "revocation sealed BEFORE this decision"
         else:
-            items.append((h, cid))
-            devs.append(dev)
-    if bad:
-        return {"error": "bad_items", "items": bad}, 400
-    _load()
-    devices = _meter(key, devs) if client != "open" else None
-    placed = _append(client, items)
-    n = len(_leaves)
-    last = _latest_sth()
-    if n - (last["tree_size"] if last else 0) >= CHECKPOINT_EVERY:
-        threading.Thread(target=_checkpoint, daemon=True).start()
-    receipts = []
-    for (idx, eh, replayed, err), (_, cid) in zip(placed, items):
-        if err:
-            receipts.append({"cid": cid, "entry_hash": eh, "error": err})
-            continue
-        r = _receipt(idx, size=n)
-        r["cid"] = cid
-        r["replayed"] = replayed
-        r["anchoring"] = _anchoring_note(None)
-        receipts.append(r)
-    return {"accepted": sum(1 for r in receipts if "error" not in r), "tree_size": n,
-            "devices_this_month": devices,
-            "root": _mth(0, n).hex(), "receipts": receipts}, 200
-
-
-def _int(q, name, default=None):
-    try:
-        return int(str(q.get(name, default)))
-    except (TypeError, ValueError):
-        return None
-
-
-def c_receipt(q, body, key):
-    idx = _int(q, "leaf")
-    if idx is None:
-        return {"error": "leaf needed"}, 400
-    r = _receipt(idx)
-    return (r, 200) if r else ({"error": "no such leaf"}, 404)
-
-
-def c_proof(q, body, key):
-    idx, size = _int(q, "leaf"), _int(q, "size", 0)
-    if idx is None:
-        return {"error": "leaf needed"}, 400
-    r = _receipt(idx, size=size or len(_leaves))
-    return (r, 200) if r else ({"error": "no such leaf"}, 404)
-
-
-def c_consistency(q, body, key):
-    _load()
-    m, n = _int(q, "first"), _int(q, "second", len(_leaves))
-    if m is None or n is None or m < 1 or m > n or n > len(_leaves):
-        return {"error": "need 1 <= first <= second <= tree size", "tree_size": len(_leaves)}, 400
-    return {"first": m, "second": n, "first_root": _mth(0, m).hex(), "second_root": _mth(0, n).hex(),
-            "proof": [p.hex() for p in _consistency(m, n)], "spec": SPEC}, 200
-
-
-def c_sth(q, body, key):
-    _load()
-    last = _latest_sth()
-    if last:
-        last.pop("ts", None)
-    return {"tree_size": len(_leaves), "latest_sealed_tree_head": last,
-            "checkpoint_every_seconds": CHECKPOINT_SECONDS, "spec": SPEC}, 200
-
-
-def c_find(q, body, key):
-    h = str(q.get("hash") or "").strip().lower()
-    if not HEX64.match(h):
-        return {"error": "hash must be 64 hex characters"}, 400
-    rows = _sth_rows("SELECT idx FROM ppa_leaf WHERE entry_hash=? ORDER BY idx LIMIT 50", (h,))
-    return {"entry_hash": h, "leaf_indexes": [r[0] for r in rows]}, 200
-
-
-def c_index(q, body, key):
-    return {"log": "sebbi.pro public proof log", "version": VERSION, "spec": SPEC,
-            "submit": "POST " + SITE + "/p/submit with X-Sebbi-Key",
-            "check": ["GET " + SITE + "/p/receipt?leaf=N", "GET " + SITE + "/p/consistency?first=M&second=N",
-                      "GET " + SITE + "/p/sth"],
-            "hash_only": True}, 200
-
-
-GETS = {"receipt": c_receipt, "proof": c_proof, "consistency": c_consistency, "sth": c_sth,
-        "find": c_find, "": c_index}
-POSTS = {"submit": c_submit, "signup": c_signup, "account": c_account, "pay": c_pay, "decide": c_decide}
-
-
-# ---------------------------------------------------------------- transport
-
-def _send(h, obj, code=200):
-    body = json.dumps(obj).encode("utf-8")
-    h.send_response(code)
-    h.send_header("Content-Type", "application/json; charset=utf-8")
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Access-Control-Allow-Origin", "*")
-    h.send_header("Access-Control-Allow-Headers", "Content-Type, X-Sebbi-Key")
-    h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    h.send_header("Cache-Control", "no-store")
-    h.end_headers()
-    h.wfile.write(body)
-
-
-def _run(h, method):
-    u = urllib.parse.urlparse(h.path)
-    name = u.path[3:].strip("/").lower()
-    table = GETS if method == "GET" else POSTS
-    if name not in table:
-        return False
-    if "conn" not in _ctx:
-        _send(h, {"error": "not_armed", "message": "open /x/plugin/status once"}, 503)
-        return True
-    _setup()
-    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
-    body = {}
-    if method == "POST":
-        try:
-            n = int(h.headers.get("Content-Length") or 0)
-        except ValueError:
-            n = 0
-        if n > MAX_BODY:
-            _send(h, {"error": "body_too_large", "max_bytes": MAX_BODY}, 413)
-            return True
-        try:
-            body = json.loads(h.rfile.read(n).decode("utf-8") or "{}") if n else {}
-            if not isinstance(body, dict):
-                body = {}
-        except Exception:
-            _send(h, {"error": "bad_json"}, 400)
-            return True
-    key = h.headers.get("X-Sebbi-Key") or body.get("key") or q.get("key")
-    try:
-        if name == "signup":
-            ip = (h.headers.get("X-Forwarded-For") or h.client_address[0] or "").split(",")[0].strip()
-            out, code = c_signup(q, body, key, ip)
+            rel = "revocation sealed AFTER this decision"
+        order.append(dict(item, relation=rel))
+    results = {k: "pass" for k in CHECKS}
+    for msg in (x.lower() for x in problems if x):
+        if "presented at" in msg:
+            results["audience"] = "fail"
+        elif "evaluation expired" in msg:
+            results["expiry"] = "fail"
+        elif "already bound" in msg or "concurrent request" in msg:
+            results["single_use"] = "fail"
+        elif "parameters do not match" in msg:
+            results["exact_parameters"] = "fail"
+        elif "no longer matches" in msg:
+            results["lineage_integrity"] = "fail"
+        elif "was revoked" in msg:
+            results["lineage_revocation"] = "fail"
+        elif "not valid until" in msg or ("grant" in msg and "expired at" in msg):
+            results["lineage_validity_window"] = "fail"
+        elif ("lineage is not the one" in msg or "does not terminate" in msg
+              or "grant not found" in msg or "walk limit" in msg):
+            results["lineage_unchanged_since_evaluation"] = "fail"
         else:
-            out, code = table[name](q, body, key)
-    except Exception as e:
-        out, code = {"error": "failed", "detail": str(e)[:160]}, 500
-    _send(h, out, code)
-    return True
+            results.setdefault("other", []).append(msg)
+    if outcome == "refused" and results["audience"] == "fail":
+        # A wrong-site refusal stops before the live checks run.
+        for k in CHECKS[2:]:
+            results[k] = "not reached"
+    r = {
+        "v": 1, "kind": "passport_redemption_receipt", "iss": "sebbi.pro",
+        "pid": body.get("pid"),
+        "token_digest": hashlib.sha256(token.encode()).hexdigest(),
+        "presented_at": audience, "passport_audience": body.get("aud"),
+        "action": body.get("act"), "evaluation": body.get("eval"),
+        "params_digest_presented": pd, "params_digest_authorised": body.get("pd"),
+        "outcome": outcome, "problems": problems,
+        "decided_at_ms": decided_ms,
+        "clock": "server UTC system clock. Order is proven by chain position, not by clock.",
+        "chain": {"block": block, "audit_hash": audit_hash, "seq": seq},
+        "revocation_log": rev_head,
+        "lineage_order": order,
+        "checks": results,
+        "completeness": "These are all the conditions a sebbi.pro passport redemption "
+                        "depends on. Nothing else is consulted and nothing else can "
+                        "change the outcome.",
+        "nonce": uuid.uuid4().hex[:16],
+    }
+    raw = _canon(r).encode("utf-8")
+    seed, pk, _src = C._keys(ctx)
+    sig = C._ed_signature(RECEIPT_PREFIX + raw, seed, pk)
+    tok = "%s.%s.%s" % (RECEIPT_TAG, _b64e(raw), _b64e(sig))
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO passport_receipt(passport_id,outcome,receipt,digest,"
+                            "at_ms,block_index) VALUES(?,?,?,?,?,?)",
+                            (body.get("pid"), outcome, tok,
+                             hashlib.sha256(tok.encode()).hexdigest(), decided_ms, block))
+        ctx["conn"].commit()
+    return tok, r
+
+
+def _redeem(ctx, C, data):
+    token = str(data.get("token") or data.get("passport") or "").strip()
+    audience = str(data.get("audience", "")).strip().lower()
+    params = data.get("params") or {}
+    if not token or not audience:
+        return {"error": "token_and_audience_required"}, 400
+    body, problems = _open(ctx, C, token)
+    if body is None or problems:
+        return {"redeemed": False, "problems": problems}, 409
+    pid = body.get("pid")
+    rev_head = _rev_head(ctx)
+
+    if audience != body.get("aud"):
+        now = time.time()
+        reasons = ["issued for %s, presented at %s" % (body.get("aud"), audience)]
+        audit_hash, block = _seal(ctx, "passport_refused",
+                                  {"passport": pid, "reasons": reasons,
+                                   "detail": "pid=%s;wrong_audience" % pid},
+                                  "passport-redeem:" + audience[:60])
+        with ctx["lock"]:
+            ctx["conn"].execute("INSERT INTO passport_use(passport_id,outcome,reasons,at,"
+                                "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
+                                (pid, "refused", _canon(reasons), now, audit_hash, block))
+            ctx["conn"].commit()
+        tok, rc = _receipt(ctx, C, token, body, audience, "refused", reasons,
+                           int(now * 1000), block, audit_hash, None, rev_head, params)
+        return {"redeemed": False, "problems": reasons, "sealed_in_chain": audit_hash,
+                "block_index": block, "receipt": tok, "receipt_body": rc,
+                "check_receipt": BASE + "receipt?receipt=" + tok}, 409
+
+    # The consequence boundary. continuity re-derives standing, enforces the
+    # window, compares the exact parameters, and allows one binding only.
+    t0 = time.time()
+    r, s = C._confirm(ctx, "passport-redeem:" + audience[:60],
+                      {"evaluation": body.get("eval"), "action": body.get("act"),
+                       "params": params, "outcome": "redeemed@" + audience[:40]})
+    bound = bool(r.get("bound"))
+    probs = r.get("problems", []) or ([r.get("error")] if r.get("error") else [])
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO passport_use(passport_id,outcome,reasons,at,"
+                            "audit_hash,block_index) VALUES(?,?,?,?,?,?)",
+                            (pid, "redeemed" if bound else "refused",
+                             _canon(probs), time.time(),
+                             r.get("sealed_in_chain"), r.get("block_index")))
+        ctx["conn"].commit()
+    decided_ms = _ms((r.get("standing_at_bind") or {}).get("checked_at"), t0)
+    tok, rc = _receipt(ctx, C, token, body, audience, "redeemed" if bound else "refused",
+                       probs, decided_ms, r.get("block_index"), r.get("sealed_in_chain"),
+                       r.get("receipt_seq"), rev_head, params)
+    return {"redeemed": bound, "passport": pid, "audience": audience,
+            "action": body.get("act"), "problems": probs,
+            "standing_at_redemption": r.get("standing_at_bind"),
+            "sealed_in_chain": r.get("sealed_in_chain"), "block_index": r.get("block_index"),
+            "receipt": tok, "receipt_body": rc,
+            "check_receipt": BASE + "receipt?receipt=" + tok,
+            "meaning": ("Bound. The action was authorised by a human-rooted lineage that still "
+                        "stood at this instant, on exactly these parameters, once."
+                        if bound else
+                        "Refused. Do not perform the action. The refusal is sealed.")}, \
+        (200 if bound else 409)
+
+
+def _receipt_check(ctx, C, data):
+    tok = str(data.get("receipt", "")).strip()
+    pid = str(data.get("pid", "")).strip()
+    if not tok and (not pid or not pid.startswith("p_")):
+        with ctx["lock"]:
+            rows = ctx["conn"].execute("SELECT passport_id,outcome,receipt FROM passport_receipt "
+                                       "ORDER BY id DESC LIMIT 5").fetchall()
+        return {"what_this_is": "Every passport redemption on sebbi.pro, accepted or refused, "
+                                "gets a signed receipt. Tap any link below to check one.",
+                "latest": [{"passport": r[0], "outcome": r[1],
+                            "check_this_receipt": BASE + "receipt?receipt=" + r[2],
+                            "every_receipt_for_this_passport": BASE + "receipt?pid=" + r[0]}
+                           for r in rows]}, 200
+    if pid and not tok:
+        with ctx["lock"]:
+            rows = ctx["conn"].execute("SELECT receipt FROM passport_receipt WHERE "
+                                       "passport_id=? ORDER BY id ASC", (pid,)).fetchall()
+        return {"passport": pid, "receipts": [x[0] for x in rows],
+                "count": len(rows),
+                "check_one": BASE + "receipt?receipt=<receipt>"}, 200
+    try:
+        tag, b, sg = tok.split(".")
+        if tag != RECEIPT_TAG:
+            raise ValueError
+        raw, sig = _b64d(b), _b64d(sg)
+        body = json.loads(raw)
+    except Exception:
+        return {"valid": False, "problems": ["not a sebbi.pro redemption receipt "
+                                             "(expected prefix %s.)" % RECEIPT_TAG]}, 200
+    _seed, pk, _src = C._keys(ctx)
+    if not C._ed_checkvalid(sig, RECEIPT_PREFIX + raw, pk):
+        return {"valid": False, "problems": ["signature does not verify against the "
+                                             "published key"]}, 200
+    with ctx["lock"]:
+        known = ctx["conn"].execute("SELECT 1 FROM passport_receipt WHERE digest=?",
+                                    (hashlib.sha256(tok.encode()).hexdigest(),)).fetchone()
+    return {"valid": True, "signature": "ok", "issued_by_this_server": bool(known),
+            "receipt": body,
+            "public_key": "https://sebbi.pro/x/continuity/pubkey",
+            "check_offline": "Ed25519 over 'AILEASH-PASSPORT-RECEIPT-v1:' || the body bytes",
+            "check_chain": "Block %s should carry audit hash %s"
+                           % ((body.get("chain") or {}).get("block"),
+                              (body.get("chain") or {}).get("audit_hash"))}, 200
+
+
+def _sitefile(data):
+    domain = str(data.get("domain", "your.site")).strip().lower() or "your.site"
+    req = str(data.get("require", "payments.*")).strip()
+    require = [x.strip() for x in req.split(",") if x.strip()]
+    doc = {
+        "agent_passport": {
+            "version": 1,
+            "audience": domain,
+            "required_for": require,
+            "issuer": "sebbi.pro",
+            "public_key": "https://sebbi.pro/x/continuity/pubkey",
+            "verify": BASE + "verify",
+            "redeem": BASE + "redeem",
+            "header": "Agent-Passport",
+            "live_standing_required": True,
+            "single_use": True,
+            "spec": BASE + "spec",
+        }
+    }
+    return {"host_this_at": "https://%s/.well-known/agent-passport.json" % domain,
+            "file": doc,
+            "what_it_does": "Tells every AI agent that these actions need a passport. An "
+                            "agent without one is not served. Your server checks the "
+                            "signature offline and redeems it once at the moment of action."}, 200
+
+
+def _spec(C):
+    return {
+        "passport_version": VERSION,
+        "token": "sbp1.<base64url(canonical JSON body)>.<base64url(Ed25519 signature)>",
+        "signature": "Ed25519 over 'AILEASH-PASSPORT-v1:' || the exact body bytes",
+        "public_key": "https://sebbi.pro/x/continuity/pubkey",
+        "body_fields": {
+            "pid": "passport id", "iss": "issuer", "aud": "the one site it is good at",
+            "act": "the capability", "pd": "digest of {action, params} it was issued for",
+            "grant": "grant exercised", "ld": "lineage digest at issue",
+            "eval": "sealed evaluation id", "by": "human who authorised",
+            "agent": "who acts", "risk": "who accepts the risk",
+            "iat": "issued (unix seconds)", "iat_ms": "issued (unix milliseconds)",
+            "exp": "expires (unix)", "blk": "chain block of the evaluation",
+            "nonce": "uniqueness",
+        },
+        "offline_check": ["split on '.'", "base64url-decode body and signature",
+                          "verify Ed25519 over prefix + body bytes with the public key",
+                          "check aud is you and exp is in the future"],
+        "live_check": BASE + "verify?token=<token>&audience=<you>",
+        "redeem": "POST " + BASE + "redeem  {token, audience, params}. Binds once, re-derives "
+                  "standing at that instant, compares the exact parameters, seals the outcome.",
+        "receipt": {
+            "format": "sbr1.<base64url(canonical JSON body)>.<base64url(Ed25519 signature)>",
+            "signature": "Ed25519 over 'AILEASH-PASSPORT-RECEIPT-v1:' || the body bytes, same "
+                         "published key. The different prefix means a receipt can never be "
+                         "passed off as a passport.",
+            "answers": {"A_which_event": "pid, token_digest, presented_at, action, parameter "
+                                         "digests presented and authorised",
+                        "B_what_order": "chain block of this decision against the chain block "
+                                        "of every revocation in the lineage, plus how far the "
+                                        "revocation log had been read before deciding",
+                        "C_what_was_checked": "the closed list of every condition redemption "
+                                              "depends on, each with its result"},
+            "check": BASE + "receipt?receipt=<receipt>",
+            "list": BASE + "receipt?pid=<passport id>",
+        },
+        "discovery": BASE + "sitefile?domain=<your.site>&require=payments.*,records.write",
+        "mcp": BASE + "mcp",
+        "requires_continuity": ">= 1.6.0",
+        "continuity_version": getattr(C, "VERSION", None),
+    }, 200
+
+
+# ----------------------------------------------------------------------
+# the demo - the whole story in one tap
+# ----------------------------------------------------------------------
+
+def _demo(ctx, C):
+    now = time.time()
+    if now - _last_demo[0] < DEMO_GAP:
+        return {"error": "too_soon", "retry_after_seconds": int(DEMO_GAP - (now - _last_demo[0]))}, 429
+    with ctx["lock"]:
+        n = ctx["conn"].execute("SELECT COUNT(*) FROM passport_demo WHERE at>?",
+                                (now - 86400,)).fetchone()[0]
+    if n >= DEMO_PER_DAY:
+        return {"error": "daily_limit"}, 429
+    _last_demo[0] = now
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO passport_demo(at) VALUES(?)", (now,))
+        ctx["conn"].commit()
+
+    tag = uuid.uuid4().hex[:10]
+    aud = "shop.demo.sebbi.pro"
+    params = {"amount": 20}
+    story = []
+
+    def grant(gid):
+        g = {"id": gid, "issuer": "demo-human", "issuer_kind": "human",
+             "subject": "demo-agent-" + tag, "scope": ["demo.pay"],
+             "constraints": {"max_amount": 50}, "purpose": "demo purchase",
+             "purpose_tags": ["demo"], "not_after": now + 900}
+        return C._issue(ctx, DEMO_KEY, g)[0]
+
+    def ask(gid):
+        return _mint(ctx, C, DEMO_KEY, {"grant": gid, "action": "demo.pay", "params": params,
+                                        "purpose_tag": "demo", "audience": aud})[0]
+
+    # Act 1 - a human authorises, the agent gets a passport, the shop accepts it once.
+    g1 = "demo_" + tag + "_1"
+    gr = grant(g1)
+    story.append({"act": "1. A human grants an agent authority to pay up to 50",
+                  "grant": g1, "block": gr.get("block_index")})
+    p1 = ask(g1)
+    story.append({"act": "2. The agent asks for a passport to pay 20 at " + aud,
+                  "issued": p1.get("issued"), "passport": p1.get("passport"),
+                  "block": p1.get("block_index")})
+    if not p1.get("issued"):
+        return {"demo": "stopped", "why": "no passport issued", "story": story,
+                "detail": p1}, 200
+    chk, _b = _check(ctx, C, p1["passport"], aud)
+    story.append({"act": "3. The shop checks it (signature offline, standing live)",
+                  "valid": chk["valid"], "problems": chk["problems"]})
+    r1 = _redeem(ctx, C, {"token": p1["passport"], "audience": aud, "params": params})[0]
+    story.append({"act": "4. The shop redeems it at the moment of payment",
+                  "redeemed": r1["redeemed"], "block": r1.get("block_index"),
+                  "signed_receipt": r1.get("receipt"),
+                  "check_this_receipt": r1.get("check_receipt"),
+                  "every_receipt_for_this_passport": BASE + "receipt?pid=" + str(r1.get("passport"))})
+    r2 = _redeem(ctx, C, {"token": p1["passport"], "audience": aud, "params": params})[0]
+    story.append({"act": "5. Someone replays the same passport",
+                  "redeemed": r2["redeemed"], "why": r2.get("problems")})
+
+    # Act 2 - a valid passport, then the human pulls the authority.
+    g2 = "demo_" + tag + "_2"
+    grant(g2)
+    p2 = ask(g2)
+    story.append({"act": "6. A second passport is issued - valid, unexpired",
+                  "issued": p2.get("issued")})
+    rv = C._revoke(ctx, DEMO_KEY, {"grant": g2, "reason": "demo: human pulls authority"})[0]
+    story.append({"act": "7. The human revokes the agent's authority",
+                  "block": rv.get("block_index")})
+    r3 = _redeem(ctx, C, {"token": p2.get("passport", ""), "audience": aud,
+                          "params": params})[0]
+    story.append({"act": "8. The agent tries to spend the still-signed passport",
+                  "redeemed": r3["redeemed"], "why": r3.get("problems"),
+                  "order": [x.get("relation") for x in
+                            (r3.get("receipt_body") or {}).get("lineage_order", [])],
+                  "signed_receipt": r3.get("receipt"),
+                  "check_this_receipt": r3.get("check_receipt")})
+
+    # Act 3 - the wrong door, and a tampered amount.
+    g3 = "demo_" + tag + "_3"
+    grant(g3)
+    p3 = ask(g3)
+    r4 = _redeem(ctx, C, {"token": p3.get("passport", ""), "audience": "evil.example.com",
+                          "params": params})[0]
+    story.append({"act": "9. The passport is presented at a different site",
+                  "redeemed": r4["redeemed"], "why": r4.get("problems")})
+    r5 = _redeem(ctx, C, {"token": p3.get("passport", ""), "audience": aud,
+                          "params": {"amount": 49}})[0]
+    story.append({"act": "10. At the right site, but for 49 instead of 20",
+                  "redeemed": r5["redeemed"], "why": r5.get("problems")})
+
+    held = (r1["redeemed"] and not r2["redeemed"] and not r3["redeemed"]
+            and not r4["redeemed"] and not r5["redeemed"])
+    return {"demo": "Agent Passport - live on production, every step sealed",
+            "result": "ALL TEN BEHAVED" if held else "SOMETHING DID NOT BEHAVE - see story",
+            "one_line": "The payment happened once, where it was meant to, for the amount "
+                        "authorised, while the human's authority stood. Every other attempt "
+                        "was refused and the refusal is on the chain.",
+            "story": story,
+            "make_your_site_require_it": BASE + "sitefile?domain=your.site&require=payments.*",
+            "spec": BASE + "spec"}, 200
+
+
+# ----------------------------------------------------------------------
+# MCP - agents use passports as tools
+# ----------------------------------------------------------------------
+
+_TOOLS = [
+    {"name": "passport_request",
+     "description": "Request a signed Agent Passport before taking an action. Returns a "
+                    "token to present to the site, or a sealed refusal. Needs a sebbi.pro "
+                    "API key as Authorization: Bearer.",
+     "inputSchema": {"type": "object", "required": ["grant", "action", "audience"],
+                     "properties": {"grant": {"type": "string"}, "action": {"type": "string"},
+                                    "audience": {"type": "string"},
+                                    "params": {"type": "object"},
+                                    "purpose_tag": {"type": "string"}}}},
+    {"name": "passport_verify",
+     "description": "Check a passport: signature, expiry, audience, and whether the "
+                    "authority behind it still stands right now.",
+     "inputSchema": {"type": "object", "required": ["token"],
+                     "properties": {"token": {"type": "string"},
+                                    "audience": {"type": "string"}}}},
+    {"name": "passport_redeem",
+     "description": "Spend a passport once at the moment of action. Refused if authority "
+                    "was revoked, it expired, the site or parameters differ, or it was used.",
+     "inputSchema": {"type": "object", "required": ["token", "audience"],
+                     "properties": {"token": {"type": "string"},
+                                    "audience": {"type": "string"},
+                                    "params": {"type": "object"}}}},
+    {"name": "passport_sitefile",
+     "description": "Generate the discovery file a site hosts to require passports.",
+     "inputSchema": {"type": "object",
+                     "properties": {"domain": {"type": "string"},
+                                    "require": {"type": "string"}}}},
+]
+
+
+def _mcp(ctx, C, api_key, data):
+    rid = data.get("id")
+    method = data.get("method", "")
+    p = data.get("params") or {}
+
+    def ok(result):
+        return {"jsonrpc": "2.0", "id": rid, "result": result}, 200
+
+    if method == "initialize":
+        return ok({"protocolVersion": p.get("protocolVersion") or MCP_PROTOCOL,
+                   "capabilities": {"tools": {}},
+                   "serverInfo": {"name": "sebbi-passport", "version": VERSION},
+                   "instructions": "Before any consequential action, call passport_request "
+                                   "and present the token to the site. No passport, no action."})
+    if method in ("notifications/initialized", "ping"):
+        return ok({})
+    if method == "tools/list":
+        return ok({"tools": _TOOLS})
+    if method == "tools/call":
+        name = p.get("name")
+        a = p.get("arguments") or {}
+        if name == "passport_request":
+            if not api_key:
+                res, st = {"error": "needs Authorization: Bearer <sebbi.pro key>"}, 401
+            else:
+                res, st = _mint(ctx, C, api_key, a)
+        elif name == "passport_verify":
+            res, _b = _check(ctx, C, a.get("token", ""), a.get("audience"))
+            st = 200
+        elif name == "passport_redeem":
+            res, st = _redeem(ctx, C, a)
+        elif name == "passport_sitefile":
+            res, st = _sitefile(a)
+        else:
+            return {"jsonrpc": "2.0", "id": rid,
+                    "error": {"code": -32602, "message": "unknown tool"}}, 200
+        return ok({"content": [{"type": "text", "text": json.dumps(res, default=str)}],
+                   "isError": st >= 400})
+    return {"jsonrpc": "2.0", "id": rid,
+            "error": {"code": -32601, "message": "method not found"}}, 200
+
+
+# ----------------------------------------------------------------------
+
+def _status(ctx, C):
+    with ctx["lock"]:
+        issued = ctx["conn"].execute("SELECT COUNT(*) FROM passport").fetchone()[0]
+        used = ctx["conn"].execute("SELECT outcome,COUNT(*) FROM passport_use "
+                                   "GROUP BY outcome").fetchall()
+        receipts = ctx["conn"].execute("SELECT COUNT(*) FROM passport_receipt").fetchone()[0]
+    tally = {k: v for k, v in used}
+    cv = getattr(C, "VERSION", "0")
+    return {"module": "passport", "version": VERSION, "armed": True,
+            "continuity_version": cv,
+            "continuity_ready": hasattr(C, "_standing_at_bind"),
+            "passports_issued": issued,
+            "redeemed": tally.get("redeemed", 0), "refused": tally.get("refused", 0),
+            "signed_receipts": receipts,
+            "demo": BASE + "demo", "spec": BASE + "spec",
+            "sitefile": BASE + "sitefile?domain=your.site&require=payments.*",
+            "mcp": BASE + "mcp"}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    C = _continuity()
+    C._setup(ctx)
+    _setup(ctx)
+    action = (action or "").strip("/").lower()
+    data = data or {}
+
+    if not hasattr(C, "_standing_at_bind") and action not in ("status", "spec"):
+        return {"error": "continuity_too_old",
+                "message": "Passport needs continuity.py 1.6.0 or later."}, 503
+
+    if action == "status":
+        return _status(ctx, C)
+    if action == "spec":
+        return _spec(C)
+    if action == "sitefile":
+        return _sitefile(data)
+    if action == "demo" and method == "GET":
+        return _demo(ctx, C)
+    if action == "verify":
+        res, _b = _check(ctx, C, data.get("token", ""), data.get("audience"))
+        return res, 200
+    if action == "redeem" and method == "POST":
+        return _redeem(ctx, C, data)
+    if action == "receipt":
+        return _receipt_check(ctx, C, data)
+    if action == "mcp":
+        if method == "GET":
+            return {"mcp": "POST JSON-RPC 2.0 here", "tools": [t["name"] for t in _TOOLS],
+                    "server": "sebbi-passport", "version": VERSION}, 200
+        return _mcp(ctx, C, api_key, data)
+    if action == "issue" and method == "POST":
+        if not api_key:
+            return {"error": "invalid_api_key"}, 401
+        return _mint(ctx, C, api_key, data)
+
+    return {"error": "unknown_action",
+            "GET": ["status", "spec", "demo", "verify", "sitefile", "mcp", "receipt"],
+            "POST": ["issue", "verify", "redeem", "mcp", "receipt"]}, 404
+
+```
+
+
+## `modules/passportpage.py`
+
+477 lines, 42509 bytes
+
+```python
+"""
+modules/passportpage.py  v1.1.0
+Serves the Agent Passport page at /passport, and the Passport Kit downloads
+at /passport/sebbi_agent.py and /passport/sebbi_site.py.
+
+Page module, same family as map.py / console.py / network.py: a runtime
+do_GET patch puts full pages at clean URLs. Armed by hitting
+/x/passportpage/status once after each deploy. server.py is never edited.
+Everything is base64-embedded so no character can break the Python string.
+The live demo on the page calls /x/passport/demo.
+"""
+
+import base64
+import sys
+
+VERSION = "1.1.0"
+PAGE_PATH = "/passport"
+
+_B64 = (
+    "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0i"
+    "dmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLCB2aWV3cG9ydC1maXQ9Y292ZXIi"
+    "Pgo8dGl0bGU+QWdlbnQgUGFzc3BvcnQg4oCUIHNlYmJpLnBybzwvdGl0bGU+CjxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250"
+    "ZW50PSJFdmVyeSBBSSBhZ2VudCBuZWVkcyBhIHBhc3Nwb3J0LiBTaWduZWQsIHNpbmdsZS11c2UgcGVybWlzc2lvbiBmb3IgQUkg"
+    "YWN0aW9ucywgY2hlY2tlZCBhdCB0aGUgbW9tZW50IG9mIGFjdGlvbiwgc2VhbGVkIG9uIGEgcHVibGljIGNoYWluLiI+CjxsaW5r"
+    "IHJlbD0icHJlY29ubmVjdCIgaHJlZj0iaHR0cHM6Ly9mb250cy5nb29nbGVhcGlzLmNvbSI+CjxsaW5rIGhyZWY9Imh0dHBzOi8v"
+    "Zm9udHMuZ29vZ2xlYXBpcy5jb20vY3NzMj9mYW1pbHk9TmV3c3JlYWRlcjpvcHN6LHdnaHRANi4uNzIsNDAwOzYuLjcyLDUwMCZm"
+    "YW1pbHk9SUJNK1BsZXgrU2Fuczp3Z2h0QDQwMDs1MDA7NjAwJmZhbWlseT1JQk0rUGxleCtNb25vOndnaHRANDAwOzUwMCZkaXNw"
+    "bGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7LS1pbms6IzBhMGYxZTstLWluazI6IzEwMTgyZTstLXBh"
+    "cGVyOiNGQUZBRjY7LS1saW5lOiNERURCRDE7LS1nb2xkOiNjOWE4NGM7LS1vazojMkU3RDU3Oy0tb2tiZzojRTRFQ0U4Oy0td2Fy"
+    "bjojOUMyRjI2Oy0td2FybmJnOiNGNUU2RTM7LS1tdXRlZDojNUE2MjcwOy0tZmFpbnQ6IzhBOTBBMDsKLS1zYW5zOidJQk0gUGxl"
+    "eCBTYW5zJyxzeXN0ZW0tdWksc2Fucy1zZXJpZjstLXNlcmlmOidOZXdzcmVhZGVyJyxHZW9yZ2lhLHNlcmlmOy0tbW9ubzonSUJN"
+    "IFBsZXggTW9ubycsdWktbW9ub3NwYWNlLG1vbm9zcGFjZX0KKntib3gtc2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGlu"
+    "ZzowfQpib2R5e2ZvbnQtZmFtaWx5OnZhcigtLXNhbnMpO2JhY2tncm91bmQ6dmFyKC0tcGFwZXIpO2NvbG9yOnZhcigtLWluayk7"
+    "bGluZS1oZWlnaHQ6MS42Oy13ZWJraXQtZm9udC1zbW9vdGhpbmc6YW50aWFsaWFzZWR9Ci53cmFwe21heC13aWR0aDo4MjBweDtt"
+    "YXJnaW46MCBhdXRvO3BhZGRpbmc6MCAyMnB4fQoudG9we2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRp"
+    "bmc6MTZweCAwfQoudG9wIC53cmFwe2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVt"
+    "czpiYXNlbGluZTtnYXA6MTJweDtmbGV4LXdyYXA6d3JhcH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6"
+    "ZToxM3B4fS5icmFuZCBie2NvbG9yOnZhcigtLWdvbGQpO2ZvbnQtd2VpZ2h0OjUwMH0KLnRvcCBuYXYgYXtmb250LWZhbWlseTp2"
+    "YXIoLS1tb25vKTtmb250LXNpemU6MTIuNXB4O2NvbG9yOnZhcigtLW11dGVkKTt0ZXh0LWRlY29yYXRpb246bm9uZTttYXJnaW4t"
+    "bGVmdDoxNHB4fQouaGVyb3twYWRkaW5nOjU0cHggMCAyNnB4fQoua2lja3tmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNp"
+    "emU6MTJweDtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3BhY2luZzouMDZlbTttYXJnaW4tYm90dG9tOjE0cHh9Ci5oZXJvIGgx"
+    "e2ZvbnQtZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDM0cHgsNnZ3LDU2cHgpO2xp"
+    "bmUtaGVpZ2h0OjEuMDU7bWF4LXdpZHRoOjE1Y2g7bWFyZ2luLWJvdHRvbToxOHB4fQouaGVybyBwe2ZvbnQtc2l6ZToxNy41cHg7"
+    "Y29sb3I6dmFyKC0tbXV0ZWQpO21heC13aWR0aDo1NmNofQouY3Rhe2Rpc3BsYXk6aW5saW5lLWJsb2NrO21hcmdpbjoyNnB4IDEy"
+    "cHggMCAwO2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxNHB4O3RleHQtZGVjb3JhdGlvbjpub25lO2JvcmRlci1y"
+    "YWRpdXM6NXB4O3BhZGRpbmc6MTNweCAyMHB4O2N1cnNvcjpwb2ludGVyO2JvcmRlcjowfQouY3RhLmdvbGR7YmFja2dyb3VuZDp2"
+    "YXIoLS1nb2xkKTtjb2xvcjp2YXIoLS1pbmspO2ZvbnQtd2VpZ2h0OjUwMH0KLmN0YS5naG9zdHtib3JkZXI6MXB4IHNvbGlkIHZh"
+    "cigtLWxpbmUpO2NvbG9yOnZhcigtLWluayk7YmFja2dyb3VuZDojZmZmfQouc3RhdHN7ZGlzcGxheTpmbGV4O2dhcDoyMnB4O2Zs"
+    "ZXgtd3JhcDp3cmFwO21hcmdpbi10b3A6MzBweDtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTJweDtjb2xvcjp2"
+    "YXIoLS1mYWludCl9Ci5zdGF0cyBie2NvbG9yOnZhcigtLWluayk7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToxNXB4O2Rpc3Bs"
+    "YXk6YmxvY2t9CnNlY3Rpb257cGFkZGluZzo0MHB4IDA7Ym9yZGVyLXRvcDoxcHggc29saWQgdmFyKC0tbGluZSl9Cmgye2ZvbnQt"
+    "ZmFtaWx5OnZhcigtLXNlcmlmKTtmb250LXdlaWdodDo1MDA7Zm9udC1zaXplOmNsYW1wKDI2cHgsNC4ydncsMzZweCk7bGluZS1o"
+    "ZWlnaHQ6MS4xMjttYXJnaW4tYm90dG9tOjE0cHg7bWF4LXdpZHRoOjIyY2h9Ci5sZWFke2NvbG9yOnZhcigtLW11dGVkKTttYXgt"
+    "d2lkdGg6NjBjaDttYXJnaW4tYm90dG9tOjIycHh9Ci5zdGVwc3tkaXNwbGF5OmdyaWQ7Z2FwOjE0cHh9Ci5zdGVwe2JhY2tncm91"
+    "bmQ6I2ZmZjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6N3B4O3BhZGRpbmc6MjBweCAyMnB4fQou"
+    "c3RlcCAubntmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTFweDtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3Bh"
+    "Y2luZzouMDVlbX0KLnN0ZXAgaDN7Zm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0OjUwMDtmb250LXNpemU6MjFw"
+    "eDttYXJnaW46NHB4IDAgNnB4fQouc3RlcCBwe2ZvbnQtc2l6ZToxNC44cHg7Y29sb3I6dmFyKC0tbXV0ZWQpfQouZGFya3tiYWNr"
+    "Z3JvdW5kOnZhcigtLWluayk7Y29sb3I6I2ZmZjtib3JkZXItcmFkaXVzOjEwcHg7cGFkZGluZzozMHB4IDI0cHg7Ym9yZGVyOjJw"
+    "eCBzb2xpZCB2YXIoLS1nb2xkKX0KLmRhcmsgaDJ7Y29sb3I6I2ZmZn0uZGFyayAubGVhZHtjb2xvcjpyZ2JhKDI1NSwyNTUsMjU1"
+    "LC43Mil9CiNzdG9yeXttYXJnaW4tdG9wOjE4cHg7ZGlzcGxheTpncmlkO2dhcDo4cHh9Ci5yb3d7ZGlzcGxheTpmbGV4O2dhcDox"
+    "MnB4O2FsaWduLWl0ZW1zOmZsZXgtc3RhcnQ7YmFja2dyb3VuZDp2YXIoLS1pbmsyKTtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjAx"
+    "LDE2OCw3NiwuMTgpO2JvcmRlci1yYWRpdXM6NnB4O3BhZGRpbmc6MTFweCAxNHB4O2ZvbnQtc2l6ZToxNHB4O29wYWNpdHk6MDt0"
+    "cmFuc2Zvcm06dHJhbnNsYXRlWSg2cHgpO3RyYW5zaXRpb246YWxsIC4zNXN9Ci5yb3cuc2hvd3tvcGFjaXR5OjE7dHJhbnNmb3Jt"
+    "Om5vbmV9Ci5yb3cgLmlje2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O21pbi13aWR0aDo2NnB4O3RleHQt"
+    "YWxpZ246Y2VudGVyO3BhZGRpbmc6MnB4IDZweDtib3JkZXItcmFkaXVzOjNweH0KLmljLnBhc3N7YmFja2dyb3VuZDojMTczOTJh"
+    "O2NvbG9yOiM3ZmUzYjB9LmljLnN0b3B7YmFja2dyb3VuZDojM2QxYTE3O2NvbG9yOiNmZjhhODB9LmljLmluZm97YmFja2dyb3Vu"
+    "ZDojMmEyYTFhO2NvbG9yOnZhcigtLWdvbGQpfQoucm93IC53aHl7ZGlzcGxheTpibG9jaztmb250LWZhbWlseTp2YXIoLS1tb25v"
+    "KTtmb250LXNpemU6MTEuNXB4O2NvbG9yOnJnYmEoMjU1LDI1NSwyNTUsLjUpO21hcmdpbi10b3A6M3B4O3dvcmQtYnJlYWs6YnJl"
+    "YWstd29yZH0KI3ZlcmRpY3R7Zm9udC1mYW1pbHk6dmFyKC0tbW9ubyk7Zm9udC1zaXplOjE0cHg7Y29sb3I6dmFyKC0tZ29sZCk7"
+    "bWFyZ2luLXRvcDoxNnB4O21pbi1oZWlnaHQ6MjBweH0KLnJ1bntiYWNrZ3JvdW5kOnZhcigtLWdvbGQpO2NvbG9yOnZhcigtLWlu"
+    "ayl9Ci5ncmlkMntkaXNwbGF5OmdyaWQ7Z2FwOjE0cHg7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcn0KQG1lZGlhKG1pbi13aWR0"
+    "aDo3MDBweCl7LmdyaWQye2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyfX0KLmNhcmR7YmFja2dyb3VuZDojZmZmO2JvcmRl"
+    "cjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo3cHg7cGFkZGluZzoyMHB4IDIycHh9Ci5jYXJkIC50YWd7Zm9u"
+    "dC1mYW1pbHk6dmFyKC0tbW9ubyk7Zm9udC1zaXplOjExcHg7Y29sb3I6dmFyKC0tZmFpbnQpO2xldHRlci1zcGFjaW5nOi4wNWVt"
+    "fQouY2FyZCBoM3tmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToyMHB4O21hcmdpbjo0"
+    "cHggMCA2cHh9Ci5jYXJkIHB7Zm9udC1zaXplOjE0LjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLWJvdHRvbToxMHB4fQou"
+    "Y2FyZCBwcmV7bWFyZ2luOjEwcHggMCAwfS5jYXJkIGEuY3Rhe2NvbG9yOnZhcigtLWluayk7d29yZC1icmVhazpub3JtYWx9LmNh"
+    "cmQgYXtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTIuNXB4O2NvbG9yOnZhcigtLWluayk7d29yZC1icmVhazpi"
+    "cmVhay1hbGx9CnByZXtiYWNrZ3JvdW5kOnZhcigtLWluayk7Y29sb3I6I2U4ZTZkZjtmb250LWZhbWlseTp2YXIoLS1tb25vKTtm"
+    "b250LXNpemU6MTJweDtib3JkZXItcmFkaXVzOjZweDtwYWRkaW5nOjE0cHg7b3ZlcmZsb3cteDphdXRvO21hcmdpbi10b3A6OHB4"
+    "fQouY2xvc2V7YmFja2dyb3VuZDp2YXIoLS1pbmspO2NvbG9yOiNmZmY7Ym9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6MzJweCAy"
+    "NHB4O21hcmdpbjozNnB4IDAgNTBweH0KLmNsb3NlIGgye2NvbG9yOiNmZmZ9LmNsb3NlIHB7Y29sb3I6cmdiYSgyNTUsMjU1LDI1"
+    "NSwuNzUpO21heC13aWR0aDo1NmNofQpmb290ZXJ7Ym9yZGVyLXRvcDoxcHggc29saWQgdmFyKC0tbGluZSk7cGFkZGluZzoyMnB4"
+    "IDAgNDZweDtmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTEuNXB4O2NvbG9yOnZhcigtLWZhaW50KX0KQG1lZGlh"
+    "KHByZWZlcnMtcmVkdWNlZC1tb3Rpb246cmVkdWNlKXsqe3RyYW5zaXRpb246bm9uZSFpbXBvcnRhbnR9fQo8L3N0eWxlPgo8L2hl"
+    "YWQ+Cjxib2R5Pgo8aGVhZGVyIGNsYXNzPSJ0b3AiPjxkaXYgY2xhc3M9IndyYXAiPjxkaXYgY2xhc3M9ImJyYW5kIj5zZWJiaTxi"
+    "Pi5wcm88L2I+PC9kaXY+CjxuYXY+PGEgaHJlZj0iLyI+SG9tZTwvYT48YSBocmVmPSIja2l0Ij5LaXQ8L2E+PGEgaHJlZj0iL21h"
+    "cCI+TWFwPC9hPjxhIGhyZWY9Ii93aGl0ZXBhcGVyIj5XaGl0ZXBhcGVyPC9hPjwvbmF2PjwvZGl2PjwvaGVhZGVyPgoKPGRpdiBj"
+    "bGFzcz0id3JhcCI+CjxkaXYgY2xhc3M9Imhlcm8iPgogIDxkaXYgY2xhc3M9ImtpY2siPkFHRU5UIFBBU1NQT1JUPC9kaXY+CiAg"
+    "PGgxPkV2ZXJ5IEFJIGFnZW50IG5vdyBuZWVkcyBhIHBhc3Nwb3J0LjwvaDE+CiAgPHA+QUkgYWdlbnRzIHBheSwgYm9vaywgc2Vu"
+    "ZCBhbmQgY2hhbmdlIHJlY29yZHMgb24gdGhlaXIgb3duLiBUaGUgQWdlbnQgUGFzc3BvcnQgbGV0cyBhbnkgc2l0ZSBrbm93LCBp"
+    "biBtaWxsaXNlY29uZHMsIHRoYXQgYSByZWFsIHBlcnNvbiBhdXRob3Jpc2VkIHRoZSBhY3Rpb24sIHRoYXQgdGhlIGF1dGhvcml0"
+    "eSBzdGlsbCBzdGFuZHMgcmlnaHQgbm93LCBhbmQgdGhhdCBpdCBjYW4gaGFwcGVuIGV4YWN0bHkgb25jZS48L3A+CiAgPGJ1dHRv"
+    "biBjbGFzcz0iY3RhIGdvbGQiIG9uY2xpY2s9InJ1bkRlbW8oKSI+UnVuIGl0IGxpdmU8L2J1dHRvbj4KICA8YSBjbGFzcz0iY3Rh"
+    "IGdob3N0IiBocmVmPSIja2l0Ij5HZXQgdGhlIGtpdDwvYT4KICA8ZGl2IGNsYXNzPSJzdGF0cyI+PGRpdj48YiBpZD0icy1pc3N1"
+    "ZWQiPuKAlDwvYj5wYXNzcG9ydHMgaXNzdWVkPC9kaXY+PGRpdj48YiBpZD0icy1yZWQiPuKAlDwvYj5yZWRlZW1lZDwvZGl2Pjxk"
+    "aXY+PGIgaWQ9InMtcmVmIj7igJQ8L2I+cmVmdXNlZCBhbmQgc2VhbGVkPC9kaXY+PC9kaXY+CjwvZGl2PgoKPHNlY3Rpb24+CiAg"
+    "PGgyPlRocmVlIHN0ZXBzLiBObyB0cnVzdCByZXF1aXJlZC48L2gyPgogIDxkaXYgY2xhc3M9InN0ZXBzIj4KICAgIDxkaXYgY2xh"
+    "c3M9InN0ZXAiPjxkaXYgY2xhc3M9Im4iPjAxIMK3IFRIRSBBR0VOVCBBU0tTPC9kaXY+PGgzPkF1dGhvcml0eSB0cmFjZWQgYmFj"
+    "ayB0byBhIGh1bWFuPC9oMz48cD5CZWZvcmUgYWN0aW5nLCB0aGUgYWdlbnQgYXNrcyBzZWJiaS5wcm8uIFRoZSBhdXRob3JpdHkg"
+    "aXMgd2Fsa2VkIGJhY2sgdG8gdGhlIHBlcnNvbiB3aG8gZ3JhbnRlZCBpdCwgZXZlcnkgbGluayBjaGVja2VkLCBhbmQgYSBzaWdu"
+    "ZWQgcGFzc3BvcnQgaXNzdWVkIGZvciBvbmUgYWN0aW9uLCBhdCBvbmUgc2l0ZSwgZm9yIG9uZSBhbW91bnQsIGZvciBtaW51dGVz"
+    "LjwvcD48L2Rpdj4KICAgIDxkaXYgY2xhc3M9InN0ZXAiPjxkaXYgY2xhc3M9Im4iPjAyIMK3IFRIRSBTSVRFIENIRUNLUzwvZGl2"
+    "PjxoMz5WZXJpZmllZCBpbiBtaWxsaXNlY29uZHMsIG9mZmxpbmU8L2gzPjxwPlRoZSBzaXRlIGNoZWNrcyB0aGUgc2lnbmF0dXJl"
+    "IHdpdGggYSBzdGFuZGFyZCBsaWJyYXJ5IGluIGFueSBsYW5ndWFnZS4gTm90aGluZyB0byBpbnN0YWxsLCBubyBhY2NvdW50LCBu"
+    "byBjYWxsIGhvbWUuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+MDMgwrcgVEhFIEFDVElP"
+    "TiBCSU5EUzwvZGl2PjxoMz5SZS1jaGVja2VkIGF0IHRoZSBtb21lbnQgaXQgaGFwcGVuczwvaDM+PHA+VGhlIHNpdGUgcmVkZWVt"
+    "cyB0aGUgcGFzc3BvcnQuIFJpZ2h0IHRoZW4sIHNlYmJpLnBybyBjb25maXJtcyB0aGUgaHVtYW4ncyBhdXRob3JpdHkgc3RpbGwg"
+    "c3RhbmRzLCB0aGUgYW1vdW50IG1hdGNoZXMsIGFuZCBpdCBoYXMgbmV2ZXIgYmVlbiB1c2VkLiBUaGVuIGl0IGJpbmRzLCBvbmNl"
+    "LCBhbmQgdGhlIG91dGNvbWUgaXMgc2VhbGVkLjwvcD48L2Rpdj4KICA8L2Rpdj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24gc3R5bGU9"
+    "ImJvcmRlci10b3A6MCI+CjxkaXYgY2xhc3M9ImRhcmsiPgogIDxoMj5XYXRjaCBpdCBydW4gb24gcHJvZHVjdGlvbi48L2gyPgog"
+    "IDxwIGNsYXNzPSJsZWFkIj5PbmUgdGFwIHJ1bnMgdGhlIHdob2xlIHN0b3J5IGxpdmU6IGEgcmVhbCBncmFudCwgcmVhbCBwYXNz"
+    "cG9ydHMsIHJlYWwgcmVkZW1wdGlvbnMgYW5kIHJlYWwgcmVmdXNhbHMsIGVhY2ggc2VhbGVkIGludG8gdGhlIHB1YmxpYyBjaGFp"
+    "bi48L3A+CiAgPGJ1dHRvbiBjbGFzcz0iY3RhIHJ1biIgaWQ9InJ1bmJ0biIgb25jbGljaz0icnVuRGVtbygpIj5SdW4gdGhlIGxp"
+    "dmUgZGVtbzwvYnV0dG9uPgogIDxkaXYgaWQ9InN0b3J5Ij48L2Rpdj4KICA8ZGl2IGlkPSJ2ZXJkaWN0Ij48L2Rpdj4KPC9kaXY+"
+    "Cjwvc2VjdGlvbj4KCjxzZWN0aW9uPgogIDxoMj5XaGF0IGEgcGFzc3BvcnQgcmVmdXNlczwvaDI+CiAgPHAgY2xhc3M9ImxlYWQi"
+    "PkEgc3RvbGVuLCByZXBsYXllZCwgcmUtYWltZWQgb3IgZWRpdGVkIHBhc3Nwb3J0IGlzIHdvcnRobGVzcy4gRXZlcnkgcmVmdXNh"
+    "bCBpcyB3cml0dGVuIHRvIHRoZSBjaGFpbiwgc28gYW4gYWdlbnQgY2FuIGV2ZW4gcHJvdmUgaXQgd2FzIDxiPm5vdDwvYj4gYWxs"
+    "b3dlZC48L3A+CiAgPGRpdiBjbGFzcz0ic3RlcHMiPgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+UkVQTEFZ"
+    "PC9kaXY+PHA+U3BlbnQgb25jZS4gVGhlIHNlY29uZCBhdHRlbXB0IGlzIHJlZnVzZWQuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFz"
+    "cz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+UkVWT0tFRCBBIFNFQ09ORCBBR088L2Rpdj48cD5TdGlsbCBzaWduZWQsIHN0aWxsIGlu"
+    "IGRhdGUsIGFuZCBzdGlsbCByZWZ1c2VkLCBiZWNhdXNlIHRoZSBodW1hbiBwdWxsZWQgdGhlIGF1dGhvcml0eS48L3A+PC9kaXY+"
+    "CiAgICA8ZGl2IGNsYXNzPSJzdGVwIj48ZGl2IGNsYXNzPSJuIj5XUk9ORyBTSVRFPC9kaXY+PHA+QSBwYXNzcG9ydCBpcyBvbmx5"
+    "IGdvb2Qgd2hlcmUgaXQgd2FzIGlzc3VlZCBmb3IuPC9wPjwvZGl2PgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0i"
+    "biI+RURJVEVEIEFNT1VOVDwvZGl2PjxwPkF1dGhvcmlzZWQgZm9yIDIwLCBwcmVzZW50ZWQgZm9yIDQ5LiBSZWZ1c2VkLjwvcD48"
+    "L2Rpdj4KICA8L2Rpdj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24gaWQ9ImtpdCI+CiAgPGgyPkdldCB0aGUga2l0LiBPbmUgbGluZSBv"
+    "biBlYWNoIHNpZGUuPC9oMj4KICA8cCBjbGFzcz0ibGVhZCI+VHdvIHNpbmdsZSBmaWxlcywgc3RhbmRhcmQgUHl0aG9uLCBub3Ro"
+    "aW5nIHRvIGluc3RhbGwuIFRlc3RlZCBlbmQgdG8gZW5kOiB0aGUgb2ZmbGluZSBwYXNzcG9ydCBjaGVjayBydW5zIGluIGFib3V0"
+    "IDUgbWlsbGlzZWNvbmRzLjwvcD4KICA8ZGl2IGNsYXNzPSJncmlkMiI+CiAgICA8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNz"
+    "PSJ0YWciPkZPUiBBR0VOVCBCVUlMREVSUyDCtyBzZWJiaV9hZ2VudC5weTwvZGl2PjxoMz5Zb3VyIGFnZW50IGNhcnJpZXMgYSBw"
+    "YXNzcG9ydDwvaDM+PHA+UHV0IG9uZSBsaW5lIGFib3ZlIGFueSBhY3Rpb24uIFRoZSBwYXNzcG9ydCBpcyBmZXRjaGVkIGJlZm9y"
+    "ZSBpdCBydW5zLiBJZiBzZWJiaS5wcm8gcmVmdXNlcywgdGhlIGFjdGlvbiBuZXZlciBoYXBwZW5zLjwvcD4KPHByZT5AbmVlZHNf"
+    "cGFzc3BvcnQoInBheW1lbnRzLnNlbmQiLAogICAgYXVkaWVuY2U9InNob3AuZXhhbXBsZS5jb20iLAogICAgcGFyYW1zPVsiYW1v"
+    "dW50Il0pCmRlZiBwYXkoYW1vdW50LCBwYXNzcG9ydD1Ob25lKToKICAgIC4uLjwvcHJlPgogICAgICA8YSBjbGFzcz0iY3RhIGdv"
+    "bGQiIHN0eWxlPSJtYXJnaW4tdG9wOjE0cHgiIGhyZWY9Ii9wYXNzcG9ydC9zZWJiaV9hZ2VudC5weSIgZG93bmxvYWQ+RG93bmxv"
+    "YWQgc2ViYmlfYWdlbnQucHk8L2E+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJ0YWciPkZPUiBXRUJT"
+    "SVRFUyAmYW1wOyBBUElTIMK3IHNlYmJpX3NpdGUucHk8L2Rpdj48aDM+WW91ciBzaXRlIGNoZWNrcyBldmVyeSBhZ2VudDwvaDM+"
+    "PHA+T25lIGxpbmUgYmVmb3JlIGFueSBhY3Rpb24gYW4gYWdlbnQgYXNrcyBmb3IuIFRoZSBzaWduYXR1cmUgaXMgY2hlY2tlZCBv"
+    "biB5b3VyIG93biBzZXJ2ZXIsIHRoZW4gdGhlIHBhc3Nwb3J0IGlzIHNwZW50IG9uY2UgYXQgdGhlIG1vbWVudCBvZiBhY3Rpb24u"
+    "PC9wPgo8cHJlPnBhc3Nwb3J0ID0gYWNjZXB0KHJlcXVlc3QuaGVhZGVycywKICAgIGF1ZGllbmNlPSJzaG9wLmV4YW1wbGUuY29t"
+    "IiwKICAgIHBhcmFtcz17ImFtb3VudCI6IGFtb3VudH0pCiMgc3RpbGwgaGVyZSA9IHNhZmUgdG8gYWN0PC9wcmU+CiAgICAgIDxh"
+    "IGNsYXNzPSJjdGEgZ29sZCIgc3R5bGU9Im1hcmdpbi10b3A6MTRweCIgaHJlZj0iL3Bhc3Nwb3J0L3NlYmJpX3NpdGUucHkiIGRv"
+    "d25sb2FkPkRvd25sb2FkIHNlYmJpX3NpdGUucHk8L2E+PC9kaXY+CiAgPC9kaXY+CiAgPGRpdiBjbGFzcz0ic3RlcHMiIHN0eWxl"
+    "PSJtYXJnaW4tdG9wOjE0cHgiPgogICAgPGRpdiBjbGFzcz0ic3RlcCI+PGRpdiBjbGFzcz0ibiI+VEVTVEVEIEVORCBUTyBFTkQ8"
+    "L2Rpdj48cD5QYWlkIDIwIGluIG9uZSBsaW5lOiBib3VuZC4gUmVwbGF5ZWQ6IHJlamVjdGVkLiBBc2tlZCBmb3IgNTAwIG9uIGEg"
+    "MTAwIGxpbWl0OiByZWZ1c2VkIGJlZm9yZSBhIHBhc3Nwb3J0IGV4aXN0ZWQuIFdyb25nIHNpdGUsIHRhbXBlcmVkIHRva2VuLCAy"
+    "MCBlZGl0ZWQgdG8gOTk6IGFsbCByZWplY3RlZC48L3A+PC9kaXY+CiAgPC9kaXY+Cjwvc2VjdGlvbj4KCjxzZWN0aW9uIGlkPSJz"
+    "aXRlcyI+CiAgPGgyPkJ1aWx0IGZvciBib3RoIHNpZGVzIG9mIHRoZSBhY3Rpb248L2gyPgogIDxkaXYgY2xhc3M9ImdyaWQyIj4K"
+    "ICAgIDxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9InRhZyI+Rk9SIFdFQlNJVEVTICZhbXA7IEFQSVM8L2Rpdj48aDM+UmVx"
+    "dWlyZSBpdCB3aXRoIG9uZSBmaWxlPC9oMz48cD5Ib3N0IG9uZSBzbWFsbCBmaWxlIGFuZCBldmVyeSBhZ2VudCBrbm93cyB3aGlj"
+    "aCBhY3Rpb25zIG5lZWQgYSBwYXNzcG9ydC4gTm8gcGFzc3BvcnQsIG5vIGFjdGlvbi48L3A+CiAgICAgIDxhIGhyZWY9Imh0dHBz"
+    "Oi8vc2ViYmkucHJvL3gvcGFzc3BvcnQvc2l0ZWZpbGU/ZG9tYWluPXlvdXIuc2l0ZSZyZXF1aXJlPXBheW1lbnRzLioiPkdlbmVy"
+    "YXRlIHlvdXIgZmlsZTwvYT48L2Rpdj4KICAgIDxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9InRhZyI+Rk9SIEFJIEFHRU5U"
+    "UzwvZGl2PjxoMz5BIHRvb2wsIHRocm91Z2ggTUNQPC9oMz48cD5BZ2VudHMgcmVxdWVzdCwgY2hlY2sgYW5kIHJlZGVlbSBwYXNz"
+    "cG9ydHMgYXMgdG9vbHMuIFdvcmtzIHdpdGggZXZlcnkgbW9kZWwgZnJvbSBldmVyeSB2ZW5kb3IuPC9wPgogICAgICA8YSBocmVm"
+    "PSJodHRwczovL3NlYmJpLnByby94L3Bhc3Nwb3J0L21jcCI+aHR0cHM6Ly9zZWJiaS5wcm8veC9wYXNzcG9ydC9tY3A8L2E+PC9k"
+    "aXY+CiAgICA8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJ0YWciPkZPUiBDT01QTElBTkNFPC9kaXY+PGgzPlByb29mLCBu"
+    "b3QgbG9nczwvaDM+PHA+V2hvIGF1dGhvcmlzZWQgaXQsIHdobyBhY3RlZCwgd2hvIGFjY2VwdHMgdGhlIHJpc2ssIGFuZCB3aGV0"
+    "aGVyIGl0IHN0aWxsIHN0b29kIGF0IHRoYXQgaW5zdGFudC4gU2VhbGVkLCBhbmNob3JlZCB0byBCaXRjb2luLCB3aXRuZXNzZWQg"
+    "aW5kZXBlbmRlbnRseS48L3A+CiAgICAgIDxhIGhyZWY9Imh0dHBzOi8vc2ViYmkucHJvL3gvY29udGludWl0eS9kZWNpc2lvbnMi"
+    "PlNlZSByZWFsIHNlYWxlZCBkZWNpc2lvbnM8L2E+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJ0YWci"
+    "PkZPUiBERVZFTE9QRVJTPC9kaXY+PGgzPkFuIG9wZW4gdG9rZW4gZm9ybWF0PC9oMz48cD5FZDI1NTE5LCBjYW5vbmljYWwgSlNP"
+    "Tiwgb25lIHByZWZpeC4gVXNlIG91ciBraXQgb3IgYW55IEVkMjU1MTkgbGlicmFyeSBpbiBhbnkgbGFuZ3VhZ2UuPC9wPgogICAg"
+    "ICA8YSBocmVmPSJodHRwczovL3NlYmJpLnByby94L3Bhc3Nwb3J0L3NwZWMiPlJlYWQgdGhlIHNwZWM8L2E+PC9kaXY+CiAgPC9k"
+    "aXY+CjxwcmU+QWdlbnQtUGFzc3BvcnQ6IHNicDEuZXlKaFkzUWlPaUprWlcxdkxuQmhlU0lzSW1GMVpDSTZJbk5vYjNBdeKApjwv"
+    "cHJlPgo8L3NlY3Rpb24+Cgo8ZGl2IGNsYXNzPSJjbG9zZSI+CiAgPGgyPklmIHlvdXIgYWdlbnRzIHRvdWNoIG1vbmV5LCByZWNv"
+    "cmRzIG9yIGN1c3RvbWVycywgdGhpcyBpcyBmb3IgeW91LjwvaDI+CiAgPHA+RnJlZSBmb3IgOTAgZGF5cywgdGhlbiA1MHAgcGVy"
+    "IGRldmljZSBwZXIgbW9udGguIFRlbGwgdXMgd2hhdCB5b3VyIGFnZW50cyBkbyBhbmQgd2UnbGwgc2hvdyB5b3UgaG93IHRoZSBw"
+    "YXNzcG9ydCBwbHVncyBpbnRvIHlvdXIgc3RhY2suPC9wPgogIDxhIGNsYXNzPSJjdGEgZ29sZCIgaHJlZj0ibWFpbHRvOmp1c3Ry"
+    "aWdodGRlY29yYXRvcnNAZ21haWwuY29tP3N1YmplY3Q9QWdlbnQlMjBQYXNzcG9ydCI+VGFsayB0byB1czwvYT4KICA8YSBjbGFz"
+    "cz0iY3RhIGdob3N0IiBocmVmPSIvbWFwIiBzdHlsZT0iYmFja2dyb3VuZDp0cmFuc3BhcmVudDtjb2xvcjojZmZmO2JvcmRlci1j"
+    "b2xvcjpyZ2JhKDI1NSwyNTUsMjU1LC4zKSI+U2VlIHdoZXJlIGl0IHNpdHM8L2E+CjwvZGl2Pgo8L2Rpdj4KCjxmb290ZXI+PGRp"
+    "diBjbGFzcz0id3JhcCI+c2ViYmkucHJvIMK3IE1vbm9wIENvbnRlbnQgwrcgQmx5dGgsIE5vcnRodW1iZXJsYW5kLCBVSzxicj5U"
+    "aGUgdHJ1c3QgbGF5ZXIgYmV0d2VlbiBtYWNoaW5lcyB0aGF0IGFjdCBhbmQgdGhlIHdvcmxkIHRoZXkgYWN0IG9uLjwvZGl2Pjwv"
+    "Zm9vdGVyPgoKPHNjcmlwdD4KZnVuY3Rpb24gZXNjKHMpe3JldHVybiBTdHJpbmcocz09bnVsbD8nJzpzKS5yZXBsYWNlKC9bJjw+"
+    "Il0vZyxmdW5jdGlvbihjKXtyZXR1cm57JyYnOicmYW1wOycsJzwnOicmbHQ7JywnPic6JyZndDsnLCciJzonJnF1b3Q7J31bY119"
+    "KX0KZnVuY3Rpb24gc3RhdHMoKXtmZXRjaCgnL3gvcGFzc3BvcnQvc3RhdHVzJykudGhlbihmdW5jdGlvbihyKXtyZXR1cm4gci5q"
+    "c29uKCl9KS50aGVuKGZ1bmN0aW9uKGQpewogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3MtaXNzdWVkJykudGV4dENvbnRlbnQ9"
+    "ZC5wYXNzcG9ydHNfaXNzdWVkO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzLXJlZCcpLnRleHRDb250ZW50PWQucmVkZWVtZWQ7"
+    "ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3MtcmVmJykudGV4dENvbnRlbnQ9ZC5yZWZ1c2VkfSkuY2F0Y2goZnVuY3Rpb24oKXt9"
+    "KX0Kc3RhdHMoKTsKZnVuY3Rpb24gcnVuRGVtbygpewogdmFyIGJveD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnc3RvcnknKSx2"
+    "PWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd2ZXJkaWN0JyksYj1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncnVuYnRuJyk7CiBk"
+    "b2N1bWVudC5xdWVyeVNlbGVjdG9yKCcuZGFyaycpLnNjcm9sbEludG9WaWV3KHtiZWhhdmlvcjonc21vb3RoJ30pOwogYm94Lmlu"
+    "bmVySFRNTD0nJzt2LnRleHRDb250ZW50PSdSdW5uaW5nIG9uIHByb2R1Y3Rpb27igKYnO2IuZGlzYWJsZWQ9dHJ1ZTsKIGZldGNo"
+    "KCcveC9wYXNzcG9ydC9kZW1vJykudGhlbihmdW5jdGlvbihyKXtyZXR1cm4gci5qc29uKCl9KS50aGVuKGZ1bmN0aW9uKGQpewog"
+    "IGlmKGQuZXJyb3I9PT0ndG9vX3Nvb24nKXt2LnRleHRDb250ZW50PSdTb21lb25lIGp1c3QgcmFuIGl0LiBUcnkgYWdhaW4gaW4g"
+    "JytkLnJldHJ5X2FmdGVyX3NlY29uZHMrJyBzZWNvbmRzLic7Yi5kaXNhYmxlZD1mYWxzZTtyZXR1cm59CiAgaWYoIWQuc3Rvcnkp"
+    "e3YudGV4dENvbnRlbnQ9J0RlbW8gdW5hdmFpbGFibGUgcmlnaHQgbm93Lic7Yi5kaXNhYmxlZD1mYWxzZTtyZXR1cm59CiAgZC5z"
+    "dG9yeS5mb3JFYWNoKGZ1bmN0aW9uKHMsaSl7CiAgIHZhciBraW5kPSdpbmZvJyxsYWJlbD0nU0VBTEVEJzsKICAgaWYocy5yZWRl"
+    "ZW1lZD09PXRydWV8fHMudmFsaWQ9PT10cnVlfHxzLmlzc3VlZD09PXRydWUpe2tpbmQ9J3Bhc3MnO2xhYmVsPXMucmVkZWVtZWQ9"
+    "PT10cnVlPydCT1VORCc6KHMudmFsaWQ9PT10cnVlPydWQUxJRCc6J0lTU1VFRCcpfQogICBpZihzLnJlZGVlbWVkPT09ZmFsc2V8"
+    "fHMudmFsaWQ9PT1mYWxzZXx8cy5pc3N1ZWQ9PT1mYWxzZSl7a2luZD0nc3RvcCc7bGFiZWw9J1JFRlVTRUQnfQogICB2YXIgd2h5"
+    "PXMud2h5JiZzLndoeS5sZW5ndGg/JzxzcGFuIGNsYXNzPSJ3aHkiPicrZXNjKHMud2h5WzBdKSsnPC9zcGFuPic6Jyc7CiAgIHZh"
+    "ciBlbD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCdkaXYnKTtlbC5jbGFzc05hbWU9J3Jvdyc7CiAgIGVsLmlubmVySFRNTD0nPHNw"
+    "YW4gY2xhc3M9ImljICcra2luZCsnIj4nK2xhYmVsKyc8L3NwYW4+PGRpdj4nK2VzYyhzLmFjdCkrd2h5Kyc8L2Rpdj4nOwogICBi"
+    "b3guYXBwZW5kQ2hpbGQoZWwpO3NldFRpbWVvdXQoZnVuY3Rpb24oKXtlbC5jbGFzc0xpc3QuYWRkKCdzaG93Jyl9LDE2MCppKzYw"
+    "KX0pOwogIHNldFRpbWVvdXQoZnVuY3Rpb24oKXt2LnRleHRDb250ZW50PWQucmVzdWx0PT09J0FMTCBURU4gQkVIQVZFRCc/J+Kc"
+    "kyBBbGwgdGVuIGJlaGF2ZWQuIEV2ZXJ5IHN0ZXAgaXMgb24gdGhlIGNoYWluLic6ZC5yZXN1bHQ7Yi5kaXNhYmxlZD1mYWxzZTtz"
+    "dGF0cygpfSwxNjAqZC5zdG9yeS5sZW5ndGgrMzAwKTsKIH0pLmNhdGNoKGZ1bmN0aW9uKCl7di50ZXh0Q29udGVudD0nQ291bGQg"
+    "bm90IHJlYWNoIHRoZSBkZW1vLic7Yi5kaXNhYmxlZD1mYWxzZX0pOwp9Cjwvc2NyaXB0Pgo8L2JvZHk+CjwvaHRtbD4K"
+)
+
+_AGENT_B64 = (
+    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKc2ViYmlfYWdlbnQucHkgIC0gIGdpdmUgYW55IEFJIGFnZW50IGFuIEFnZW50IFBh"
+    "c3Nwb3J0IGluIG9uZSBsaW5lCj09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09"
+    "PT09PT09PT09PQoKICAgIGZyb20gc2ViYmlfYWdlbnQgaW1wb3J0IG5lZWRzX3Bhc3Nwb3J0CgogICAgQG5lZWRzX3Bhc3Nwb3J0"
+    "KCJwYXltZW50cy5zZW5kIiwgYXVkaWVuY2U9InNob3AuZXhhbXBsZS5jb20iLAogICAgICAgICAgICAgICAgICAgIGdyYW50PSJn"
+    "X3lvdXJfZ3JhbnRfaWQiLCBwYXJhbXM9WyJhbW91bnQiXSkKICAgIGRlZiBwYXkoYW1vdW50LCBwYXNzcG9ydD1Ob25lKToKICAg"
+    "ICAgICAjIHBhc3Nwb3J0IGlzIGEgc2lnbmVkIHRva2VuLiBTZW5kIGl0IHdpdGggdGhlIHJlcXVlc3Q6CiAgICAgICAgIyAgIGhl"
+    "YWRlcnMgPSB7IkFnZW50LVBhc3Nwb3J0IjogcGFzc3BvcnR9CiAgICAgICAgLi4uCgogICAgcGF5KGFtb3VudD0yMCkKCkJlZm9y"
+    "ZSB0aGUgZnVuY3Rpb24gcnVucywgc2ViYmkucHJvIHRyYWNlcyB0aGUgYWdlbnQncyBhdXRob3JpdHkgYmFjayB0byB0aGUKaHVt"
+    "YW4gd2hvIGdyYW50ZWQgaXQgYW5kIGlzc3VlcyBhIHBhc3Nwb3J0IGZvciBleGFjdGx5IHRoaXMgYWN0aW9uLCBhdCB0aGlzCnNp"
+    "dGUsIHdpdGggdGhlc2UgcGFyYW1ldGVycy4gSWYgc2ViYmkucHJvIHJlZnVzZXMsIHRoZSBmdW5jdGlvbiBuZXZlciBydW5zIGFu"
+    "ZApQYXNzcG9ydFJlZnVzZWQgaXMgcmFpc2VkIHdpdGggdGhlIHJlYXNvbnMgYW5kIGEgbGluayB0byB0aGUgc2VhbGVkIHJlZnVz"
+    "YWwuCgpGYWlscyBjbG9zZWQ6IGlmIHNlYmJpLnBybyBjYW5ub3QgYmUgcmVhY2hlZCwgdGhlIGFjdGlvbiBkb2VzIG5vdCBoYXBw"
+    "ZW4uCgpOZWVkcyB5b3VyIHNlYmJpLnBybyBBUEkga2V5IGluIHRoZSBTRUJCSV9LRVkgZW52aXJvbm1lbnQgdmFyaWFibGUuClN0"
+    "YW5kYXJkIGxpYnJhcnkgb25seS4gT25lIGZpbGUuIFB5dGhvbiAzLjgrLgoKQ29tbWFuZCBsaW5lOgogICAgcHl0aG9uIHNlYmJp"
+    "X2FnZW50LnB5IHJlcXVlc3QgLS1ncmFudCBHIC0tYWN0aW9uIHBheW1lbnRzLnNlbmQgXFwKICAgICAgICAtLWF1ZGllbmNlIHNo"
+    "b3AuZXhhbXBsZS5jb20gLS1wYXJhbXMgJ3siYW1vdW50IjogMjB9JwoiIiIKCmltcG9ydCBmdW5jdG9vbHMKaW1wb3J0IGluc3Bl"
+    "Y3QKaW1wb3J0IGpzb24KaW1wb3J0IG9zCmltcG9ydCBzeXMKaW1wb3J0IHRocmVhZGluZwppbXBvcnQgdXJsbGliLmVycm9yCmlt"
+    "cG9ydCB1cmxsaWIucmVxdWVzdAoKX192ZXJzaW9uX18gPSAiMS4wLjAiCgpCQVNFID0gb3MuZW52aXJvbi5nZXQoIlNFQkJJX0JB"
+    "U0UiLCAiaHR0cHM6Ly9zZWJiaS5wcm8iKS5yc3RyaXAoIi8iKQpIRUFERVIgPSAiQWdlbnQtUGFzc3BvcnQiClRJTUVPVVQgPSAx"
+    "MAoKX2xvY2FsID0gdGhyZWFkaW5nLmxvY2FsKCkKCgpjbGFzcyBQYXNzcG9ydEVycm9yKEV4Y2VwdGlvbik6CiAgICAiIiJCYXNl"
+    "IGNsYXNzLiBUaGUgYWN0aW9uIGRpZCBub3QgaGFwcGVuLiIiIgoKCmNsYXNzIFBhc3Nwb3J0UmVmdXNlZChQYXNzcG9ydEVycm9y"
+    "KToKICAgICIiInNlYmJpLnBybyBldmFsdWF0ZWQgdGhlIHJlcXVlc3QgYW5kIGRpZCBub3QgaXNzdWUgYSBwYXNzcG9ydC4iIiIK"
+    "CiAgICBkZWYgX19pbml0X18oc2VsZiwgdmVyZGljdCwgcmVhc29ucywgcHJvb2Y9Tm9uZSk6CiAgICAgICAgc2VsZi52ZXJkaWN0"
+    "LCBzZWxmLnJlYXNvbnMsIHNlbGYucHJvb2YgPSB2ZXJkaWN0LCByZWFzb25zLCBwcm9vZgogICAgICAgIG1zZyA9ICIlczogJXMi"
+    "ICUgKHZlcmRpY3QsICI7ICIuam9pbihyZWFzb25zKSBpZiByZWFzb25zIGVsc2UgIm5vIHJlYXNvbiBnaXZlbiIpCiAgICAgICAg"
+    "aWYgcHJvb2Y6CiAgICAgICAgICAgIG1zZyArPSAiIChzZWFsZWQgcmVmdXNhbDogJXMpIiAlIHByb29mCiAgICAgICAgc3VwZXIo"
+    "KS5fX2luaXRfXyhtc2cpCgoKY2xhc3MgUGFzc3BvcnRVbmF2YWlsYWJsZShQYXNzcG9ydEVycm9yKToKICAgICIiInNlYmJpLnBy"
+    "byBjb3VsZCBub3QgYmUgcmVhY2hlZCBvciBhbnN3ZXJlZCB3aXRoIGFuIGVycm9yLiBGYWlscyBjbG9zZWQuIiIiCgoKZGVmIF9w"
+    "b3N0KHBhdGgsIGJvZHksIGtleSk6CiAgICByZXEgPSB1cmxsaWIucmVxdWVzdC5SZXF1ZXN0KAogICAgICAgIEJBU0UgKyBwYXRo"
+    "LCBkYXRhPWpzb24uZHVtcHMoYm9keSkuZW5jb2RlKCJ1dGYtOCIpLCBtZXRob2Q9IlBPU1QiLAogICAgICAgIGhlYWRlcnM9eyJD"
+    "b250ZW50LVR5cGUiOiAiYXBwbGljYXRpb24vanNvbiIsICJBdXRob3JpemF0aW9uIjogIkJlYXJlciAiICsga2V5LAogICAgICAg"
+    "ICAgICAgICAgICJVc2VyLUFnZW50IjogInNlYmJpLWFnZW50LyIgKyBfX3ZlcnNpb25fX30pCiAgICB0cnk6CiAgICAgICAgd2l0"
+    "aCB1cmxsaWIucmVxdWVzdC51cmxvcGVuKHJlcSwgdGltZW91dD1USU1FT1VUKSBhcyByOgogICAgICAgICAgICByZXR1cm4ganNv"
+    "bi5sb2FkcyhyLnJlYWQoKS5kZWNvZGUoInV0Zi04IikpCiAgICBleGNlcHQgdXJsbGliLmVycm9yLkhUVFBFcnJvciBhcyBlOgog"
+    "ICAgICAgIHRyeToKICAgICAgICAgICAgZGV0YWlsID0ganNvbi5sb2FkcyhlLnJlYWQoKS5kZWNvZGUoInV0Zi04IikpCiAgICAg"
+    "ICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgZGV0YWlsID0geyJlcnJvciI6ICJodHRwXyVkIiAlIGUuY29kZX0KICAg"
+    "ICAgICByYWlzZSBQYXNzcG9ydFVuYXZhaWxhYmxlKCJzZWJiaS5wcm8gYW5zd2VyZWQgJWQ6ICVzIiAlIChlLmNvZGUsIGRldGFp"
+    "bCkpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgcmFpc2UgUGFzc3BvcnRVbmF2YWlsYWJsZSgiY291bGQgbm90"
+    "IHJlYWNoIHNlYmJpLnBybzogJXMiICUgZSkKCgpkZWYgcmVxdWVzdF9wYXNzcG9ydChncmFudCwgYWN0aW9uLCBhdWRpZW5jZSwg"
+    "cGFyYW1zPU5vbmUsIHB1cnBvc2VfdGFnPU5vbmUsIGtleT1Ob25lKToKICAgICIiIkFzayBzZWJiaS5wcm8gZm9yIGEgcGFzc3Bv"
+    "cnQuIFJldHVybnMgdGhlIHRva2VuIHN0cmluZyBvciByYWlzZXMuIiIiCiAgICBrZXkgPSBrZXkgb3Igb3MuZW52aXJvbi5nZXQo"
+    "IlNFQkJJX0tFWSIsICIiKQogICAgaWYgbm90IGtleToKICAgICAgICByYWlzZSBQYXNzcG9ydFVuYXZhaWxhYmxlKCJzZXQgU0VC"
+    "QklfS0VZIHRvIHlvdXIgc2ViYmkucHJvIEFQSSBrZXkiKQogICAgcmVzID0gX3Bvc3QoIi94L3Bhc3Nwb3J0L2lzc3VlIiwgeyJn"
+    "cmFudCI6IGdyYW50LCAiYWN0aW9uIjogYWN0aW9uLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgImF1ZGll"
+    "bmNlIjogYXVkaWVuY2UsICJwYXJhbXMiOiBwYXJhbXMgb3Ige30sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAicHVycG9zZV90YWciOiBwdXJwb3NlX3RhZ30sIGtleSkKICAgIGlmIHJlcy5nZXQoImlzc3VlZCIpOgogICAgICAgIHJldHVy"
+    "biByZXNbInBhc3Nwb3J0Il0KICAgIGlmICJ2ZXJkaWN0IiBpbiByZXM6CiAgICAgICAgcmFpc2UgUGFzc3BvcnRSZWZ1c2VkKHJl"
+    "c1sidmVyZGljdCJdLCByZXMuZ2V0KCJyZWFzb25zIiwgW10pLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICByZXMuZ2V0"
+    "KCJwcm9vZl9vZl9yZWZ1c2FsIikpCiAgICByYWlzZSBQYXNzcG9ydFVuYXZhaWxhYmxlKCJ1bmV4cGVjdGVkIGFuc3dlcjogJXMi"
+    "ICUgcmVzKQoKCmRlZiBjdXJyZW50X3Bhc3Nwb3J0KCk6CiAgICAiIiJUaGUgcGFzc3BvcnQgZm9yIHRoZSBhY3Rpb24gY3VycmVu"
+    "dGx5IHJ1bm5pbmcgaW5zaWRlIEBuZWVkc19wYXNzcG9ydC4iIiIKICAgIHJldHVybiBnZXRhdHRyKF9sb2NhbCwgInRva2VuIiwg"
+    "Tm9uZSkKCgpkZWYgaGVhZGVycyh0b2tlbj1Ob25lKToKICAgICIiIkhUVFAgaGVhZGVycyB0byBzZW5kIHdpdGggdGhlIGFjdGlv"
+    "bi4iIiIKICAgIHJldHVybiB7SEVBREVSOiB0b2tlbiBvciBjdXJyZW50X3Bhc3Nwb3J0KCkgb3IgIiJ9CgoKZGVmIG5lZWRzX3Bh"
+    "c3Nwb3J0KGFjdGlvbiwgYXVkaWVuY2UsIGdyYW50PU5vbmUsIHBhcmFtcz1Ob25lLCBwdXJwb3NlX3RhZz1Ob25lLCBrZXk9Tm9u"
+    "ZSk6CiAgICAiIiJEZWNvcmF0b3IuIFRoZSB3cmFwcGVkIGZ1bmN0aW9uIHJ1bnMgb25seSBpZiBhIHBhc3Nwb3J0IGlzIGlzc3Vl"
+    "ZC4KCiAgICBwYXJhbXM6IGxpc3Qgb2YgYXJndW1lbnQgbmFtZXMgd2hvc2UgdmFsdWVzIGRlZmluZSB0aGUgYWN0aW9uLCBlLmcu"
+    "CiAgICAgICAgICAgIFsiYW1vdW50IiwgImN1cnJlbmN5Il0uIFRoZSBzaXRlIG11c3QgcmVkZWVtIHdpdGggdGhlIHNhbWUgdmFs"
+    "dWVzLAogICAgICAgICAgICBzbyBhIHBhc3Nwb3J0IGZvciAyMCBjYW5ub3QgYmUgc3BlbnQgb24gNDkuCiAgICBncmFudDogIHRo"
+    "ZSBncmFudCBpZC4gQ2FuIGFsc28gYmUgcGFzc2VkIGF0IGNhbGwgdGltZSBhcyBncmFudD0uLi4KICAgIFRoZSB0b2tlbiBpcyBo"
+    "YW5kZWQgdG8gdGhlIGZ1bmN0aW9uIGFzIHBhc3Nwb3J0PS4uLiBpZiBpdCBhY2NlcHRzIHRoYXQKICAgIGFyZ3VtZW50LCBhbmQg"
+    "aXMgYWx3YXlzIGF2YWlsYWJsZSB0aHJvdWdoIGN1cnJlbnRfcGFzc3BvcnQoKS4KICAgICIiIgogICAgbmFtZXMgPSBsaXN0KHBh"
+    "cmFtcyBvciBbXSkKCiAgICBkZWYgd3JhcChmbik6CiAgICAgICAgc2lnID0gaW5zcGVjdC5zaWduYXR1cmUoZm4pCiAgICAgICAg"
+    "dGFrZXNfcGFzc3BvcnQgPSAicGFzc3BvcnQiIGluIHNpZy5wYXJhbWV0ZXJzCgogICAgICAgIEBmdW5jdG9vbHMud3JhcHMoZm4p"
+    "CiAgICAgICAgZGVmIGlubmVyKCphcmdzLCAqKmt3YXJncyk6CiAgICAgICAgICAgIGcgPSBrd2FyZ3MucG9wKCJncmFudCIsIE5v"
+    "bmUpIGlmICJncmFudCIgbm90IGluIHNpZy5wYXJhbWV0ZXJzIGVsc2Uga3dhcmdzLmdldCgiZ3JhbnQiKQogICAgICAgICAgICBn"
+    "ID0gZyBvciBncmFudCBvciBvcy5lbnZpcm9uLmdldCgiU0VCQklfR1JBTlQiKQogICAgICAgICAgICBpZiBub3QgZzoKICAgICAg"
+    "ICAgICAgICAgIHJhaXNlIFBhc3Nwb3J0VW5hdmFpbGFibGUoIm5vIGdyYW50IGlkOiBwYXNzIGdyYW50PS4uLiBvciBzZXQgU0VC"
+    "QklfR1JBTlQiKQogICAgICAgICAgICBib3VuZCA9IHNpZy5iaW5kX3BhcnRpYWwoKmFyZ3MsICoqa3dhcmdzKQogICAgICAgICAg"
+    "ICBib3VuZC5hcHBseV9kZWZhdWx0cygpCiAgICAgICAgICAgIHAgPSB7bjogYm91bmQuYXJndW1lbnRzW25dIGZvciBuIGluIG5h"
+    "bWVzIGlmIG4gaW4gYm91bmQuYXJndW1lbnRzfQogICAgICAgICAgICB0b2tlbiA9IHJlcXVlc3RfcGFzc3BvcnQoZywgYWN0aW9u"
+    "LCBhdWRpZW5jZSwgcCwgcHVycG9zZV90YWcsIGtleSkKICAgICAgICAgICAgaWYgdGFrZXNfcGFzc3BvcnQ6CiAgICAgICAgICAg"
+    "ICAgICBrd2FyZ3NbInBhc3Nwb3J0Il0gPSB0b2tlbgogICAgICAgICAgICBfbG9jYWwudG9rZW4gPSB0b2tlbgogICAgICAgICAg"
+    "ICB0cnk6CiAgICAgICAgICAgICAgICByZXR1cm4gZm4oKmFyZ3MsICoqa3dhcmdzKQogICAgICAgICAgICBmaW5hbGx5OgogICAg"
+    "ICAgICAgICAgICAgX2xvY2FsLnRva2VuID0gTm9uZQogICAgICAgIHJldHVybiBpbm5lcgogICAgcmV0dXJuIHdyYXAKCgpkZWYg"
+    "X2NsaShhcmd2KToKICAgIGltcG9ydCBhcmdwYXJzZQogICAgYXAgPSBhcmdwYXJzZS5Bcmd1bWVudFBhcnNlcihwcm9nPSJzZWJi"
+    "aV9hZ2VudCIpCiAgICBzdWIgPSBhcC5hZGRfc3VicGFyc2VycyhkZXN0PSJjbWQiKQogICAgciA9IHN1Yi5hZGRfcGFyc2VyKCJy"
+    "ZXF1ZXN0IikKICAgIHIuYWRkX2FyZ3VtZW50KCItLWdyYW50IiwgcmVxdWlyZWQ9VHJ1ZSkKICAgIHIuYWRkX2FyZ3VtZW50KCIt"
+    "LWFjdGlvbiIsIHJlcXVpcmVkPVRydWUpCiAgICByLmFkZF9hcmd1bWVudCgiLS1hdWRpZW5jZSIsIHJlcXVpcmVkPVRydWUpCiAg"
+    "ICByLmFkZF9hcmd1bWVudCgiLS1wYXJhbXMiLCBkZWZhdWx0PSJ7fSIpCiAgICByLmFkZF9hcmd1bWVudCgiLS1wdXJwb3NlIiwg"
+    "ZGVmYXVsdD1Ob25lKQogICAgYSA9IGFwLnBhcnNlX2FyZ3MoYXJndikKICAgIGlmIGEuY21kICE9ICJyZXF1ZXN0IjoKICAgICAg"
+    "ICBhcC5wcmludF9oZWxwKCkKICAgICAgICByZXR1cm4gMgogICAgdHJ5OgogICAgICAgIHByaW50KHJlcXVlc3RfcGFzc3BvcnQo"
+    "YS5ncmFudCwgYS5hY3Rpb24sIGEuYXVkaWVuY2UsIGpzb24ubG9hZHMoYS5wYXJhbXMpLCBhLnB1cnBvc2UpKQogICAgICAgIHJl"
+    "dHVybiAwCiAgICBleGNlcHQgUGFzc3BvcnRFcnJvciBhcyBlOgogICAgICAgIHByaW50KCJSRUZVU0VEOiAlcyIgJSBlLCBmaWxl"
+    "PXN5cy5zdGRlcnIpCiAgICAgICAgcmV0dXJuIDEKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgc3lzLmV4aXQoX2Ns"
+    "aShzeXMuYXJndlsxOl0pKQo="
+)
+
+_SITE_B64 = (
+    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKc2ViYmlfc2l0ZS5weSAgLSAgcmVxdWlyZSBhbiBBZ2VudCBQYXNzcG9ydCBvbiB5"
+    "b3VyIHNpdGUgaW4gb25lIGxpbmUKPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09"
+    "PT09PT09PT09PT09PT0KCiAgICBmcm9tIHNlYmJpX3NpdGUgaW1wb3J0IGFjY2VwdAoKICAgIGRlZiBoYW5kbGVfcGF5bWVudChy"
+    "ZXF1ZXN0KToKICAgICAgICBwYXNzcG9ydCA9IGFjY2VwdChyZXF1ZXN0LmhlYWRlcnMsIGF1ZGllbmNlPSJzaG9wLmV4YW1wbGUu"
+    "Y29tIiwKICAgICAgICAgICAgICAgICAgICAgICAgICBhY3Rpb249InBheW1lbnRzLnNlbmQiLAogICAgICAgICAgICAgICAgICAg"
+    "ICAgICAgIHBhcmFtcz17ImFtb3VudCI6IHJlcXVlc3QuanNvblsiYW1vdW50Il19KQogICAgICAgICMgUmVhY2hpbmcgaGVyZSBt"
+    "ZWFuczogYSBodW1hbiBhdXRob3Jpc2VkIHRoaXMgYWdlbnQsIHRoYXQgYXV0aG9yaXR5CiAgICAgICAgIyBzdGlsbCBzdGFuZHMg"
+    "YXQgdGhpcyBpbnN0YW50LCB0aGUgYW1vdW50IGlzIGV4YWN0bHkgd2hhdCB3YXMKICAgICAgICAjIGF1dGhvcmlzZWQsIGFuZCB0"
+    "aGlzIHBhc3Nwb3J0IGhhcyBuZXZlciBiZWVuIHVzZWQuIERvIHRoZSBhY3Rpb24uCiAgICAgICAgLi4uCgphY2NlcHQoKSBkb2Vz"
+    "IHR3byB0aGluZ3M6CgogIDEuIENIRUNLLCBvbiB5b3VyIG93biBzZXJ2ZXIuIFRoZSBFZDI1NTE5IHNpZ25hdHVyZSBpcyB2ZXJp"
+    "ZmllZCBhZ2FpbnN0CiAgICAgc2ViYmkucHJvJ3MgcHVibGlzaGVkIGtleSwgcGx1cyBleHBpcnksIHNpdGUgYW5kIGFjdGlvbi4g"
+    "Tm90aGluZyBpcyBzZW50CiAgICAgYW55d2hlcmUgZm9yIHRoaXMgc3RlcC4gQSBmb3JnZWQsIGV4cGlyZWQgb3IgbWlzZGlyZWN0"
+    "ZWQgcGFzc3BvcnQgaXMKICAgICB0dXJuZWQgYXdheSBiZWZvcmUgc2ViYmkucHJvIGlzIGV2ZXIgYXNrZWQuCiAgMi4gUkVERUVN"
+    "LCBhdCB0aGUgbW9tZW50IG9mIGFjdGlvbi4gc2ViYmkucHJvIHJlLWNoZWNrcyB0aGUgaHVtYW4ncwogICAgIGF1dGhvcml0eSBy"
+    "aWdodCBub3csIGNvbXBhcmVzIHRoZSBleGFjdCBwYXJhbWV0ZXJzLCBhbmQgbGV0cyB0aGUgcGFzc3BvcnQKICAgICBiaW5kIG9u"
+    "Y2UuIFRoZSBvdXRjb21lIGlzIHNlYWxlZCBpbiBhIHB1YmxpYyBjaGFpbi4KCkFueXRoaW5nIHdyb25nIHJhaXNlcyBQYXNzcG9y"
+    "dFJlamVjdGVkIC0gZG8gbm90IHBlcmZvcm0gdGhlIGFjdGlvbi4KCkZvciBhIGZ1bGx5IG9mZmxpbmUgc2lnbmF0dXJlIGNoZWNr"
+    "LCBzZXQgU0VCQklfUFVCS0VZIHRvIHRoZSBoZXgga2V5IGZyb20KaHR0cHM6Ly9zZWJiaS5wcm8veC9jb250aW51aXR5L3B1Ymtl"
+    "eS4gT3RoZXJ3aXNlIGl0IGlzIGZldGNoZWQgb25jZSBhbmQgY2FjaGVkLgoKU3RhbmRhcmQgbGlicmFyeSBvbmx5LiBPbmUgZmls"
+    "ZS4gUHl0aG9uIDMuOCsuCgpDb21tYW5kIGxpbmU6CiAgICBweXRob24gc2ViYmlfc2l0ZS5weSBjaGVjayA8dG9rZW4+IFthdWRp"
+    "ZW5jZV0KIiIiCgppbXBvcnQgYmFzZTY0CmltcG9ydCBoYXNobGliCmltcG9ydCBqc29uCmltcG9ydCBvcwppbXBvcnQgc3lzCmlt"
+    "cG9ydCB0aW1lCmltcG9ydCB1cmxsaWIuZXJyb3IKaW1wb3J0IHVybGxpYi5yZXF1ZXN0CgpfX3ZlcnNpb25fXyA9ICIxLjAuMCIK"
+    "CkJBU0UgPSBvcy5lbnZpcm9uLmdldCgiU0VCQklfQkFTRSIsICJodHRwczovL3NlYmJpLnBybyIpLnJzdHJpcCgiLyIpCkhFQURF"
+    "UiA9ICJBZ2VudC1QYXNzcG9ydCIKUFJFRklYID0gYiJBSUxFQVNILVBBU1NQT1JULXYxOiIKVElNRU9VVCA9IDEwCgoKY2xhc3Mg"
+    "UGFzc3BvcnRSZWplY3RlZChFeGNlcHRpb24pOgogICAgIiIiRG8gbm90IHBlcmZvcm0gdGhlIGFjdGlvbi4gLnJlYXNvbnMgbGlz"
+    "dHMgd2h5LiIiIgoKICAgIGRlZiBfX2luaXRfXyhzZWxmLCByZWFzb25zLCBzZWFsZWQ9Tm9uZSk6CiAgICAgICAgc2VsZi5yZWFz"
+    "b25zID0gcmVhc29ucyBpZiBpc2luc3RhbmNlKHJlYXNvbnMsIGxpc3QpIGVsc2UgW3N0cihyZWFzb25zKV0KICAgICAgICBzZWxm"
+    "LnNlYWxlZCA9IHNlYWxlZAogICAgICAgIHN1cGVyKCkuX19pbml0X18oIjsgIi5qb2luKHNlbGYucmVhc29ucykpCgoKIyAtLS0t"
+    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tIEVkMjU1MTkKIyBSRkMg"
+    "ODAzMiB2ZXJpZmljYXRpb24sIHN0YW5kYXJkIGxpYnJhcnkgb25seSwgc28gdGhlcmUgaXMgbm90aGluZyB0byBpbnN0YWxsLgoK"
+    "X1EgPSAyICoqIDI1NSAtIDE5Cl9MID0gMiAqKiAyNTIgKyAyNzc0MjMxNzc3NzM3MjM1MzUzNTg1MTkzNzc5MDg4MzY0ODQ5Mwpf"
+    "RCA9IC0xMjE2NjUgKiBwb3coMTIxNjY2LCBfUSAtIDIsIF9RKSAlIF9RCl9JID0gcG93KDIsIChfUSAtIDEpIC8vIDQsIF9RKQoK"
+    "CmRlZiBfaW52KHgpOgogICAgcmV0dXJuIHBvdyh4LCBfUSAtIDIsIF9RKQoKCmRlZiBfeHJlYyh5KToKICAgIHh4ID0gKHkgKiB5"
+    "IC0gMSkgKiBfaW52KF9EICogeSAqIHkgKyAxKQogICAgeCA9IHBvdyh4eCwgKF9RICsgMykgLy8gOCwgX1EpCiAgICBpZiAoeCAq"
+    "IHggLSB4eCkgJSBfUToKICAgICAgICB4ID0geCAqIF9JICUgX1EKICAgIGlmIHggJSAyOgogICAgICAgIHggPSBfUSAtIHgKICAg"
+    "IHJldHVybiB4CgoKX0JZID0gNCAqIF9pbnYoNSkgJSBfUQpfQlggPSBfeHJlYyhfQlkpCl9CID0gKF9CWCwgX0JZLCAxLCBfQlgg"
+    "KiBfQlkgJSBfUSkKCgpkZWYgX2FkZChwLCBxKToKICAgIHgxLCB5MSwgejEsIHQxID0gcAogICAgeDIsIHkyLCB6MiwgdDIgPSBx"
+    "CiAgICBhID0gKHkxIC0geDEpICogKHkyIC0geDIpICUgX1EKICAgIGIgPSAoeTEgKyB4MSkgKiAoeTIgKyB4MikgJSBfUQogICAg"
+    "YyA9IHQxICogMiAqIF9EICogdDIgJSBfUQogICAgZCA9IHoxICogMiAqIHoyICUgX1EKICAgIGUsIGYsIGcsIGggPSBiIC0gYSwg"
+    "ZCAtIGMsIGQgKyBjLCBiICsgYQogICAgcmV0dXJuIChlICogZiAlIF9RLCBnICogaCAlIF9RLCBmICogZyAlIF9RLCBlICogaCAl"
+    "IF9RKQoKCmRlZiBfbXVsKHAsIG4pOgogICAgciA9ICgwLCAxLCAxLCAwKQogICAgd2hpbGUgbjoKICAgICAgICBpZiBuICYgMToK"
+    "ICAgICAgICAgICAgciA9IF9hZGQociwgcCkKICAgICAgICBwID0gX2FkZChwLCBwKQogICAgICAgIG4gPj49IDEKICAgIHJldHVy"
+    "biByCgoKZGVmIF9lbmMocCk6CiAgICB4LCB5LCB6LCBfID0gcAogICAgemkgPSBfaW52KHopCiAgICB4LCB5ID0geCAqIHppICUg"
+    "X1EsIHkgKiB6aSAlIF9RCiAgICByZXR1cm4gKHkgfCAoKHggJiAxKSA8PCAyNTUpKS50b19ieXRlcygzMiwgImxpdHRsZSIpCgoK"
+    "ZGVmIF9kZWMocyk6CiAgICB5ID0gaW50LmZyb21fYnl0ZXMocywgImxpdHRsZSIpICYgKCgxIDw8IDI1NSkgLSAxKQogICAgeCA9"
+    "IF94cmVjKHkpCiAgICBpZiAoeCAmIDEpICE9IChzWzMxXSA+PiA3KToKICAgICAgICB4ID0gX1EgLSB4CiAgICBwID0gKHgsIHks"
+    "IDEsIHggKiB5ICUgX1EpCiAgICB4LCB5LCB6LCB0ID0gcAogICAgaWYgKHkgKiB5IC0geCAqIHggLSB6ICogeiAtIF9EICogdCAq"
+    "IHQpICUgX1E6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigicG9pbnQgb2ZmIGN1cnZlIikKICAgIHJldHVybiBwCgoKZGVmIF92"
+    "ZXJpZnkoc2lnLCBtc2csIHBrKToKICAgIGlmIGxlbihzaWcpICE9IDY0IG9yIGxlbihwaykgIT0gMzI6CiAgICAgICAgcmV0dXJu"
+    "IEZhbHNlCiAgICB0cnk6CiAgICAgICAgciwgYSA9IF9kZWMoc2lnWzozMl0pLCBfZGVjKHBrKQogICAgZXhjZXB0IEV4Y2VwdGlv"
+    "bjoKICAgICAgICByZXR1cm4gRmFsc2UKICAgIHMgPSBpbnQuZnJvbV9ieXRlcyhzaWdbMzI6XSwgImxpdHRsZSIpCiAgICBpZiBz"
+    "ID49IF9MOgogICAgICAgIHJldHVybiBGYWxzZQogICAgaCA9IGludC5mcm9tX2J5dGVzKGhhc2hsaWIuc2hhNTEyKHNpZ1s6MzJd"
+    "ICsgcGsgKyBtc2cpLmRpZ2VzdCgpLCAibGl0dGxlIikgJSBfTAogICAgcmV0dXJuIF9lbmMoX211bChfQiwgcykpID09IF9lbmMo"
+    "X2FkZChyLCBfbXVsKGEsIGgpKSkKCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
+    "LS0tLS0tLS0tLS0tLS0gcGFzc3BvcnQKCl9rZXlfY2FjaGUgPSB7fQoKCmRlZiBwdWJsaWNfa2V5KCk6CiAgICBlbnYgPSBvcy5l"
+    "bnZpcm9uLmdldCgiU0VCQklfUFVCS0VZIiwgIiIpLnN0cmlwKCkKICAgIGlmIGVudjoKICAgICAgICByZXR1cm4gYnl0ZXMuZnJv"
+    "bWhleChlbnYpCiAgICBpZiAicGsiIG5vdCBpbiBfa2V5X2NhY2hlOgogICAgICAgIHRyeToKICAgICAgICAgICAgd2l0aCB1cmxs"
+    "aWIucmVxdWVzdC51cmxvcGVuKEJBU0UgKyAiL3gvY29udGludWl0eS9wdWJrZXkiLCB0aW1lb3V0PVRJTUVPVVQpIGFzIHI6CiAg"
+    "ICAgICAgICAgICAgICBfa2V5X2NhY2hlWyJwayJdID0gYnl0ZXMuZnJvbWhleChqc29uLmxvYWRzKHIucmVhZCgpKVsicHVibGlj"
+    "X2tleSJdKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcmFpc2UgUGFzc3BvcnRSZWplY3RlZCgi"
+    "Y291bGQgbm90IGxvYWQgc2ViYmkucHJvIHB1YmxpYyBrZXk6ICVzIiAlIGUpCiAgICByZXR1cm4gX2tleV9jYWNoZVsicGsiXQoK"
+    "CmRlZiBfYjY0ZChzKToKICAgIHJldHVybiBiYXNlNjQudXJsc2FmZV9iNjRkZWNvZGUocyArICI9IiAqICgtbGVuKHMpICUgNCkp"
+    "CgoKZGVmIGNoZWNrKHRva2VuLCBhdWRpZW5jZSwgYWN0aW9uPU5vbmUpOgogICAgIiIiT2ZmbGluZSBjaGVjay4gUmV0dXJucyB0"
+    "aGUgcGFzc3BvcnQgYm9keSBvciByYWlzZXMgUGFzc3BvcnRSZWplY3RlZC4iIiIKICAgIHRyeToKICAgICAgICB0YWcsIGIsIHMg"
+    "PSBzdHIodG9rZW4pLnN0cmlwKCkuc3BsaXQoIi4iKQogICAgICAgIGlmIHRhZyAhPSAic2JwMSI6CiAgICAgICAgICAgIHJhaXNl"
+    "IFZhbHVlRXJyb3IKICAgICAgICByYXcsIHNpZyA9IF9iNjRkKGIpLCBfYjY0ZChzKQogICAgICAgIGJvZHkgPSBqc29uLmxvYWRz"
+    "KHJhdykKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcmFpc2UgUGFzc3BvcnRSZWplY3RlZCgibWlzc2luZyBvciBtYWxm"
+    "b3JtZWQgcGFzc3BvcnQiKQogICAgaWYgbm90IF92ZXJpZnkoc2lnLCBQUkVGSVggKyByYXcsIHB1YmxpY19rZXkoKSk6CiAgICAg"
+    "ICAgcmFpc2UgUGFzc3BvcnRSZWplY3RlZCgic2lnbmF0dXJlIGRvZXMgbm90IHZlcmlmeSAtIGZvcmdlZCBvciBhbHRlcmVkIikK"
+    "ICAgIHByb2JsZW1zID0gW10KICAgIGlmIHRpbWUudGltZSgpID4gYm9keS5nZXQoImV4cCIsIDApOgogICAgICAgIHByb2JsZW1z"
+    "LmFwcGVuZCgiZXhwaXJlZCIpCiAgICBpZiBib2R5LmdldCgiYXVkIikgIT0gYXVkaWVuY2Uuc3RyaXAoKS5sb3dlcigpOgogICAg"
+    "ICAgIHByb2JsZW1zLmFwcGVuZCgiaXNzdWVkIGZvciAlcywgbm90ICVzIiAlIChib2R5LmdldCgiYXVkIiksIGF1ZGllbmNlKSkK"
+    "ICAgIGlmIGFjdGlvbiBhbmQgYm9keS5nZXQoImFjdCIpICE9IGFjdGlvbjoKICAgICAgICBwcm9ibGVtcy5hcHBlbmQoImlzc3Vl"
+    "ZCBmb3IgYWN0aW9uICVzLCBub3QgJXMiICUgKGJvZHkuZ2V0KCJhY3QiKSwgYWN0aW9uKSkKICAgIGlmIHByb2JsZW1zOgogICAg"
+    "ICAgIHJhaXNlIFBhc3Nwb3J0UmVqZWN0ZWQocHJvYmxlbXMpCiAgICByZXR1cm4gYm9keQoKCmRlZiByZWRlZW0odG9rZW4sIGF1"
+    "ZGllbmNlLCBwYXJhbXM9Tm9uZSk6CiAgICAiIiJTcGVuZCBpdCBvbmNlLCBhdCB0aGUgbW9tZW50IG9mIGFjdGlvbi4gUmV0dXJu"
+    "cyBzZWJiaS5wcm8ncyBzZWFsZWQgYW5zd2VyLiIiIgogICAgcmVxID0gdXJsbGliLnJlcXVlc3QuUmVxdWVzdCgKICAgICAgICBC"
+    "QVNFICsgIi94L3Bhc3Nwb3J0L3JlZGVlbSIsIG1ldGhvZD0iUE9TVCIsCiAgICAgICAgZGF0YT1qc29uLmR1bXBzKHsidG9rZW4i"
+    "OiB0b2tlbiwgImF1ZGllbmNlIjogYXVkaWVuY2Uuc3RyaXAoKS5sb3dlcigpLAogICAgICAgICAgICAgICAgICAgICAgICAgInBh"
+    "cmFtcyI6IHBhcmFtcyBvciB7fX0pLmVuY29kZSgidXRmLTgiKSwKICAgICAgICBoZWFkZXJzPXsiQ29udGVudC1UeXBlIjogImFw"
+    "cGxpY2F0aW9uL2pzb24iLAogICAgICAgICAgICAgICAgICJVc2VyLUFnZW50IjogInNlYmJpLXNpdGUvIiArIF9fdmVyc2lvbl9f"
+    "fSkKICAgIHRyeToKICAgICAgICB3aXRoIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4ocmVxLCB0aW1lb3V0PVRJTUVPVVQpIGFzIHI6"
+    "CiAgICAgICAgICAgIHJlcyA9IGpzb24ubG9hZHMoci5yZWFkKCkpCiAgICBleGNlcHQgdXJsbGliLmVycm9yLkhUVFBFcnJvciBh"
+    "cyBlOgogICAgICAgIHRyeToKICAgICAgICAgICAgcmVzID0ganNvbi5sb2FkcyhlLnJlYWQoKSkKICAgICAgICBleGNlcHQgRXhj"
+    "ZXB0aW9uOgogICAgICAgICAgICByYWlzZSBQYXNzcG9ydFJlamVjdGVkKCJzZWJiaS5wcm8gYW5zd2VyZWQgJWQiICUgZS5jb2Rl"
+    "KQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHJhaXNlIFBhc3Nwb3J0UmVqZWN0ZWQoImNvdWxkIG5vdCByZWFj"
+    "aCBzZWJiaS5wcm8gdG8gcmVkZWVtOiAlcyIgJSBlKQogICAgaWYgbm90IHJlcy5nZXQoInJlZGVlbWVkIik6CiAgICAgICAgcmFp"
+    "c2UgUGFzc3BvcnRSZWplY3RlZChyZXMuZ2V0KCJwcm9ibGVtcyIpIG9yIFsicmVmdXNlZCJdLCByZXMuZ2V0KCJzZWFsZWRfaW5f"
+    "Y2hhaW4iKSkKICAgIHJldHVybiByZXMKCgpkZWYgYWNjZXB0KGhlYWRlcnNfb3JfdG9rZW4sIGF1ZGllbmNlLCBhY3Rpb249Tm9u"
+    "ZSwgcGFyYW1zPU5vbmUpOgogICAgIiIiQ2hlY2sgdGhlbiByZWRlZW0uIFJldHVybnMgdGhlIHBhc3Nwb3J0IGJvZHkuIFJhaXNl"
+    "cyBQYXNzcG9ydFJlamVjdGVkLiIiIgogICAgdG9rZW4gPSBoZWFkZXJzX29yX3Rva2VuCiAgICBpZiBub3QgaXNpbnN0YW5jZSh0"
+    "b2tlbiwgc3RyKToKICAgICAgICBnZXQgPSBnZXRhdHRyKGhlYWRlcnNfb3JfdG9rZW4sICJnZXQiLCBOb25lKQogICAgICAgIHRv"
+    "a2VuID0gKGdldChIRUFERVIpIG9yIGdldChIRUFERVIubG93ZXIoKSkgb3IgIiIpIGlmIGdldCBlbHNlICIiCiAgICBib2R5ID0g"
+    "Y2hlY2sodG9rZW4sIGF1ZGllbmNlLCBhY3Rpb24pCiAgICByZXMgPSByZWRlZW0odG9rZW4sIGF1ZGllbmNlLCBwYXJhbXMpCiAg"
+    "ICBib2R5WyJzZWFsZWRfaW5fY2hhaW4iXSA9IHJlcy5nZXQoInNlYWxlZF9pbl9jaGFpbiIpCiAgICBib2R5WyJibG9ja19pbmRl"
+    "eCJdID0gcmVzLmdldCgiYmxvY2tfaW5kZXgiKQogICAgcmV0dXJuIGJvZHkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgog"
+    "ICAgaWYgbGVuKHN5cy5hcmd2KSA8IDMgb3Igc3lzLmFyZ3ZbMV0gIT0gImNoZWNrIjoKICAgICAgICBwcmludCgidXNhZ2U6IHB5"
+    "dGhvbiBzZWJiaV9zaXRlLnB5IGNoZWNrIDx0b2tlbj4gW2F1ZGllbmNlXSIpCiAgICAgICAgc3lzLmV4aXQoMikKICAgIHRyeToK"
+    "ICAgICAgICBhdWQgPSBzeXMuYXJndlszXSBpZiBsZW4oc3lzLmFyZ3YpID4gMyBlbHNlIGpzb24ubG9hZHMoX2I2NGQoc3lzLmFy"
+    "Z3ZbMl0uc3BsaXQoIi4iKVsxXSkpWyJhdWQiXQogICAgICAgIHQwID0gdGltZS5wZXJmX2NvdW50ZXIoKQogICAgICAgIGJvZHkg"
+    "PSBjaGVjayhzeXMuYXJndlsyXSwgYXVkKQogICAgICAgIHByaW50KCJWQUxJRCAoJS4xZiBtcykgLSAlcyBhdCAlcywgZXhwaXJl"
+    "cyAlcyIgJSAoKHRpbWUucGVyZl9jb3VudGVyKCkgLSB0MCkgKiAxMDAwLAogICAgICAgICAgICAgIGJvZHlbImFjdCJdLCBib2R5"
+    "WyJhdWQiXSwgdGltZS5jdGltZShib2R5WyJleHAiXSkpKQogICAgZXhjZXB0IFBhc3Nwb3J0UmVqZWN0ZWQgYXMgZToKICAgICAg"
+    "ICBwcmludCgiUkVKRUNURUQgLSAlcyIgJSBlKQogICAgICAgIHN5cy5leGl0KDEpCg=="
+)
+
+
+def _d(b):
+    return base64.b64decode("".join(b.split()))
+
+
+_FILES = {
+    PAGE_PATH: (_d(_B64), "text/html; charset=utf-8", None),
+    PAGE_PATH + "/sebbi_agent.py": (_d(_AGENT_B64), "text/plain; charset=utf-8", "sebbi_agent.py"),
+    PAGE_PATH + "/sebbi_site.py": (_d(_SITE_B64), "text/plain; charset=utf-8", "sebbi_site.py"),
+}
+_patched = False
 
 
 def _find_handler_class(ctx):
@@ -1188,22 +1253,18 @@ def _find_handler_class(ctx):
     return None
 
 
-def _install(ctx):
+def _install_page(ctx):
     global _patched
-    if isinstance(ctx, dict) and "conn" in ctx:
-        _ctx.update(ctx)
-        _setup()
-        _load()
-        _start_loop()
     if _patched:
         return True
     cls = _find_handler_class(ctx)
     if cls is None:
         return False
-    if getattr(cls, "_ppa_patched", False):
+    if getattr(cls, "_passportpage_patched", False):
         _patched = True
         return True
-    og, op, oo = cls.do_GET, getattr(cls, "do_POST", None), getattr(cls, "do_OPTIONS", None)
+
+    original_do_GET = cls.do_GET
 
     def do_GET(self):
         path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
@@ -1214,775 +1275,30 @@ def _install(ctx):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             if fname:
-                self.send_header("Content-Disposition", 'attachment; filename="%s"' % fname)
-            self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Disposition", 'inline; filename="%s"' % fname)
             self.end_headers()
             self.wfile.write(body)
             return
-        if (self.path == "/p" or self.path.startswith("/p/")) and _run(self, "GET"):
-            return
-        return og(self)
-
-    def do_POST(self):
-        if self.path.startswith("/p/") and _run(self, "POST"):
-            return
-        return op(self) if op else None
-
-    def do_OPTIONS(self):
-        if self.path.startswith("/p/"):
-            self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Sebbi-Key")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        return oo(self) if oo else None
+        return original_do_GET(self)
 
     cls.do_GET = do_GET
-    if op:
-        cls.do_POST = do_POST
-    cls.do_OPTIONS = do_OPTIONS
-    cls._ppa_patched = True
+    cls._passportpage_patched = True
     _patched = True
     return True
 
 
-def _flat(d):
-    if not isinstance(d, dict):
-        return {}
-    return {k: (v[0] if isinstance(v, list) and v else v) for k, v in d.items()}
-
-
 def handle(method, action, data, api_key, ctx):
-    armed = _install(ctx)
-    action = (action or "status").strip("/").lower()
-    data = _flat(data)
-    if "conn" in _ctx and action in POSTS and method == "POST":
-        return POSTS[action](data, data, api_key or data.get("key"))
-    if "conn" in _ctx and action in GETS and action not in ("",):
-        return GETS[action](data, data, api_key)
-    last = _latest_sth() if "conn" in _ctx else None
-    if last:
-        last.pop("ts", None)
-    return {"module": "plugin", "version": VERSION, "armed": armed,
-            "aliases": ALIASES, "tree_size": len(_leaves), "latest_sealed_tree_head": last,
-            "checkpoint_every_seconds": CHECKPOINT_SECONDS, "checkpoint_every_leaves": CHECKPOINT_EVERY,
-            "open_submissions": OPEN, "spec": SPEC,
-            "pages": sorted(_FILES.keys()),
-            "endpoints": ["POST /p/submit", "/p/receipt", "/p/proof", "/p/consistency", "/p/sth", "/p/find"]}, 200
-
-
-def register(MODULE_MAP):
-    """For name-based loaders: map this module under its own name and its aliases."""
-    mod = sys.modules[__name__]
-    for name in ["plugin"] + ALIASES:
-        MODULE_MAP.setdefault(name, mod)
-    return MODULE_MAP
-
-```
-
-
-## `modules/praxis.py`
-
-697 lines, 24699 bytes
-
-```python
-"""
-modules/praxis.py  v1.0.2
-
-Outbound submitter for the PRAXIS external-witness observe endpoint (chain 4).
-
-Contract implemented against the SERVED schema route, not prose:
-    GET  https://chain4.thepraesidium.ai/api/external-witness/observe/schema
-    POST https://chain4.thepraesidium.ai/api/external-witness/observe
-
-Signing:
-    preimage  = b"PRAXIS-OBSERVE-v1\\n" + canonical JSON of the envelope
-                with the "signature" field REMOVED
-    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=True).encode("utf-8")
-    signature = lowercase hex HMAC-SHA256, carried in the body
-
-Secret:
-    environment variable PRAXIS_OBSERVE_SECRET
-    (never written to a file, never returned by any route)
-
-Routes
-    GET  /x/praxis/spec      public   what this module does and how it signs
-    GET  /x/praxis/status    public   config check + arms the /praxis page
-    GET  /x/praxis/schema    public   fetches THEIR live contract, reports version
-    GET  /x/praxis/history   keyed    past attempts from our own chain
-    POST /x/praxis/canonical keyed    dry run: envelope, preimage, signature, NO send
-    POST /x/praxis/submit    keyed    signs and sends ONE bounded submission
-
-v1.0.1 fixes a real fault found on 7 Sep 2026. _seal called the host seal()
-with one argument when it requires three, so every submit reported
-sealed:false while the response still said ok:true. A remote call was being
-recorded by the peer with no matching entry in our own chain. A failed seal
-now makes the whole response ok:false and says so at the top level.
-
-v1.0.2 fixes the follow-on. The host seal() returns a tuple
-(audit_hash, block_index, key_seq); v1.0.1 only read dicts and strings and
-so reported a successful seal as "seal returned no hash".
-"""
-
-import os
-import json
-import time
-import hmac
-import hashlib
-import secrets
-import sys
-import urllib.request
-import urllib.error
-from datetime import datetime, timezone
-
-VERSION = "1.0.2"
-
-# ---------------------------------------------------------------- constants
-
-BASE = "https://chain4.thepraesidium.ai"
-OBSERVE_URL = BASE + "/api/external-witness/observe"
-SCHEMA_URL = BASE + "/api/external-witness/observe/schema"
-
-DOMAIN = b"PRAXIS-OBSERVE-v1\n"
-ENVELOPE_SCHEMA = "praxis_external_observe_request_v1"
-
-OUR_PEER_ID = "aileash"
-OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
-
-SECRET_ENV = "PRAXIS_OBSERVE_SECRET"
-
-TIMEOUT = 20
-MAX_RESPONSE_BYTES = 262144
-
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "status"),
-    ("GET", "schema"),
-}
-
-
-# ---------------------------------------------------------------- helpers
-
-def _now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _canonical(obj):
-    return json.dumps(
-        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("utf-8")
-
-
-def _sha256_hex(b):
-    return hashlib.sha256(b).hexdigest()
-
-
-def _secret():
-    s = os.environ.get(SECRET_ENV, "")
-    return s.strip()
-
-
-def _fresh_nonce():
-    # matches ^[A-Za-z0-9_.:-]{12,128}$
-    return secrets.token_hex(20)
-
-
-def _fresh_idem():
-    # matches ^[0-9a-f]{64}(\.attempt-N)?$
-    return secrets.token_hex(32)
-
-
-def _http(method, url, body=None):
-    req = urllib.request.Request(url, data=body, method=method)
-    req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "AILeash-praxis/" + VERSION)
-    if body is not None:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            raw = r.read(MAX_RESPONSE_BYTES)
-            return r.status, dict(r.headers), raw, None
-    except urllib.error.HTTPError as e:
-        raw = b""
-        try:
-            raw = e.read(MAX_RESPONSE_BYTES)
-        except Exception:
-            pass
-        return e.code, dict(getattr(e, "headers", {}) or {}), raw, None
-    except Exception as e:
-        return 0, {}, b"", "%s: %s" % (type(e).__name__, e)
-
-
-def _parse_json(raw):
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except Exception:
-        return None
-
-
-def _build_envelope(tip_digest, witnessed_peer_id, source_url,
-                    receipt_digest=None, attempt=None, observed_at=None):
-    payload = {
-        "witnessed_peer_id": witnessed_peer_id,
-        "data_class": "HASH_ONLY",
-        "tip_digest": tip_digest,
-        "source_url": source_url,
-        "observed_at": observed_at or _now_iso(),
-    }
-    # receipt_digest is OPTIONAL in contract v1_1 and is omitted for a pure
-    # chain-tip observation. Never duplicate tip_digest into it.
-    if receipt_digest:
-        payload["receipt_digest"] = receipt_digest
-
-    key = _fresh_idem()
-    if attempt:
-        key = "%s.attempt-%s" % (key, attempt)
-
-    return {
-        "schema_version": ENVELOPE_SCHEMA,
-        "peer_id": OUR_PEER_ID,
-        "ts": _now_iso(),
-        "nonce": _fresh_nonce(),
-        "idempotency_key": key,
-        "payload": payload,
-    }
-
-
-def _sign(envelope, secret):
-    unsigned = {k: v for k, v in envelope.items() if k != "signature"}
-    canonical = _canonical(unsigned)
-    preimage = DOMAIN + canonical
-    sig = hmac.new(secret.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
-    return canonical, preimage, sig
-
-
-def _validate(tip_digest, witnessed_peer_id, source_url, receipt_digest):
-    import re
-    if not re.fullmatch(r"[0-9a-f]{64}", tip_digest or ""):
-        return "tip_digest must be 64 lowercase hex characters"
-    if not re.fullmatch(r"[a-z][a-z0-9_.:-]{2,63}", witnessed_peer_id or ""):
-        return "witnessed_peer_id must match ^[a-z][a-z0-9_.:-]{2,63}$"
-    if not (source_url or "").startswith("https://") or (source_url or "").count("/") < 3:
-        return "source_url must be an https URL with a path"
-    if len(source_url) > 512:
-        return "source_url exceeds 512 characters"
-    if receipt_digest and not re.fullmatch(r"[0-9a-f]{64}", receipt_digest):
-        return "receipt_digest, if supplied, must be 64 lowercase hex characters"
-    if receipt_digest and receipt_digest == tip_digest:
-        return "receipt_digest must not duplicate tip_digest"
-    return None
-
-
-def _record_seal_result(out, res):
-    """Read whatever the host seal() handed back.
-
-    This deployment's seal() returns a TUPLE: (audit_hash, block_index,
-    key_seq). v1.0.1 only understood dicts and strings, so a successful seal
-    was reported as "seal returned no hash". Tuples are handled first.
-    """
-    if isinstance(res, (tuple, list)):
-        if len(res) > 0:
-            out["audit_hash"] = res[0]
-        if len(res) > 1:
-            out["block_index"] = res[1]
-        if len(res) > 2:
-            out["key_seq"] = res[2]
-    elif isinstance(res, dict):
-        out["audit_hash"] = (res.get("audit_hash") or res.get("hash")
-                             or res.get("seal") or res.get("block_hash"))
-        out["block_index"] = res.get("block_index") or res.get("index")
-        out["key_seq"] = res.get("key_seq") or res.get("seq")
-    elif isinstance(res, str):
-        out["audit_hash"] = res
-    out["sealed"] = bool(out["audit_hash"])
-    return out
-
-
-def _seal(ctx, event):
-    """Seal into our own chain.
-
-    The host seal() takes three positional arguments (event, result, ts).
-    v1.0.0 called it with one and every submit failed silently. We try the
-    three-argument form first and fall back only if the host is older, and
-    we record which call shape worked so this is never guesswork again.
-    """
-    out = {"sealed": False, "audit_hash": None, "error": None,
-           "call_shape": None}
-    sealer = ctx.get("seal")
-    if not sealer:
-        out["error"] = "no seal function in ctx"
-        return out
-
-    result_value = event.get("result") or "sent"
-    ts_value = event.get("ts") or _now_iso()
-
-    attempts = [
-        ("seal(event, result, ts)", lambda: sealer(event, result_value, ts_value)),
-        ("seal(event, result)", lambda: sealer(event, result_value)),
-        ("seal(event)", lambda: sealer(event)),
-    ]
-
-    errors = []
-    for shape, call in attempts:
-        try:
-            res = call()
-        except TypeError as e:
-            errors.append("%s -> TypeError: %s" % (shape, e))
-            continue
-        except Exception as e:
-            out["error"] = "%s -> %s: %s" % (shape, type(e).__name__, e)
-            out["call_shape"] = shape
-            return out
-        out["call_shape"] = shape
-        _record_seal_result(out, res)
-        if not out["sealed"]:
-            out["error"] = "seal returned no hash"
-        return out
-
-    out["error"] = "no accepted call shape; " + " | ".join(errors)
-    return out
-
-
-# ---------------------------------------------------------------- page
-
-PAGE = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex">
-<title>PRAXIS submit</title>
-<style>
-:root{--ink:#0a0f1e;--ink2:#10182e;--gold:#c9a84c;--ok:#7fe3b0;--err:#ff8a80}
-*{box-sizing:border-box}
-body{margin:0;padding:16px;background:var(--ink);color:#e8ecf5;
-     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-h1{font-size:18px;margin:0 0 4px;color:var(--gold)}
-p.sub{margin:0 0 18px;color:#8b96ad;font-size:13px}
-label{display:block;margin:12px 0 4px;font-size:12px;color:#8b96ad;
-      text-transform:uppercase;letter-spacing:.06em}
-input{width:100%;padding:11px;background:var(--ink2);border:1px solid #24304e;
-      border-radius:8px;color:#e8ecf5;font:14px monospace}
-input:focus{outline:none;border-color:var(--gold)}
-.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
-button{flex:1;min-width:120px;padding:13px;border:0;border-radius:8px;
-       background:var(--gold);color:#0a0f1e;font-weight:600;font-size:15px}
-button.alt{background:var(--ink2);color:#e8ecf5;border:1px solid #24304e}
-button:disabled{opacity:.45}
-pre{margin-top:16px;padding:12px;background:var(--ink2);border:1px solid #24304e;
-    border-radius:8px;white-space:pre-wrap;word-break:break-all;
-    font:12px/1.45 monospace;max-height:60vh;overflow:auto}
-.ok{color:var(--ok)}.err{color:var(--err)}
-</style></head><body>
-
-<h1>PRAXIS observe &mdash; chain 4</h1>
-<p class="sub">Signs one bounded submission and sends it. Fresh ts, nonce and
-idempotency key every press.</p>
-
-<label>API key</label>
-<input id="key" type="password" placeholder="AILeash API key" autocomplete="off">
-
-<label>Tip digest (64 hex)</label>
-<input id="tip" placeholder="press Load tip">
-
-<label>Witnessed peer id</label>
-<input id="wpid" value="aileash">
-
-<label>Source URL</label>
-<input id="src" value="https://sebbi.pro/x/witness/tip">
-
-<label>Attempt marker (optional)</label>
-<input id="att" placeholder="leave blank for a first attempt">
-
-<div class="row">
-  <button class="alt" onclick="loadTip()">Load tip</button>
-  <button class="alt" onclick="theirSchema()">Their schema</button>
-</div>
-<div class="row">
-  <button class="alt" onclick="go('canonical')">Dry run</button>
-  <button onclick="send()">Send</button>
-</div>
-
-<pre id="out">Ready.</pre>
-
-<script>
-var out = document.getElementById('out');
-function show(t, cls){ out.className = cls || ''; out.textContent = t; }
-function val(id){ return document.getElementById(id).value.trim(); }
-
-function loadTip(){
-  show('Loading our tip...');
-  fetch('/x/witness/tip').then(function(r){ return r.json(); }).then(function(j){
-    var t = j.tip || j.hash || j.head || j.chain_tip || j.latest || '';
-    document.getElementById('tip').value = t;
-    show('Tip loaded.\\n\\n' + JSON.stringify(j, null, 2), 'ok');
-  }).catch(function(e){ show('Failed: ' + e, 'err'); });
-}
-
-function theirSchema(){
-  show('Fetching their live contract...');
-  fetch('/x/praxis/schema').then(function(r){ return r.json(); }).then(function(j){
-    show(JSON.stringify(j, null, 2), j.receipt_digest_required ? 'err' : 'ok');
-  }).catch(function(e){ show('Failed: ' + e, 'err'); });
-}
-
-function body(){
-  return {
-    tip_digest: val('tip'),
-    witnessed_peer_id: val('wpid'),
-    source_url: val('src'),
-    attempt: val('att') || null
-  };
-}
-
-function go(action){
-  var k = val('key');
-  if(!k){ show('API key required.', 'err'); return; }
-  show('Working...');
-  fetch('/x/praxis/' + action, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + k },
-    body: JSON.stringify(body())
-  }).then(function(r){ return r.json(); }).then(function(j){
-    show(JSON.stringify(j, null, 2), j.ok === false ? 'err' : 'ok');
-  }).catch(function(e){ show('Failed: ' + e, 'err'); });
-}
-
-function send(){
-  if(!confirm('Send one bounded submission to chain 4 now?')) return;
-  go('submit');
-}
-</script>
-</body></html>"""
-
-
-def _install_page():
-    """Serve /praxis by wrapping the running handler's do_GET, once."""
-    for mod in list(sys.modules.values()):
-        if mod is None:
-            continue
-        try:
-            names = dir(mod)
-        except Exception:
-            continue
-        for name in names:
-            try:
-                obj = getattr(mod, name, None)
-            except Exception:
-                continue
-            if not isinstance(obj, type):
-                continue
-            if not (hasattr(obj, "do_GET") and hasattr(obj, "do_POST")):
-                continue
-            if getattr(obj, "_praxis_patched", False):
-                return True
-            original = obj.do_GET
-
-            def patched(self, _original=original):
-                try:
-                    path = self.path.split("?")[0].rstrip("/")
-                except Exception:
-                    path = ""
-                if path == "/praxis":
-                    data = PAGE.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("X-Robots-Tag", "noindex")
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
-                return _original(self)
-
-            obj.do_GET = patched
-            obj._praxis_patched = True
-            return True
-    return False
-
-
-# ---------------------------------------------------------------- actions
-
-def _spec():
-    return {
-        "module": "praxis",
+    armed = _install_page(ctx)
+    return ({
+        "module": "passportpage",
         "version": VERSION,
-        "what_this_is": (
-            "Outbound submitter for the PRAXIS external-witness observe "
-            "endpoint. One bounded submission per press. This module sends; "
-            "it does not receive."
-        ),
-        "target": {"observe": OBSERVE_URL, "schema": SCHEMA_URL},
-        "signing": {
-            "algorithm": "hmac-sha256",
-            "domain": "PRAXIS-OBSERVE-v1\\n",
-            "canonicalization": "sort_keys=true, separators=(',',':'), ensure_ascii=true, utf-8",
-            "preimage": "domain bytes + canonical JSON of the envelope with 'signature' removed",
-            "signature_encoding": "lowercase hex",
-            "auth_transport": "body, not headers",
-        },
-        "payload_policy": (
-            "receipt_digest is optional under their contract v1_1 and is "
-            "omitted for a pure chain-tip observation. It is never filled "
-            "with a duplicate of tip_digest or a placeholder."
-        ),
-        "freshness": "fresh ts, fresh nonce and a fresh idempotency key on every submit",
-        "seal_policy": (
-            "a submit that reaches the peer but fails to seal into our own "
-            "chain returns ok:false with seal_failed true. The send is still "
-            "reported in full, because it happened and the peer may hold a "
-            "durable record of it."
-        ),
-        "not_claimed": [
-            "this lane is one-directional and does not establish mutual witnessing",
-            "their acceptance is a transport and signature outcome, not verification "
-            "of anything in our chain",
-        ],
-        "routes": {
-            "public": ["GET spec", "GET status", "GET schema"],
-            "keyed": ["GET history", "POST canonical", "POST submit"],
-        },
-    }
+        "serves": sorted(_FILES.keys()),
+        "armed": armed,
+        "bytes": {k: len(v[0]) for k, v in _FILES.items()},
+        "note": "Hit /x/passportpage/status once after each deploy to arm these pages.",
+    }, 200)
 
 
-def _status():
-    installed = _install_page()
-    s = _secret()
-    return {
-        "module": "praxis",
-        "version": VERSION,
-        "page": "/praxis",
-        "page_installed": installed,
-        "peer_id": OUR_PEER_ID,
-        "secret_configured": bool(s),
-        "secret_env": SECRET_ENV,
-        "secret_length": len(s) if s else 0,
-        "target": OBSERVE_URL,
-        "note": (
-            "secret_configured false means the environment variable is not set "
-            "on this replica; the secret itself is never returned by any route"
-        ),
-    }
-
-
-def _their_schema():
-    code, headers, raw, err = _http("GET", SCHEMA_URL)
-    if err:
-        return {"ok": False, "error": "fetch_failed", "detail": err}, 502
-    doc = _parse_json(raw)
-    if doc is None:
-        return {"ok": False, "error": "unparseable", "status": code}, 502
-
-    req = (((doc.get("request_schema") or {}).get("properties") or {})
-           .get("payload") or {})
-    required = req.get("required") or []
-    hdr = {}
-    for k, v in (headers or {}).items():
-        if k.lower().startswith("x-praxis") or k.lower() == "cache-control":
-            hdr[k.lower()] = v
-
-    return {
-        "ok": True,
-        "fetched_at": _now_iso(),
-        "http_status": code,
-        "contract_version": doc.get("schema_version"),
-        "payload_required": required,
-        "receipt_digest_required": "receipt_digest" in required,
-        "canonicalization": ((doc.get("signing") or {}).get("canonicalization")),
-        "domain": ((doc.get("signing") or {}).get("domain")),
-        "clock_skew_seconds": ((doc.get("freshness") or {}).get("clock_skew_seconds")),
-        "headers": hdr,
-        "body_sha256": _sha256_hex(raw),
-    }, 200
-
-
-def _canonical_action(data):
-    tip = (data.get("tip_digest") or "").strip().lower()
-    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
-    src = (data.get("source_url") or OUR_TIP_URL).strip()
-    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
-    attempt = data.get("attempt") or None
-
-    bad = _validate(tip, wpid, src, rcpt)
-    if bad:
-        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
-
-    secret = _secret()
-    if not secret:
-        return {"ok": False, "error": "secret_unconfigured",
-                "detail": "set %s in the environment" % SECRET_ENV}, 503
-
-    env = _build_envelope(tip, wpid, src, rcpt, attempt)
-    canonical, preimage, sig = _sign(env, secret)
-    signed = dict(env)
-    signed["signature"] = sig
-
-    return {
-        "ok": True,
-        "dry_run": True,
-        "sent": False,
-        "envelope": signed,
-        "canonical_json": canonical.decode("utf-8"),
-        "canonical_sha256": _sha256_hex(canonical),
-        "preimage_sha256": _sha256_hex(preimage),
-        "signature": sig,
-        "note": "nothing was sent; ts, nonce and idempotency_key here are "
-                "single-use and will be regenerated on an actual submit",
-    }, 200
-
-
-def _submit(data, ctx):
-    tip = (data.get("tip_digest") or "").strip().lower()
-    wpid = (data.get("witnessed_peer_id") or OUR_PEER_ID).strip().lower()
-    src = (data.get("source_url") or OUR_TIP_URL).strip()
-    rcpt = (data.get("receipt_digest") or "").strip().lower() or None
-    attempt = data.get("attempt") or None
-
-    bad = _validate(tip, wpid, src, rcpt)
-    if bad:
-        return {"ok": False, "error": "invalid_input", "detail": bad}, 400
-
-    secret = _secret()
-    if not secret:
-        return {"ok": False, "error": "secret_unconfigured",
-                "detail": "set %s in the environment" % SECRET_ENV}, 503
-
-    env = _build_envelope(tip, wpid, src, rcpt, attempt)
-    canonical, preimage, sig = _sign(env, secret)
-    signed = dict(env)
-    signed["signature"] = sig
-    wire = _canonical(signed)
-
-    started = time.time()
-    code, headers, raw, err = _http("POST", OBSERVE_URL, wire)
-    took = round(time.time() - started, 3)
-
-    parsed = _parse_json(raw)
-    transport_ok = err is None and code in (200, 202)
-    result = {
-        "ok": transport_ok,
-        "sent": err is None,
-        "took_seconds": took,
-        "http_status": code,
-        "transport_error": err,
-        "request": {
-            "idempotency_key": env["idempotency_key"],
-            "nonce": env["nonce"],
-            "ts": env["ts"],
-            "peer_id": env["peer_id"],
-            "payload": env["payload"],
-            "signature": sig,
-            "canonical_sha256": _sha256_hex(canonical),
-            "wire_sha256": _sha256_hex(wire),
-            "wire_bytes": len(wire),
-        },
-        "response": {
-            "body": parsed,
-            "raw_sha256": _sha256_hex(raw) if raw else None,
-            "raw_bytes": len(raw),
-            "raw_text": (raw.decode("utf-8", "replace")[:4000] if raw else None),
-        },
-    }
-
-    if isinstance(parsed, dict):
-        result["their_error"] = parsed.get("error")
-        result["their_accepted"] = parsed.get("accepted")
-        result["their_replayed"] = parsed.get("replayed")
-        result["their_request_digest"] = parsed.get("request_digest")
-        result["their_durable_event_recorded"] = parsed.get("durable_event_recorded")
-        result["their_accepted_decision_recorded"] = parsed.get(
-            "accepted_decision_recorded")
-
-    event = {
-        "user_id": "praxis:" + OUR_PEER_ID,
-        "event": "praxis_observe_submit",
-        "kind": "praxis_observe_submit",
-        "ts": _now_iso(),
-        "target": OBSERVE_URL,
-        "idempotency_key": env["idempotency_key"],
-        "request_wire_sha256": result["request"]["wire_sha256"],
-        "http_status": code,
-        "response_sha256": result["response"]["raw_sha256"],
-        "their_error": result.get("their_error"),
-        "their_accepted": result.get("their_accepted"),
-        "result": "sent" if err is None else "transport_error",
-    }
-    result["our_seal"] = _seal(ctx, event)
-
-    # A send that the peer accepted but our own chain has no entry for is a
-    # failure of this deployment, not a success. Say so at the top level.
-    if not result["our_seal"].get("sealed"):
-        result["ok"] = False
-        result["seal_failed"] = True
-        result["seal_failed_note"] = (
-            "the submission reached the peer but was NOT sealed into our "
-            "chain. The peer may hold a durable record with no counterpart "
-            "here. Do not treat this submission as evidenced on our side."
-        )
-
-    if not transport_ok:
-        status = 502 if err else 200
-    elif not result["our_seal"].get("sealed"):
-        status = 500
-    else:
-        status = 200
-    return result, status
-
-
-def _history(ctx, data):
-    limit = 20
-    try:
-        limit = max(1, min(100, int(data.get("limit") or 20)))
-    except Exception:
-        pass
-    rows = []
-    try:
-        conn = ctx.get("conn")
-        lock = ctx.get("lock")
-        sql = ("SELECT rowid, * FROM audit_log "
-               "WHERE user_id = ? ORDER BY rowid DESC LIMIT ?")
-        if lock:
-            with lock:
-                cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
-                cols = [d[0] for d in cur.description]
-                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        else:
-            cur = conn.execute(sql, ("praxis:" + OUR_PEER_ID, limit))
-            cols = [d[0] for d in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-    except Exception as e:
-        return {"ok": False, "error": "query_failed",
-                "detail": "%s: %s" % (type(e).__name__, e)}, 500
-    return {"ok": True, "count": len(rows), "rows": rows}, 200
-
-
-# ---------------------------------------------------------------- router
-
-def handle(method, action, data, api_key, ctx):
-    data = data or {}
-
-    if method == "GET" and action == "spec":
-        return _spec(), 200
-
-    if method == "GET" and action == "status":
-        return _status(), 200
-
-    if method == "GET" and action == "schema":
-        return _their_schema()
-
-    if method == "GET" and action == "history":
-        return _history(ctx, data)
-
-    if method == "POST" and action == "canonical":
-        return _canonical_action(data)
-
-    if method == "POST" and action == "submit":
-        return _submit(data, ctx)
-
-    return {"ok": False, "error": "unknown_action", "action": action,
-            "available": ["spec", "status", "schema", "history",
-                          "canonical", "submit"]}, 404
+PUBLIC = {("GET", "status"), ("GET", "spec")}
 
 ```
