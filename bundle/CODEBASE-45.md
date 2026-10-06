@@ -6,7 +6,7 @@ Contains:
 
 ## `index.html`
 
-3661 lines, 243331 bytes
+3682 lines, 244636 bytes
 
 ```html
 <!DOCTYPE html>
@@ -542,6 +542,13 @@ body.fieldlock nav,body.fieldlock #rail,body.fieldlock #chip{display:none!import
   background:linear-gradient(180deg,#ffe9a8 0%,#f7c14b 45%,#c98f17 100%);
   -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;
   opacity:.2;filter:drop-shadow(0 0 70px rgba(247,160,26,.4))}
+#fbtcblk{position:absolute;left:50%;top:40px;transform:translateX(-50%);z-index:4;pointer-events:none;
+  display:flex;align-items:center;gap:8px;padding:6px 14px;border-radius:999px;
+  background:rgba(12,9,2,.6);border:1px solid rgba(247,160,26,.45);backdrop-filter:blur(6px)}
+#fbtcblk .b{color:#f7931a;font-weight:800;font-size:14px;line-height:1}
+#fbtcblk .k{color:#c99a4a;font-size:8px;letter-spacing:2px}
+#fbtcblk .n{color:#ffd98a;font-weight:700;font-size:13px;letter-spacing:.5px}
+@media(max-width:700px){#fbtcblk{top:38px;padding:5px 11px;gap:6px}#fbtcblk .n,#fbtcblk .b{font-size:12px}#fbtcblk .k{font-size:7px}}
 
 /* ---------- top bar ---------- */
 .fbar{position:absolute;top:0;left:0;right:0;z-index:5;height:30px;display:flex;
@@ -648,6 +655,7 @@ body.fieldlock nav,body.fieldlock #rail,body.fieldlock #chip{display:none!import
   <canvas id="fgl"></canvas>
   <canvas id="flbl"></canvas>
   <div id="fbtcbg" aria-hidden="true">&#8383;</div>
+  <div id="fbtcblk" aria-live="polite"><span class="b">&#8383;</span><span class="k">BITCOIN BLOCK</span><span class="n" id="fbtcblk-n">&middot;&middot;&middot;</span></div>
 
   <div class="fbar">
     <div class="fm">AILEASH</div>
@@ -3664,6 +3672,19 @@ requestAnimationFrame(draw);
     if(!AC||!on) return;
     master.gain.setTargetAtTime(document.hidden?0.0001:0.55,AC.currentTime,document.hidden?0.5:3);
   });
+})();
+</script>
+<script id="FIELDBTC">
+(function(){
+  var el=document.getElementById('fbtcblk-n'); if(!el) return;
+  var O=(location.protocol==='http:'||location.protocol==='https:')?'':'https://sebbi.pro';
+  function load(){
+    fetch(O+'/a/btc').then(function(r){return r.text();}).then(function(t){
+      var m=t.match(/latest block\s+(\d+)/i);
+      el.textContent = m ? '#'+Number(m[1]).toLocaleString() : 'live';
+    }).catch(function(){ el.textContent='live'; });
+  }
+  load(); setInterval(load,60000);
 })();
 </script>
 
