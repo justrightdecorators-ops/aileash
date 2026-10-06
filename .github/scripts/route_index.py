@@ -122,6 +122,20 @@ ABOUT = {
     "cinemafeed": ("Site pages", "The video feed behind the Cinema."),
     "marquee": ("Site pages", "Creator submissions for the Cinema's 10p wing."),
     "game": ("Site pages", "Deep Run, the sebbi.pro game at /game, with a shared leaderboard."),
+    # products and proof in Bitcoin (built Oct 2026)
+    "notary": ("Decisions and evidence", "Bitcoin Notary and Forever Proofs. Timestamp any fingerprint in Bitcoin; every chain block and Human Keys proof gets a proof anyone can check against Bitcoin without sebbi.pro."),
+    "gateway": ("Authority and agents", "Seal at the wire: point an app's OpenAI or Anthropic base URL here and every call is scored, sealed, blocked if needed, and answered with an AI-Decision-Receipt header."),
+    "spendgate": ("Authority and agents", "Spend Gate. An AI agent gets a signed APPROVED or DENIED before it can spend, checked against per-agent limits. sebbi.pro is the sign-off, never the wallet."),
+    "humankeys": ("Decisions and evidence", "Human Keys. Proof a human typed a text, scored by typing rhythm, owned by a device key and dated by Bitcoin."),
+    "connect": ("Site pages", "The /connect and /build pages: hook any stack or AI up, and build Signal Packs in plain English."),
+    "mcp": ("Authority and agents", "The Model Context Protocol connector at /mcp: an AI assistant sets a customer up and runs every product end to end."),
+    "pilot": ("Billing", "The paid pilot at /pilot: governed in 7 days, and the gateway's free-call allowance before a card is needed."),
+    "ratelimit": ("Operations", "Per-key request limits sized for real gateway traffic."),
+    "monitor": ("Operations", "The admin command-centre data: signups, devices, downloads, visitors, money and health."),
+    "autopilot": ("Operations", "Automatic follow-up emails to people who signed up or started a checkout, with unsubscribe and one email per step."),
+    "answers": ("Registers and standards", "The plain-English answer pages, the open Forever Proof and AI-Decision-Receipt standards, the sitemap and llms.txt."),
+    "brand": ("Operations", "Presents every page under one brand as it is served, without editing page files."),
+    "ainews": ("Site pages", "The live AI-only news ticker along the foot of the site."),
 }
 GROUPS = ["Decisions and evidence", "The chain", "Authority and agents", "Oversight and notaries",
           "Witness network", "Registers and standards", "Billing", "Operations", "Site pages"]
