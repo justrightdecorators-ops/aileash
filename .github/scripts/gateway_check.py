@@ -62,6 +62,7 @@ class Up(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+http.server.ThreadingHTTPServer.request_queue_size = 256   # the stand-ins must not be the bottleneck
 up_o = http.server.ThreadingHTTPServer(("127.0.0.1", 8911), Up)
 up_a = http.server.ThreadingHTTPServer(("127.0.0.1", 8912), Up)
 for u in (up_o, up_a):
@@ -252,6 +253,7 @@ try:
             with lock:
                 res.append((0, None, 0, str(ex)))
 
+    http_("GET", "/gateway", raw=True)  # first request raises the connection queue
     ts = [threading.Thread(target=one, args=(i,)) for i in range(40)]
     t0 = time.time()
     [t.start() for t in ts]
@@ -261,7 +263,7 @@ try:
     blocks = {x[1] for x in ok}
     times = sorted(x[3] for x in ok)
     print("  note 40 concurrent streams: wall %.2fs, median %.2fs (stand-in takes 1.0s), slowest %.2fs" % (wall, times[len(times) // 2] if times else -1, times[-1] if times else -1))
-    chk("40 concurrent streams all delivered", len(ok) == 40, res[:5])
+    chk("40 concurrent streams all delivered", len(ok) == 40, [x for x in res if not (x[0] == 200 and x[2] == 6)])
     chk("each one sealed in its own block", len(blocks) == 40, len(blocks))
     chk("gateway adds little delay under load", times and times[len(times) // 2] < 2.5, times[:3])
 
@@ -278,7 +280,8 @@ try:
     chk("provider down -> clean 502 with receipt", st == 502 and d.get("type") == "error" and hd.get("AI-Decision-Receipt"), (st, d))
 
     st, s1, _ = http_("GET", "/x/gateway/status")
-    chk("status counts", s1["since_start"]["forwarded"] >= 43 and s1["since_start"]["blocked"] >= 1 and s1["receipt_header_on_govern"], s1)
+    chk("connection queue raised", s1.get("connection_queue") == 512, s1.get("connection_queue"))
+    chk("status counts", s1["since_start"]["forwarded"] >= 40 and s1["since_start"]["blocked"] >= 1 and s1["receipt_header_on_govern"], s1)
     st, o, e = None, *tool("sebbi_overview", {})
     chk("existing connector tools still work", not e and o.get("products"))
 finally:

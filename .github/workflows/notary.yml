@@ -36,6 +36,8 @@ jobs:
         run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/answers_check.py
       - name: Gateway and AI-Decision-Receipt header, with load test (no outside network)
         run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/gateway_check.py
+      - name: Per-key rate limits (no outside network)
+        run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/ratelimit_check.py
 
   live:
     if: github.event_name != 'push'

@@ -79,6 +79,12 @@ HEADER = "AI-Decision-Receipt"
 _state = {"pages": False, "wire": False, "headers": False, "mcp": False, "calls": 0, "blocked": 0,
           "forwarded": 0, "upstream_errors": 0, "receipts_added": 0, "last_error": None}
 _lock = threading.Lock()
+_count_lock = threading.Lock()
+
+
+def _inc(k):
+    with _count_lock:
+        _state[k] += 1
 
 
 def _srv():
@@ -305,7 +311,7 @@ def serve_wire(h):
             body_json = None
     s = _srv()
     call_id = _new_call()
-    _state["calls"] += 1
+    _inc("calls")
     try:
         result, status = s.govern(_event(h, provider, model, rest, req_digest, body_json), key)
     except Exception as e:
@@ -322,7 +328,7 @@ def serve_wire(h):
     kh = _kh(key)
     hold_challenge = (h.headers.get("X-Sebbi-On-Challenge") or "").strip().lower() == "block"
     if dec == "BLOCK" or (dec == "CHALLENGE" and hold_challenge):
-        _state["blocked"] += 1
+        _inc("blocked")
         _db("INSERT INTO gateway_call(id,ts,key_hash,provider,model,endpoint,decision,score,block_index,audit_hash,"
             "req_sha256,status,ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (call_id, t0, kh, provider, str(model or "")[:80], rest[:120], dec, result.get("score"), block, seal,
@@ -355,7 +361,7 @@ def serve_wire(h):
         conn.request(h.command, target, body=body or None, headers=fwd)
         resp = conn.getresponse()
     except Exception as e:
-        _state["upstream_errors"] += 1
+        _inc("upstream_errors")
         _db("INSERT INTO gateway_call(id,ts,key_hash,provider,model,endpoint,decision,score,block_index,audit_hash,"
             "req_sha256,status,ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (call_id, t0, kh, provider, str(model or "")[:80], rest[:120], dec, result.get("score"), block, seal,
@@ -363,7 +369,7 @@ def serve_wire(h):
         return _err_with(h, provider, 502, "upstream_unreachable",
                          "The provider could not be reached (%s). The decision was sealed; nothing was sent twice."
                          % type(e).__name__, rcpt, {"AI-Decision-Call": call_id})
-    _state["forwarded"] += 1
+    _inc("forwarded")
     h.send_response(resp.status)
     for k, v in resp.getheaders():
         if k.lower() in RESP_DROP:
@@ -474,6 +480,22 @@ def new_token(api_key, label=None):
 # installing
 # ---------------------------------------------------------------------------
 
+BACKLOG = int(os.environ.get("SERVER_BACKLOG", "512"))
+
+
+def _raise_backlog(h):
+    """Python's HTTPServer listens with a queue of 5 new connections, so a burst of
+    simultaneous clients gets refused. Re-listening on the live socket raises the
+    queue in place; nothing is restarted and no connection is dropped."""
+    _state["backlog"] = True
+    try:
+        sock = h.server.socket
+        sock.listen(BACKLOG)
+        _state["backlog_size"] = BACKLOG
+    except Exception as e:
+        _state["last_error"] = "backlog: %s" % str(e)[:120]
+
+
 def _install_wire():
     if _state["wire"]:
         return True
@@ -488,6 +510,8 @@ def _install_wire():
         orig = getattr(H, name, None)
 
         def method(self):
+            if not _state.get("backlog"):
+                _raise_backlog(self)
             p = (self.path or "").split("?")[0]
             if p.startswith("/g/"):
                 try:
@@ -584,7 +608,7 @@ class _Out(object):
             if isinstance(d, dict) and d.get("block_index") is not None and d.get("decision"):
                 rc = receipt_header(d.get("decision"), d.get("score"), d.get("block_index"), d.get("audit_hash"))
                 head = head + ("\r\n%s: %s\r\nAccess-Control-Expose-Headers: %s" % (HEADER, rc, HEADER)).encode()
-                _state["receipts_added"] += 1
+                _inc("receipts_added")
         except Exception:
             pass
         self.real.write(head + b"\r\n\r\n" + body)
@@ -847,6 +871,7 @@ def handle(method, action, data, api_key, ctx):
                 "upstreams": UPSTREAM, "calls_recorded": n, "since_start": {k: _state[k] for k in
                 ("calls", "forwarded", "blocked", "upstream_errors", "receipts_added")},
                 "receipt_header_on_govern": _state["headers"], "ai_connector_tool": _state["mcp"],
+                "connection_queue": _state.get("backlog_size", "raised on first request"),
                 "last_error": _state["last_error"]}, 200
     if action == "spec":
         return {"module": "gateway", "version": VERSION, "header": HEADER,
