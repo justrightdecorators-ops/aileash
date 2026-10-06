@@ -680,7 +680,7 @@ def handle(method, action, data, api_key, ctx):
 
 ## `modules/answers.py`
 
-386 lines, 30726 bytes
+386 lines, 30743 bytes
 
 ```python
 """
@@ -991,7 +991,7 @@ def standard_page():
 
 def sitemap():
     urls = [SITE + "/answers", SITE + "/standard/forever-proof", SITE + "/forever", SITE + "/bitcoin",
-            SITE + "/bitcoin/code", SITE + "/gateway", SITE + "/standard/ai-decision-receipt"] + [SITE + "/answers/" + a["slug"] for a in ANSWERS]
+            SITE + "/bitcoin/code", SITE + "/gateway", SITE + "/standard/ai-decision-receipt", SITE + "/pilot"] + [SITE + "/answers/" + a["slug"] for a in ANSWERS]
     return ('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
             "".join("  <url><loc>%s</loc><changefreq>weekly</changefreq></url>\n" % u for u in urls) + "</urlset>\n")
 

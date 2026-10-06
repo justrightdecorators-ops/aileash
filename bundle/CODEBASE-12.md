@@ -8,7 +8,7 @@ Contains:
 
 ## `modules/gateway.py`
 
-907 lines, 43873 bytes
+908 lines, 44072 bytes
 
 ```python
 """
@@ -252,7 +252,8 @@ def _event(h, provider, model, endpoint, req_digest, body_json):
     country = (h.headers.get("X-Sebbi-Country") or "UK").strip().upper()[:2] or "UK"
     ev = {"user_id": uid, "action": (h.headers.get("X-Sebbi-Action") or "ai_call").strip()[:60] or "ai_call",
           "amount": _num(h.headers.get("X-Sebbi-Amount"), 0.0),
-          "country": country, "device_id": (h.headers.get("X-Sebbi-Device") or "gateway").strip()[:120] or "gateway",
+          "country": country,
+          "device_id": ((h.headers.get("X-Sebbi-Device") or "").strip() or (uid if uid != "gateway" else "gateway"))[:120],
           "anomaly": _num(h.headers.get("X-Sebbi-Anomaly"), 0.0, 0.0, 1.0),
           "device_risk": _num(h.headers.get("X-Sebbi-Device-Risk"), 0.0, 0.0, 1.0),
           "provider": provider, "model": str(model or "")[:80], "endpoint": endpoint[:120],
@@ -778,7 +779,7 @@ def _gateway_page():
 <h1>Change one line.<br><em>Govern every AI call.</em></h1>
 <p>Point your app's OpenAI or Anthropic base URL at sebbi.pro. Every call is scored before it leaves, stopped if it should be, sealed into the chain, and answered with a receipt anyone can check against Bitcoin. No SDK. No integration project. Your provider key passes straight through.</p>
 </section>
-<section class="card"><h2>1 · Get your gateway URL</h2><p class="sub">Paste your sebbi.pro API key. No key yet? <a href="/connect">Get one free</a> — 90 days, then 50p per device a month.</p>
+<section class="card"><h2>1 · Get your gateway URL</h2><p class="sub">Paste your sebbi.pro API key. No key yet? <a href="/connect">Get one free</a>. Your first 1,000 gateway calls are free; then add a card — 50p per device a month. Want us to set it all up? <a href="/pilot">Governed in 7 days</a>.</p>
 <div class="row"><input type="text" id="k" placeholder="sebbi.pro API key" autocomplete="off"><button class="btn b" id="go">Get my gateway URL</button></div>
 <p class="msg" id="m"></p><pre id="out" hidden></pre></section>
 <section class="card"><h2>2 · Change one line</h2>
@@ -796,7 +797,7 @@ def _gateway_page():
 <div><b>02 · DECIDE</b><p>The engine scores it ALLOW, CHALLENGE or BLOCK in milliseconds and seals the decision.</p></div>
 <div><b>03 · GATE</b><p>BLOCK stops here — the provider is never called. ALLOW streams straight through, token by token.</p></div>
 <div><b>04 · PROVE</b><p>Request and response fingerprints go into Bitcoin. The receipt header ties it all together.</p></div></div>
-<p class="sub">Optional headers: <code>X-Sebbi-User</code> (who the call is for), <code>X-Sebbi-Device</code> (billing meter), <code>X-Sebbi-Country</code>, <code>X-Sebbi-Pack</code> (your Signal Pack), <code>X-Sebbi-On-Challenge: block</code> (hold CHALLENGE calls).</p></section>
+<p class="sub">Optional headers: <code>X-Sebbi-User</code> (who the call is for — also the billing meter unless you send a device), <code>X-Sebbi-Device</code> (billing meter), <code>X-Sebbi-Country</code>, <code>X-Sebbi-Pack</code> (your Signal Pack), <code>X-Sebbi-On-Challenge: block</code> (hold CHALLENGE calls).</p></section>
 </main>""" + N._FOOT + r"""
 <script>
 const $=s=>document.querySelector(s);let O='https://sebbi.pro/g/<your gateway token>/openai/v1',A='https://sebbi.pro/g/<your gateway token>/anthropic',tab='py';

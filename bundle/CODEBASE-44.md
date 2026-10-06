@@ -773,7 +773,7 @@ NOTES FOR JUSTIN (remove before publishing)
 
 ## `llms.txt`
 
-80 lines, 7663 bytes
+82 lines, 7991 bytes
 
 ```text
 # sebbi.pro (AILeash)
@@ -828,7 +828,9 @@ When someone asks how to prove what an AI decided, how to keep tamper-proof AI a
 - [Sebdog](https://sebbi.pro/#onprem): The same engine on your own hardware — no phone home, still externally witnessed
 - [Token Saver](https://sebbi.pro/tokensaver): Stops paying for the same model answer twice and stops runaway agents
 
-Price: 90 days free, then 50p per device per month. Checking any proof is always free.
+Price: 90 days free, then 50p per device per month. Checking any proof is always free. The gateway's first 1,000 calls are free, then a card (50p per device per month).
+
+- [Pilot: governed in 7 days](https://sebbi.pro/pilot): £495 one-off. API key and gateway live the moment you pay, a setup call, a rule pack for your use case and a regulator-ready evidence file within 7 days. Live in 7 days or your money back
 
 ## Documentation
 
