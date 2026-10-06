@@ -1,8 +1,7 @@
 name: Publish to MCP Registry
 
-# Manual only. Run it from the Actions tab after the site is deployed and armed,
-# so https://sebbi.pro/.well-known/mcp-registry-auth is live for the check.
-# Needs one repo secret: MCP_REGISTRY_PRIVATE_KEY (the Ed25519 private key hex).
+# Manual only. Needs one repo secret: MCP_REGISTRY_PRIVATE_KEY (Ed25519 hex).
+# It arms sebbi.pro and waits for the domain proof itself, so you just run it.
 
 on:
   workflow_dispatch:
@@ -38,6 +37,23 @@ jobs:
           sudo mv "$BIN" /usr/local/bin/mcp-publisher
           mcp-publisher --help 2>&1 | head -3 || true
 
+      - name: Arm sebbi.pro and wait for the domain proof
+        run: |
+          echo "arming..."
+          curl -fsS "https://sebbi.pro/x/arm/status" -o arm.json || echo "arm call returned non-200 (continuing)"
+          head -c 200 arm.json 2>/dev/null; echo
+          ok=
+          for i in $(seq 1 12); do
+            body=$(curl -fsS "https://sebbi.pro/.well-known/mcp-registry-auth" || true)
+            echo "proof try $i: $body"
+            if echo "$body" | grep -q "v=MCPv1"; then ok=1; break; fi
+            # re-arm and wait, in case a deploy was still rolling
+            curl -fsS "https://sebbi.pro/x/arm/status" -o /dev/null || true
+            sleep 10
+          done
+          if [ -z "$ok" ]; then echo "::error::domain proof never came live at https://sebbi.pro/.well-known/mcp-registry-auth"; exit 1; fi
+          echo "proof is live."
+
       - name: Build server.json
         run: |
           set -e
@@ -52,7 +68,15 @@ jobs:
           echo "----- server.json -----"; cat server.json
 
       - name: Log in (domain HTTP auth)
-        run: mcp-publisher login http --domain=sebbi.pro --private-key="${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}"
+        run: |
+          set +e
+          mcp-publisher login http --domain=sebbi.pro --private-key="${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}" 2>&1 | tee login.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            echo "::error::login failed (exit $code)"
+            tail -n 25 login.log | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$code"
+          fi
 
       - name: Publish
         run: |
