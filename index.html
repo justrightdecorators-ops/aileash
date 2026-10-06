@@ -524,6 +524,13 @@ body.fieldlock nav,body.fieldlock #rail,body.fieldlock #chip{display:none!import
 #FIELD canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
 #fgl{z-index:1;touch-action:none}
 #flbl{z-index:2;pointer-events:none}
+#fbtcbg{position:absolute;left:50%;top:50%;z-index:1;pointer-events:none;user-select:none;
+  transform:translate(-50%,-52%) rotate(14deg);line-height:1;
+  font-family:'Arial Black','Helvetica Neue',Arial,sans-serif;font-weight:900;
+  font-size:min(82vh,82vw);
+  background:linear-gradient(180deg,#ffe9a8 0%,#f7c14b 45%,#c98f17 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;
+  opacity:.2;filter:drop-shadow(0 0 70px rgba(247,160,26,.4))}
 
 /* ---------- top bar ---------- */
 .fbar{position:absolute;top:0;left:0;right:0;z-index:5;height:30px;display:flex;
@@ -629,6 +636,7 @@ body.fieldlock nav,body.fieldlock #rail,body.fieldlock #chip{display:none!import
 <div id="FIELD" role="dialog" aria-label="AILeash field">
   <canvas id="fgl"></canvas>
   <canvas id="flbl"></canvas>
+  <div id="fbtcbg" aria-hidden="true">&#8383;</div>
 
   <div class="fbar">
     <div class="fm">AILEASH</div>
