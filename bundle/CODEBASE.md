@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-175 files across 51 parts.
+176 files across 52 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -179,32 +179,36 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/sound.py`
 - `modules/spec.py`
+- `modules/spendgate.py`
 - `modules/standard.py`
+
+## [CODEBASE-31.md](CODEBASE-31.md)
+
 - `modules/standing.py`
 - `modules/startpage.py`
 - `modules/stats.py`
 
-## [CODEBASE-31.md](CODEBASE-31.md)
+## [CODEBASE-32.md](CODEBASE-32.md)
 
 - `modules/studio.py`
 
-## [CODEBASE-32.md](CODEBASE-32.md)
+## [CODEBASE-33.md](CODEBASE-33.md)
 
 - `modules/tokensaver.py`
 
-## [CODEBASE-33.md](CODEBASE-33.md)
+## [CODEBASE-34.md](CODEBASE-34.md)
 
 - `modules/toolspage.py`
 - `modules/verifier.py`
 - `modules/walk.py`
 
-## [CODEBASE-34.md](CODEBASE-34.md)
+## [CODEBASE-35.md](CODEBASE-35.md)
 
 - `modules/wallet.py`
 - `modules/warmup.py`
 - `modules/witness.py`
 
-## [CODEBASE-35.md](CODEBASE-35.md)
+## [CODEBASE-36.md](CODEBASE-36.md)
 
 - `modules/witnessed.py`
 - `ai_act_ranker.py`
@@ -214,7 +218,7 @@ Generated automatically on every push. Do not edit by hand.
 - `anchor.py`
 - `brain.py`
 
-## [CODEBASE-36.md](CODEBASE-36.md)
+## [CODEBASE-37.md](CODEBASE-37.md)
 
 - `forever_verify.py`
 - `gateway_proxy.py`
@@ -223,7 +227,7 @@ Generated automatically on every push. Do not edit by hand.
 - `sebbi_benchmark.py`
 - `sebbi_sdk.py`
 
-## [CODEBASE-37.md](CODEBASE-37.md)
+## [CODEBASE-38.md](CODEBASE-38.md)
 
 - `sebbi_site.py`
 - `sebbi_tokensaver.py`
@@ -231,7 +235,7 @@ Generated automatically on every push. Do not edit by hand.
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 
-## [CODEBASE-38.md](CODEBASE-38.md)
+## [CODEBASE-39.md](CODEBASE-39.md)
 
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
@@ -244,21 +248,21 @@ Generated automatically on every push. Do not edit by hand.
 - `AILeash-API-Reference-v6.4.2.md`
 - `LICENCE`
 
-## [CODEBASE-39.md](CODEBASE-39.md)
+## [CODEBASE-40.md](CODEBASE-40.md)
 
 - `README.md`
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 
-## [CODEBASE-40.md](CODEBASE-40.md)
+## [CODEBASE-41.md](CODEBASE-41.md)
 
 - `aileash-game.html`
 - `aitxt-popup-live.html`
 - `brain.html`
 - `certificate.html`
 
-## [CODEBASE-41.md](CODEBASE-41.md)
+## [CODEBASE-42.md](CODEBASE-42.md)
 
 - `compliance-assistant.html`
 - `console.html`
@@ -266,12 +270,12 @@ Generated automatically on every push. Do not edit by hand.
 - `copyright.txt`
 - `data-protection.html`
 
-## [CODEBASE-42.md](CODEBASE-42.md)
+## [CODEBASE-43.md](CODEBASE-43.md)
 
 - `developers.html`
 - `dis.txt`
 
-## [CODEBASE-43.md](CODEBASE-43.md)
+## [CODEBASE-44.md](CODEBASE-44.md)
 
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
@@ -280,11 +284,11 @@ Generated automatically on every push. Do not edit by hand.
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-44.md](CODEBASE-44.md)
+## [CODEBASE-45.md](CODEBASE-45.md)
 
 - `index.html`
 
-## [CODEBASE-45.md](CODEBASE-45.md)
+## [CODEBASE-46.md](CODEBASE-46.md)
 
 - `integration-docs.html`
 - `investor-prospectus.html`
@@ -293,7 +297,7 @@ Generated automatically on every push. Do not edit by hand.
 - `llms.txt`
 - `map.html`
 
-## [CODEBASE-46.md](CODEBASE-46.md)
+## [CODEBASE-47.md](CODEBASE-47.md)
 
 - `notary.html`
 - `pack.html`
@@ -302,13 +306,13 @@ Generated automatically on every push. Do not edit by hand.
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-47.md](CODEBASE-47.md)
+## [CODEBASE-48.md](CODEBASE-48.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-48.md](CODEBASE-48.md)
+## [CODEBASE-49.md](CODEBASE-49.md)
 
 - `scan.html`
 - `seal.html`
@@ -316,17 +320,17 @@ Generated automatically on every push. Do not edit by hand.
 - `signal-packs.html`
 - `sitemap.xml`
 
-## [CODEBASE-49.md](CODEBASE-49.md)
+## [CODEBASE-50.md](CODEBASE-50.md)
 
 - `sonicboom.html`
 - `terms.html`
 
-## [CODEBASE-50.md](CODEBASE-50.md)
+## [CODEBASE-51.md](CODEBASE-51.md)
 
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-51.md](CODEBASE-51.md)
+## [CODEBASE-52.md](CODEBASE-52.md)
 
 - `whitepaper.html`
 

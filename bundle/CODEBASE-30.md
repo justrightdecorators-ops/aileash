@@ -1,12 +1,10 @@
-# Codebase — part 30 of 51
+# Codebase — part 30 of 52
 
 Contains:
 - `modules/sound.py`
 - `modules/spec.py`
+- `modules/spendgate.py`
 - `modules/standard.py`
-- `modules/standing.py`
-- `modules/startpage.py`
-- `modules/stats.py`
 
 
 ## `modules/sound.py`
@@ -663,6 +661,683 @@ def handle(method, action, data, api_key, ctx):
 ```
 
 
+## `modules/spendgate.py`
+
+669 lines, 32540 bytes
+
+```python
+"""
+modules/spendgate.py  v1.0.0  -  Spend Gate: your AI can't spend without a sign-off
+
+    Arm:     https://sebbi.pro/x/arm/status
+    Page:    https://sebbi.pro/spend
+    Verify:  https://sebbi.pro/x/spendgate/verify?token=...
+
+WHAT IT IS
+----------
+An AI agent that wants to spend money - pay an invoice, buy API time, move
+funds, place an order - asks sebbi.pro first. sebbi.pro checks the request
+against the limits you set for that agent, scores it with the live engine,
+seals the decision, and hands back a short SIGNED token:
+
+  APPROVED  a signature naming the exact amount, payee and a few-minute window
+  DENIED    a signed refusal, with the reason
+
+Your own payment system (your bank API, Stripe, a crypto wallet, whatever you
+already use) releases the money only if the token says APPROVED and the
+signature checks out. Over the per-transaction limit, past the daily cap, a
+payee you never allowed, or the engine flags it? No signature. No spend.
+
+sebbi.pro IS THE SIGN-OFF, NOT THE WALLET. It never holds your money, never
+holds the keys to your money, never touches a bank or a chain balance. It
+signs an allow-or-deny decision; your rail enforces it. That keeps you in
+full control and keeps sebbi.pro clear of holding client funds.
+
+HOW THE SIGNATURE WORKS
+-----------------------
+The token is signed with the same Ed25519 key that signs every authority
+proof (continuity.py). Anyone can check it with a standard library and the
+published key at https://sebbi.pro/x/continuity/pubkey - no call to us, no
+trust in us. Every request, approval and refusal is sealed in the chain and
+provable against Bitcoin like everything else on sebbi.pro.
+
+ROUTES  (/x/spendgate/<action>)
+------
+  GET  status, spec, pubkey, verify?token=                         public
+  GET  policy?agent=                                               API key - read an agent's limits
+  POST policy  {agent, per_tx, daily, currency, payees[]}          API key - set them
+  POST request {agent, amount, currency, payee, reason}            API key - ask to spend
+  POST confirm {token}                                             API key - mark it actually spent (one-shot)
+  GET  grants?agent=                                               API key - recent decisions
+Amounts are whole pounds in "amount"/"per_tx"/"daily", or exact pence in
+"amount_pence"/"per_tx_pence"/"daily_pence".
+"""
+
+import base64
+import binascii
+import importlib.util
+import json
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+SITE = "https://sebbi.pro"
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "pubkey"), ("GET", "verify"), ("GET", "")}
+
+TOKEN_TAG = "sbg1"
+SIG_PREFIX = b"AILEASH-SPENDGATE-v1:"
+TTL = int(os.environ.get("SPENDGATE_TTL", "900"))          # a token is spendable for 15 minutes
+MAX_PENCE = 10 ** 11                                        # £1,000,000,000 sanity ceiling
+AGENT_RE = re.compile(r"^[A-Za-z0-9 ._:-]{1,80}$")
+CUR_RE = re.compile(r"^[A-Za-z]{3}$")
+PAYEE_RE = re.compile(r"^[A-Za-z0-9 @._:+/-]{1,120}$")
+
+_state = {"ready": False, "pages": False, "mcp": False, "last_error": None,
+          "requests": 0, "approved": 0, "denied": 0, "confirmed": 0}
+_lock = threading.Lock()
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if not hasattr(m, "get_bearer"):
+        m = sys.modules.get("server")
+    return m
+
+
+def _C():
+    for m in list(sys.modules.values()):
+        f = getattr(m, "__file__", "") or ""
+        if f.endswith("continuity.py") and hasattr(m, "_keys") and hasattr(m, "_ed_signature"):
+            return m
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "continuity.py")
+    spec = importlib.util.spec_from_file_location("spendgate_continuity", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _ctx():
+    s = _srv()
+    return {"conn": s._conn, "lock": s._db_lock, "seal": s.seal, "get_key": s.get_key}
+
+
+def _iso(ts):
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _b64e(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _b64d(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _db(sql, args=(), one=False, write=False):
+    s = _srv()
+    with s._db_lock:
+        cur = s._conn.execute(sql, args)
+        if write:
+            s._conn.commit()
+            return cur.lastrowid
+        return cur.fetchone() if one else cur.fetchall()
+
+
+def _setup():
+    s = _srv()
+    with s._db_lock:
+        c = s._conn
+        c.execute("CREATE TABLE IF NOT EXISTS spendgate_policy(api_key TEXT, agent TEXT, per_tx_pence INTEGER,"
+                  "daily_pence INTEGER, currency TEXT, payees_json TEXT, updated REAL, PRIMARY KEY(api_key, agent))")
+        c.execute("CREATE TABLE IF NOT EXISTS spendgate_grant(id TEXT PRIMARY KEY, api_key TEXT, agent TEXT,"
+                  "amount_pence INTEGER, currency TEXT, payee TEXT, reason TEXT, decision TEXT, reasons TEXT,"
+                  "issued REAL, expires REAL, token_digest TEXT, block_index INTEGER, audit_hash TEXT,"
+                  "confirmed INTEGER DEFAULT 0, confirmed_at REAL)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sg_grant ON spendgate_grant(api_key, agent, issued)")
+        c.commit()
+
+
+# ---------------------------------------------------------------------------
+# money helpers
+# ---------------------------------------------------------------------------
+
+def _pence(data, whole_key, pence_key):
+    if data.get(pence_key) is not None:
+        v = data.get(pence_key)
+    elif data.get(whole_key) is not None:
+        try:
+            v = round(float(data.get(whole_key)) * 100)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    if v < 0 or v > MAX_PENCE:
+        return None
+    return v
+
+
+def _money(pence, currency):
+    sym = {"GBP": "£", "USD": "$", "EUR": "€"}.get(currency.upper(), "")
+    return "%s%s%s" % (sym, "{:,.2f}".format(pence / 100.0), "" if sym else " " + currency.upper())
+
+
+# ---------------------------------------------------------------------------
+# policy
+# ---------------------------------------------------------------------------
+
+def _get_policy(api_key, agent):
+    r = _db("SELECT per_tx_pence, daily_pence, currency, payees_json FROM spendgate_policy WHERE api_key=? AND agent=?",
+            (api_key, agent), one=True)
+    if not r:
+        return None
+    try:
+        payees = json.loads(r[3]) if r[3] else []
+    except Exception:
+        payees = []
+    return {"per_tx_pence": r[0], "daily_pence": r[1], "currency": r[2], "payees": payees}
+
+
+def set_policy(api_key, data):
+    agent = str(data.get("agent", "")).strip()
+    if not AGENT_RE.match(agent):
+        return {"error": "bad_agent", "message": "Name the agent, e.g. 'billing-bot' or 'buyer-agent-1'."}, 400
+    per_tx = _pence(data, "per_tx", "per_tx_pence")
+    daily = _pence(data, "daily", "daily_pence")
+    if per_tx is None or daily is None:
+        return {"error": "limits_required", "message": "Set per_tx and daily (in pounds), the most this agent may spend per payment and per day."}, 400
+    currency = str(data.get("currency", "GBP")).strip().upper()
+    if not CUR_RE.match(currency):
+        currency = "GBP"
+    payees = data.get("payees") or []
+    if isinstance(payees, str):
+        payees = [p.strip() for p in re.split(r"[\n,]+", payees) if p.strip()]
+    clean = []
+    for p in payees[:200]:
+        p = str(p).strip()
+        if p and PAYEE_RE.match(p):
+            clean.append(p[:120])
+    _db("INSERT INTO spendgate_policy(api_key,agent,per_tx_pence,daily_pence,currency,payees_json,updated) "
+        "VALUES(?,?,?,?,?,?,?) ON CONFLICT(api_key,agent) DO UPDATE SET per_tx_pence=excluded.per_tx_pence,"
+        "daily_pence=excluded.daily_pence,currency=excluded.currency,payees_json=excluded.payees_json,updated=excluded.updated",
+        (api_key, agent, per_tx, daily, currency, json.dumps(clean), time.time()), write=True)
+    return {"ok": True, "agent": agent, "per_transaction": _money(per_tx, currency), "daily": _money(daily, currency),
+            "currency": currency, "allowed_payees": clean or "any (no allow-list set)",
+            "note": "Set an allow-list of payees to refuse any payment to anyone else."}, 200
+
+
+def _spent_today(api_key, agent):
+    t0 = time.time() - time.time() % 86400
+    r = _db("SELECT COALESCE(SUM(amount_pence),0) FROM spendgate_grant WHERE api_key=? AND agent=? AND decision='APPROVED' "
+            "AND issued>=? AND (confirmed=1 OR expires>?)", (api_key, agent, t0, time.time()), one=True)
+    return r[0] if r else 0
+
+
+# ---------------------------------------------------------------------------
+# the signed token
+# ---------------------------------------------------------------------------
+
+def _sign(body):
+    C = _C()
+    seed, pk, _ = C._keys(_ctx())
+    raw = _canon(body).encode("utf-8")
+    sig = C._ed_signature(SIG_PREFIX + raw, seed, pk)
+    return "%s.%s.%s" % (TOKEN_TAG, _b64e(raw), _b64e(sig))
+
+
+def _open(token):
+    try:
+        tag, b, s = str(token).strip().split(".")
+        if tag != TOKEN_TAG:
+            return None, "not a sebbi.pro Spend Gate token (expected %s.)" % TOKEN_TAG
+        raw, sig = _b64d(b), _b64d(s)
+        body = json.loads(raw)
+    except Exception:
+        return None, "malformed token"
+    C = _C()
+    _seed, pk, _ = C._keys(_ctx())
+    if not C._ed_checkvalid(sig, SIG_PREFIX + raw, pk):
+        return None, "signature does not verify against the published key"
+    return body, None
+
+
+def _digest(token):
+    import hashlib
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# request a spend
+# ---------------------------------------------------------------------------
+
+def request(api_key, data):
+    agent = str(data.get("agent", "")).strip()
+    if not AGENT_RE.match(agent):
+        return {"error": "bad_agent", "message": "Name the agent making the payment."}, 400
+    amount = _pence(data, "amount", "amount_pence")
+    if amount is None or amount <= 0:
+        return {"error": "bad_amount", "message": "Send the amount to spend, e.g. {\"amount\": 49.99}."}, 400
+    payee = str(data.get("payee", "")).strip()
+    if not payee or not PAYEE_RE.match(payee):
+        return {"error": "bad_payee", "message": "Name who is being paid."}, 400
+    reason = re.sub(r"[\x00-\x1f]", "", str(data.get("reason", "")))[:200]
+    currency = str(data.get("currency", "")).strip().upper()
+    policy = _get_policy(api_key, agent)
+    if not policy:
+        return {"error": "no_policy", "message": "No spending limits set for agent '%s'. Set them first: POST "
+                "%s/x/spendgate/policy {agent, per_tx, daily}." % (agent, SITE)}, 409
+    currency = currency if CUR_RE.match(currency or "") else policy["currency"]
+    _state["requests"] += 1
+
+    problems = []
+    if amount > policy["per_tx_pence"]:
+        problems.append("over the per-transaction limit of %s" % _money(policy["per_tx_pence"], policy["currency"]))
+    spent = _spent_today(api_key, agent)
+    if spent + amount > policy["daily_pence"]:
+        problems.append("would take today's spend past the daily cap of %s (already %s)" %
+                        (_money(policy["daily_pence"], policy["currency"]), _money(spent, policy["currency"])))
+    if policy["payees"] and payee not in policy["payees"]:
+        problems.append("payee '%s' is not on the allow-list" % payee)
+    if currency != policy["currency"]:
+        problems.append("currency %s does not match the agent's policy currency %s" % (currency, policy["currency"]))
+
+    # risk score through the live engine (this also seals the decision in the chain)
+    engine = {}
+    block = seal = None
+    try:
+        s = _srv()
+        ev = {"user_id": agent[:120], "action": "agent_spend", "amount": round(amount / 100.0, 2),
+              "country": str(data.get("country", "UK")).strip().upper()[:2] or "UK",
+              "device_id": ("spend:" + agent)[:120], "anomaly": 0, "device_risk": 0,
+              "payee": payee, "currency": currency, "reason": reason, "via": "spendgate/1"}
+        res, st = s.govern(ev, api_key)
+        if st == 200:
+            engine = res
+            block, seal = res.get("block_index"), res.get("audit_hash")
+            if res.get("decision") == "BLOCK":
+                problems.append("the engine blocked this payment (%s)" % ", ".join(res.get("reasons") or []) or "risk")
+            elif res.get("decision") == "CHALLENGE":
+                problems.append("the engine flagged this payment for human review")
+        else:
+            return {"error": res.get("error", "engine_error"), "message": res.get("message", "The engine refused the request.")}, st
+    except Exception as e:
+        _state["last_error"] = "govern: %s" % str(e)[:150]
+        problems.append("could not reach the scoring engine")
+
+    gid = "SG-" + secrets.token_hex(8)
+    now = time.time()
+    decision = "APPROVED" if not problems else "DENIED"
+    exp = now + TTL if decision == "APPROVED" else now
+    body = {"v": 1, "iss": "sebbi.pro", "grant": gid, "decision": decision, "agent": agent,
+            "amount_pence": amount, "currency": currency, "payee": payee,
+            "issued": int(now), "expires": int(exp), "block": block}
+    if decision == "DENIED":
+        body["reasons"] = problems
+    token = _sign(body)
+    _db("INSERT INTO spendgate_grant(id,api_key,agent,amount_pence,currency,payee,reason,decision,reasons,issued,"
+        "expires,token_digest,block_index,audit_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (gid, api_key, agent, amount, currency, payee, reason, decision, json.dumps(problems), now, exp,
+         _digest(token), block, seal), write=True)
+    _state["approved" if decision == "APPROVED" else "denied"] += 1
+
+    out = {"decision": decision, "grant": gid, "agent": agent, "amount": _money(amount, currency), "payee": payee,
+           "token": token, "sealed_in_chain": seal, "block_index": block,
+           "verify": "%s/x/spendgate/verify?token=%s" % (SITE, token[:16] + "..."),
+           "engine_decision": engine.get("decision")}
+    if decision == "APPROVED":
+        out["expires_utc"] = _iso(exp)
+        out["spend_instruction"] = ("Release the payment only now, and record this token. It is valid once, until "
+                                    "%s. Confirm it with POST %s/x/spendgate/confirm once the money has moved." % (_iso(exp), SITE))
+        out["message"] = "Approved. %s to %s." % (_money(amount, currency), payee)
+    else:
+        out["reasons"] = problems
+        out["message"] = "Denied: " + "; ".join(problems) + ". Do not release the payment."
+    return out, 200
+
+
+def verify(token):
+    body, err = _open(token)
+    if err:
+        return {"valid": False, "problem": err}, 200
+    now = time.time()
+    expired = body.get("decision") == "APPROVED" and now > float(body.get("expires", 0))
+    g = _db("SELECT decision, confirmed, confirmed_at FROM spendgate_grant WHERE id=?", (body.get("grant"),), one=True)
+    out = {"valid": True, "decision": body.get("decision"), "agent": body.get("agent"),
+           "amount": _money(int(body.get("amount_pence", 0)), body.get("currency", "GBP")),
+           "amount_pence": body.get("amount_pence"), "currency": body.get("currency"), "payee": body.get("payee"),
+           "grant": body.get("grant"), "issued_utc": _iso(body.get("issued")), "expires_utc": _iso(body.get("expires")),
+           "sealed_block": body.get("block"), "signature": "verified against the published Ed25519 key",
+           "pubkey": "%s/x/continuity/pubkey" % SITE}
+    if body.get("reasons"):
+        out["reasons"] = body["reasons"]
+    if body.get("decision") == "APPROVED":
+        if expired:
+            out["spendable"] = False
+            out["problem"] = "this approval has expired - ask again"
+        elif g and g[1]:
+            out["spendable"] = False
+            out["problem"] = "already spent (confirmed %s)" % _iso(g[2])
+        else:
+            out["spendable"] = True
+            out["message"] = "Release this payment. Valid once, until %s." % _iso(body.get("expires"))
+    else:
+        out["spendable"] = False
+    return out, 200
+
+
+def confirm(api_key, data):
+    token = str(data.get("token", "")).strip()
+    body, err = _open(token)
+    if err:
+        return {"error": "bad_token", "problem": err}, 400
+    gid = body.get("grant")
+    g = _db("SELECT api_key, decision, confirmed, expires FROM spendgate_grant WHERE id=?", (gid,), one=True)
+    if not g or g[0] != api_key:
+        return {"error": "not_found", "message": "No such grant for this key."}, 404
+    if g[1] != "APPROVED":
+        return {"error": "not_approved", "message": "That payment was denied; nothing to confirm."}, 409
+    if g[2]:
+        return {"error": "already_confirmed", "message": "This approval was already spent."}, 409
+    if time.time() > float(g[3]):
+        return {"error": "expired", "message": "This approval expired before it was spent. Ask again."}, 409
+    _db("UPDATE spendgate_grant SET confirmed=1, confirmed_at=? WHERE id=?", (time.time(), gid), write=True)
+    _state["confirmed"] += 1
+    return {"ok": True, "grant": gid, "message": "Recorded as spent. It cannot be used again."}, 200
+
+
+def grants(api_key, agent=None):
+    if agent:
+        rows = _db("SELECT id,agent,amount_pence,currency,payee,decision,issued,confirmed FROM spendgate_grant "
+                   "WHERE api_key=? AND agent=? ORDER BY issued DESC LIMIT 100", (api_key, agent))
+    else:
+        rows = _db("SELECT id,agent,amount_pence,currency,payee,decision,issued,confirmed FROM spendgate_grant "
+                   "WHERE api_key=? ORDER BY issued DESC LIMIT 100", (api_key,))
+    return {"grants": [{"grant": r[0], "agent": r[1], "amount": _money(r[2], r[3]), "payee": r[4], "decision": r[5],
+                        "utc": _iso(r[6]), "spent": bool(r[7])} for r in rows]}, 200
+
+
+# ---------------------------------------------------------------------------
+# AI connector tools
+# ---------------------------------------------------------------------------
+
+MCP_TOOLS = [
+    {"name": "sebbi_spend_policy",
+     "description": "Set the spending limits for an AI agent: the most it may pay in one go and per day, and optionally an "
+                    "allow-list of payees. Must be set before the agent can be approved to spend.",
+     "inputSchema": {"type": "object", "required": ["api_key", "agent", "per_tx", "daily"],
+                     "properties": {"api_key": {"type": "string"}, "agent": {"type": "string"},
+                                    "per_tx": {"type": "number", "description": "Max per payment, in pounds"},
+                                    "daily": {"type": "number", "description": "Max per day, in pounds"},
+                                    "currency": {"type": "string"}, "payees": {"type": "array", "items": {"type": "string"}}}}},
+    {"name": "sebbi_spend_request",
+     "description": "Ask sebbi.pro to approve a payment before an AI agent makes it. Returns a signed APPROVED or DENIED "
+                    "token. Only release the money if it is APPROVED and spendable. sebbi.pro never holds the money.",
+     "inputSchema": {"type": "object", "required": ["api_key", "agent", "amount", "payee"],
+                     "properties": {"api_key": {"type": "string"}, "agent": {"type": "string"},
+                                    "amount": {"type": "number", "description": "Amount in pounds"},
+                                    "payee": {"type": "string"}, "reason": {"type": "string"}, "currency": {"type": "string"}}}},
+    {"name": "sebbi_spend_verify",
+     "description": "Check a Spend Gate token's signature and whether it may still be spent. Anyone can call this; no key needed.",
+     "inputSchema": {"type": "object", "required": ["token"], "properties": {"token": {"type": "string"}}}},
+]
+
+
+def _install_mcp():
+    if _state["mcp"]:
+        return True
+    try:
+        try:
+            from modules import mcp as M
+        except Exception:
+            import mcp as M
+    except Exception as e:
+        _state["last_error"] = "mcp: %s" % e
+        return False
+    if getattr(M, "_spendgate_tools", False):
+        _state["mcp"] = True
+        return True
+    names = {t["name"] for t in M.TOOLS}
+    for t in MCP_TOOLS:
+        if t["name"] not in names:
+            M.TOOLS.append(t)
+    original = M._call
+
+    def _call(name, a, ip, agent):
+        if name not in ("sebbi_spend_policy", "sebbi_spend_request", "sebbi_spend_verify"):
+            return original(name, a, ip, agent)
+        a = a or {}
+        if name == "sebbi_spend_verify":
+            return verify(a.get("token"))
+        key = str(a.get("api_key") or "").strip()
+        if not key or not _srv().get_key(key):
+            return {"error": "invalid_api_key", "message": "Open an account first with sebbi_create_account."}, 401
+        if name == "sebbi_spend_policy":
+            return set_policy(key, a)
+        return request(key, a)
+
+    M._call = _call
+    note = (" To stop an AI agent spending without a sign-off: set limits with sebbi_spend_policy, then call "
+            "sebbi_spend_request before every payment and release money only on an APPROVED, spendable token.")
+    if isinstance(getattr(M, "INSTRUCTIONS", None), str) and note not in M.INSTRUCTIONS:
+        M.INSTRUCTIONS = M.INSTRUCTIONS + note
+    M._spendgate_tools = True
+    _state["mcp"] = True
+    return True
+
+
+# ---------------------------------------------------------------------------
+# page
+# ---------------------------------------------------------------------------
+
+def _N():
+    try:
+        from modules import notary as N
+    except Exception:
+        import notary as N
+    return N
+
+
+def _send(h, body, ctype):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    h.send_response(200)
+    h.send_header("Content-Type", ctype)
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", "public, max-age=120")
+    h.end_headers()
+    if getattr(h, "command", "GET") != "HEAD":
+        h.wfile.write(body)
+
+
+def _page():
+    N = _N()
+    body = r"""<title>Spend Gate — your AI can't spend without a sign-off — sebbi.pro</title>
+<meta name="description" content="Your AI agent can't pay a penny without sebbi.pro signing off. Set the limits, it asks before every payment, and you get a signed yes or no — provable against Bitcoin. sebbi.pro is the sign-off, never your wallet.">
+</head><body>""" + N._TOP + r"""
+<main class="wrap">
+<section class="hero">
+<div class="kick"><i></i>SPEND GATE · NEW</div>
+<h1>Your AI can't spend<br>without a <em>sign-off.</em></h1>
+<p>Give an AI agent money to spend and you're trusting it not to go wrong. Spend Gate takes that on trust away. The agent asks sebbi.pro before every payment, it's checked against the limits you set and scored by the engine, and you get back a signed yes or no. Over the limit, wrong payee, acting out of line? No signature. No spend.</p>
+<p class="sub" style="margin-top:14px;max-width:60ch"><b>sebbi.pro is the sign-off, never your wallet.</b> It never holds your money or the keys to it. It signs the decision; your own payment system releases the money only if the signature says yes.</p>
+</section>
+
+<section class="card" id="try">
+<h2>Try it</h2>
+<p class="sub">A live agent with a £100-per-payment limit and a £250 daily cap. Paste your sebbi.pro key, or just watch the decisions — every one is sealed and provable.</p>
+<div class="row"><input type="text" id="k" placeholder="sebbi.pro API key (needed to set limits and request)" autocomplete="off"></div>
+<div class="row"><button class="btn b" id="setup">1 · Set this agent's limits</button><span class="msg" id="m1"></span></div>
+<div style="height:1px;background:var(--line);margin:14px 0"></div>
+<div class="row" style="align-items:flex-end;gap:14px">
+<div style="flex:1;min-width:120px"><label class="sub">Pay how much?</label><input type="number" id="amt" value="50" min="1" step="1"></div>
+<div style="flex:2;min-width:160px"><label class="sub">To whom?</label><input type="text" id="pay" value="AWS" placeholder="payee"></div>
+</div>
+<div class="row"><button class="btn b" id="ask">2 · Ask to spend</button><span class="msg" id="m2"></span></div>
+<div id="verdict"></div>
+</section>
+
+<section class="card">
+<h2>How your code uses it</h2>
+<p class="sub">One call before the agent pays. Release the money only on an approved, spendable token.</p>
+<pre>POST https://sebbi.pro/x/spendgate/request
+{ "api_key": "YOUR_KEY", "agent": "billing-bot",
+  "amount": 49.99, "payee": "AWS", "reason": "monthly compute" }
+
+-> { "decision": "APPROVED", "token": "sbg1.…", "expires_utc": "…" }
+   release the payment, then POST /x/spendgate/confirm { token }
+
+-> { "decision": "DENIED", "reasons": ["over the per-transaction limit"] }
+   do not pay</pre>
+<p class="sub" style="margin-top:12px">Anyone can check a token's signature against the published key, with no call to us: <a href="/x/continuity/pubkey">/x/continuity/pubkey</a>. Or let an AI assistant run it all — connect <a href="/connect">https://sebbi.pro/mcp</a> and ask it to gate a payment.</p>
+</section>
+
+<section class="card">
+<h2>Why it holds</h2>
+<div class="how">
+<div><b>YOU SET THE RULES</b><p>Per-payment limit, daily cap, an allow-list of who can ever be paid. Per agent.</p></div>
+<div><b>IT ASKS FIRST</b><p>Every payment is scored by the live engine and checked against your rules before a penny moves.</p></div>
+<div><b>SIGNED YES OR NO</b><p>A short Ed25519-signed token, valid once, for a few minutes. Anyone can verify it.</p></div>
+<div><b>SEALED FOREVER</b><p>Every approval and refusal is in the chain and provable against Bitcoin.</p></div>
+</div>
+</section>
+</main>""" + N._FOOT + r"""
+<script>
+const $=s=>document.querySelector(s);
+function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function post(p,b){const h={'Content-Type':'application/json'};const k=$('#k').value.trim();if(k)h['Authorization']='Bearer '+k;
+ const r=await fetch(p,{method:'POST',headers:h,body:JSON.stringify(b)});return[r.status,await r.json()]}
+$('#setup').onclick=async()=>{$('#m1').className='msg';$('#m1').textContent='Setting limits…';
+ try{const[st,d]=await post('/x/spendgate/policy',{agent:'demo-agent',per_tx:100,daily:250,currency:'GBP',payees:['AWS','OpenAI','Anthropic','Stripe']});
+  if(st!==200)throw Error(d.message||d.error);$('#m1').className='msg ok';$('#m1').textContent='Limits set: £100 per payment, £250 a day, payees AWS / OpenAI / Anthropic / Stripe.';}
+ catch(e){$('#m1').className='msg err';$('#m1').textContent=e.message}};
+$('#ask').onclick=async()=>{$('#m2').className='msg';$('#m2').textContent='Asking sebbi.pro…';$('#verdict').innerHTML='';
+ try{const[st,d]=await post('/x/spendgate/request',{agent:'demo-agent',amount:Number($('#amt').value||0),payee:$('#pay').value.trim()||'AWS',reason:'demo'});
+  if(st!==200)throw Error(d.message||d.error);$('#m2').textContent='';
+  const ok=d.decision==='APPROVED';
+  $('#verdict').innerHTML='<div class="verdict'+(ok?'':' bad')+'"><h3>'+(ok?'Approved':'Denied')+' — '+esc(d.amount)+' to '+esc(d.payee)+'</h3><p>'+esc(d.message)+'</p>'+(d.block?'<p class="sub" style="margin-top:8px">Sealed in block '+d.block+' · <a href="/forever?block='+d.block+'">check it against Bitcoin</a></p>':'')+'</div>';}
+ catch(e){$('#m2').className='msg err';$('#m2').textContent=e.message}};
+</script></body></html>"""
+    return N._page(N._HEAD + body)
+
+
+def _install_pages():
+    if _state["pages"]:
+        return True
+    H = getattr(_srv(), "Handler", None)
+    if H is None:
+        return False
+    if getattr(H, "_spendgate_pages", False):
+        _state["pages"] = True
+        return True
+    orig = H.do_GET
+
+    def do_GET(self):
+        p = (self.path or "").split("?")[0].rstrip("/")
+        try:
+            if p == "/spend":
+                return _send(self, _page(), "text/html; charset=utf-8")
+        except Exception as e:
+            _state["last_error"] = "page: %s" % str(e)[:150]
+        return orig(self)
+
+    H.do_GET = do_GET
+    H._spendgate_pages = True
+    _state["pages"] = True
+    return True
+
+
+def arm(ctx=None):
+    with _lock:
+        if not _state["ready"]:
+            _setup()
+            _state["ready"] = True
+        _install_pages()
+        try:
+            _install_mcp()
+        except Exception as e:
+            _state["last_error"] = "mcp: %s" % str(e)[:150]
+
+
+# ---------------------------------------------------------------------------
+# router entry
+# ---------------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    try:
+        arm(ctx)
+    except Exception as e:
+        _state["last_error"] = "arm: %s" % str(e)[:150]
+    data = data or {}
+    if action in ("", "status"):
+        return {"module": "spendgate", "version": VERSION, "armed": _state["pages"], "page": SITE + "/spend",
+                "ai_connector_tools": _state["mcp"], "since_start": {k: _state[k] for k in ("requests", "approved", "denied", "confirmed")},
+                "holds_funds": False, "last_error": _state["last_error"]}, 200
+    if action == "spec":
+        return {"module": "spendgate", "version": VERSION,
+                "what": "An AI agent must get a signed sign-off from sebbi.pro before it spends. sebbi.pro checks the "
+                        "limits you set, scores the payment, seals the decision, and signs APPROVED or DENIED. Your own "
+                        "payment system enforces it. sebbi.pro never holds funds or the keys to funds.",
+                "token": {"format": "%s.<base64 body>.<base64 Ed25519 signature>" % TOKEN_TAG,
+                          "signed_with": "the continuity.py key at %s/x/continuity/pubkey" % SITE,
+                          "fields": "v, iss, grant, decision, agent, amount_pence, currency, payee, issued, expires, block",
+                          "ttl_seconds": TTL},
+                "routes": {"policy": "POST %s/x/spendgate/policy {agent, per_tx, daily, currency, payees[]}" % SITE,
+                           "request": "POST %s/x/spendgate/request {agent, amount, payee, reason}" % SITE,
+                           "verify": "GET %s/x/spendgate/verify?token=..." % SITE,
+                           "confirm": "POST %s/x/spendgate/confirm {token}" % SITE,
+                           "grants": "GET %s/x/spendgate/grants?agent=..." % SITE,
+                           "pubkey": "%s/x/spendgate/pubkey" % SITE},
+                "holds_funds": False}, 200
+    if action == "pubkey":
+        C = _C()
+        _seed, pk, source = C._keys(_ctx())
+        return {"algorithm": "Ed25519", "public_key": binascii.hexlify(pk).decode(), "key_source": source,
+                "signs": "Spend Gate approval and refusal tokens", "prefix": SIG_PREFIX.decode()}, 200
+    if action == "verify":
+        return verify(data.get("token"))
+    if action == "policy":
+        if not api_key:
+            return {"error": "api_key_required"}, 401
+        if method == "POST":
+            return set_policy(api_key, data)
+        pol = _get_policy(api_key, str(data.get("agent", "")).strip())
+        if not pol:
+            return {"error": "no_policy"}, 404
+        return {"agent": str(data.get("agent", "")).strip(), "per_transaction": _money(pol["per_tx_pence"], pol["currency"]),
+                "daily": _money(pol["daily_pence"], pol["currency"]), "currency": pol["currency"],
+                "allowed_payees": pol["payees"] or "any (no allow-list set)"}, 200
+    if action == "request" and method == "POST":
+        if not api_key:
+            return {"error": "api_key_required"}, 401
+        return request(api_key, data)
+    if action == "confirm" and method == "POST":
+        if not api_key:
+            return {"error": "api_key_required"}, 401
+        return confirm(api_key, data)
+    if action == "grants":
+        if not api_key:
+            return {"error": "api_key_required"}, 401
+        return grants(api_key, str(data.get("agent", "")).strip() or None)
+    return {"error": "unknown_action", "action": action}, 404
+
+```
+
+
 ## `modules/standard.py`
 
 422 lines, 19423 bytes
@@ -1089,836 +1764,5 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "GET": ["status", "hash", "document"]}, 404
-
-```
-
-
-## `modules/standing.py`
-
-378 lines, 15691 bytes
-
-```python
-#!/usr/bin/env python3
-"""
-modules/standing.py  -  Temporal Standing Test runner
-=====================================================
-
-Runs the published protocol at
-https://studio.moralclarity.ai/temporal-standing-test
-against the live authority engine (modules/continuity.py), on production,
-and preserves what was observed.
-
-    GET /x/standing/status             what is frozen, what has run    (public)
-    GET /x/standing/freeze             seal implementation + claim     (public)
-    GET /x/standing/run                run both branches, seal result  (public)
-    GET /x/standing/evidence?run=<id>  the full evidence package       (public)
-    GET /x/standing/runs               every run, pass or fail         (public)
-
-Freeze first. A run is refused unless the files deployed now are byte for
-byte the files that were frozen, so the claim cannot be adjusted after a
-result is seen. Every run is kept and listed, including failures.
-"""
-
-import hashlib
-import importlib.util
-import json
-import os
-import random
-import sys
-import time
-import uuid
-from datetime import datetime, timezone
-
-VERSION = "1.0.0"
-
-PUBLIC = {("GET", "status"), ("GET", "freeze"), ("GET", "run"),
-          ("GET", "evidence"), ("GET", "runs")}
-
-PROTOCOL = "https://studio.moralclarity.ai/temporal-standing-test"
-BASE = "https://sebbi.pro/x/standing/"
-TEST_KEY = "public-standing-test"
-CAP = "tst.record.write"
-SIBLING_CAP = "tst.record.read"
-PURPOSE = "temporal-standing-test"
-MIN_GAP = 600          # seconds between runs
-MAX_PER_DAY = 6
-
-PROPOSITION = (
-    "Execution authority established at T0 is re-established at the consequence "
-    "boundary (continuity confirm) before an action binds. A change that defeats "
-    "the exercised authority lineage prevents binding; a change outside that "
-    "lineage does not.")
-
-FALSIFIER = {
-    "case_A_standing_defeating":
-        "T0: grants G and sibling S issued by a human principal; exercise under G "
-        "returns ALLOW. dN: G is revoked. Tn: confirm must return bound=false AND the "
-        "consequence table must gain no row. Any binding or any row is a FAIL.",
-    "case_B_standing_preserving":
-        "T0: identical setup. dN: sibling S is revoked (a real authority change "
-        "outside the exercised lineage). Tn: confirm must return bound=true AND the "
-        "consequence table must gain exactly one row. A refusal is a FAIL.",
-    "malformed":
-        "If the T0 exercise in either case does not return ALLOW, standing was never "
-        "established and the run is UNRESOLVED, neither PASS nor FAIL.",
-}
-
-SCOPE = ("Authority-class dN (revocation) only, on the continuity exercise -> confirm "
-         "path of this deployment. Nothing beyond the frozen implementation and this "
-         "change class is claimed.")
-
-_ready = False
-
-
-def _iso(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
-
-
-def _canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _sha_file(path):
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
-
-
-def _continuity():
-    """The engine under test - the copy the router already loaded if possible."""
-    for m in list(sys.modules.values()):
-        f = getattr(m, "__file__", "") or ""
-        if f.endswith("continuity.py") and hasattr(m, "_confirm") and hasattr(m, "_evaluate"):
-            return m
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "continuity.py")
-    spec = importlib.util.spec_from_file_location("standing_continuity", path)
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
-
-
-def _implementation(C):
-    return {
-        "continuity_version": getattr(C, "VERSION", None),
-        "continuity_sha256": _sha_file(C.__file__),
-        "standing_version": VERSION,
-        "standing_sha256": _sha_file(os.path.abspath(__file__)),
-        "proposition": PROPOSITION,
-        "falsifier": FALSIFIER,
-        "scope": SCOPE,
-        "protocol": PROTOCOL,
-    }
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS standing_freeze(id TEXT PRIMARY KEY,"
-                  "digest TEXT UNIQUE,impl TEXT,created REAL,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE TABLE IF NOT EXISTS standing_run(id TEXT PRIMARY KEY,freeze_id TEXT,"
-                  "result TEXT,package TEXT,digest TEXT,created REAL,audit_hash TEXT,"
-                  "block_index INTEGER)")
-        c.execute("CREATE TABLE IF NOT EXISTS standing_effect(id INTEGER PRIMARY KEY "
-                  "AUTOINCREMENT,run_id TEXT,case_id TEXT,evaluation TEXT,created REAL)")
-        c.commit()
-    _ready = True
-
-
-def _seal(ctx, kind, detail, extra=None):
-    now = time.time()
-    ev = {"user_id": "tst:standing", "action": kind, "amount": 0, "country": "UK",
-          "device_id": "standing", "anomaly": 0, "device_risk": 0}
-    res = {"decision": kind.upper(), "score": 0, "standing_version": VERSION,
-           "detail": detail}
-    if extra:
-        res.update(extra)
-    out = ctx["seal"](ev, res, now, TEST_KEY)
-    audit_hash = out[0] if isinstance(out, (list, tuple)) else out
-    block = out[1] if isinstance(out, (list, tuple)) and len(out) > 1 else None
-    return audit_hash, block, now
-
-
-def _current_freeze(ctx, digest):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT id,created,audit_hash,block_index FROM standing_freeze WHERE digest=?",
-            (digest,)).fetchone()
-
-
-# ----------------------------------------------------------------------
-
-def _freeze(ctx):
-    C = _continuity()
-    impl = _implementation(C)
-    digest = hashlib.sha256(_canon(impl).encode()).hexdigest()
-    row = _current_freeze(ctx, digest)
-    if row:
-        return {"frozen": True, "already": True, "freeze": row[0], "digest": digest,
-                "sealed_at": _iso(row[1]), "sealed_in_chain": row[2], "block_index": row[3],
-                "implementation": impl, "next": BASE + "run"}, 200
-    fid = "f_" + uuid.uuid4().hex[:16]
-    audit_hash, block, now = _seal(ctx, "standing_frozen",
-                                   "freeze=%s;digest=%s" % (fid, digest),
-                                   {"freeze": fid, "freeze_digest": digest,
-                                    "continuity_sha256": impl["continuity_sha256"],
-                                    "standing_sha256": impl["standing_sha256"]})
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO standing_freeze VALUES(?,?,?,?,?,?)",
-                            (fid, digest, _canon(impl), now, audit_hash, block))
-        ctx["conn"].commit()
-    return {"frozen": True, "freeze": fid, "digest": digest, "sealed_at": _iso(now),
-            "sealed_in_chain": audit_hash, "block_index": block,
-            "implementation": impl,
-            "note": "Sealed before any run. A run is refused if either file changes.",
-            "next": BASE + "run"}, 200
-
-
-def _effects(ctx, run_id, case_id):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT COUNT(*) FROM standing_effect WHERE run_id=? AND case_id=?",
-            (run_id, case_id)).fetchone()[0]
-
-
-def _case(ctx, C, run_id, case_id, defeat):
-    steps = []
-
-    def rec(name, req, resp, status):
-        steps.append({"step": name, "at": _iso(time.time()), "request": req,
-                      "response": resp, "http_status": status})
-
-    t0 = time.time()
-    tag = run_id[-10:] + "_" + case_id
-    base = {"issuer": "standing-principal", "issuer_kind": "human",
-            "subject": "tst-agent-" + tag, "subject_kind": "agent",
-            "constraints": {"max_amount": 100}, "purpose": "temporal standing test",
-            "purpose_tags": [PURPOSE], "not_after": t0 + 3600, "delegations_left": 0}
-    g_id, s_id = "tst_" + tag + "_G", "tst_" + tag + "_S"
-
-    g = dict(base, id=g_id, scope=[CAP])
-    r, s = C._issue(ctx, TEST_KEY, g); rec("T0 issue G (exercised grant)", g, r, s)
-    sib = dict(base, id=s_id, scope=[SIBLING_CAP])
-    r, s = C._issue(ctx, TEST_KEY, sib); rec("T0 issue S (sibling grant)", sib, r, s)
-
-    ex = {"grant": g_id, "action": CAP, "params": {"amount": 10}, "purpose_tag": PURPOSE}
-    e, s = C._evaluate(ctx, TEST_KEY, ex); rec("T0 exercise under G", ex, e, s)
-    eval_id = e.get("evaluation")
-    out = {"case": case_id,
-           "branch": "standing-defeating" if defeat else "standing-preserving",
-           "required": "DENY / NON-EXECUTABLE" if defeat else "PERMIT / EXECUTABLE",
-           "t0_evaluation": eval_id,
-           "t0_proof": "https://sebbi.pro/x/continuity/proof?evaluation=%s" % eval_id,
-           "steps": steps}
-    if e.get("verdict") != "ALLOW":
-        out["determination"] = "UNRESOLVED"
-        out["why"] = "T0 exercise returned %s, so standing was never established" % e.get("verdict")
-        return out
-
-    target = g_id if defeat else s_id
-    rv = {"grant": target, "reason": "temporal standing test dN"}
-    r, s = C._revoke(ctx, TEST_KEY, rv)
-    rec("dN revoke " + ("G (in lineage)" if defeat else "S (outside lineage)"), rv, r, s)
-
-    before = _effects(ctx, run_id, case_id)
-    cf = {"evaluation": eval_id, "action": CAP, "params": {"amount": 10},
-          "outcome": "executed"}
-    r, s = C._confirm(ctx, TEST_KEY, cf); rec("Tn confirm (consequence boundary)", cf, r, s)
-    bound = bool(r.get("bound"))
-    if bound:
-        # The consequence itself. It happens only if the engine let it bind.
-        with ctx["lock"]:
-            ctx["conn"].execute("INSERT INTO standing_effect(run_id,case_id,evaluation,created) "
-                                "VALUES(?,?,?,?)", (run_id, case_id, eval_id, time.time()))
-            ctx["conn"].commit()
-    after = _effects(ctx, run_id, case_id)
-
-    tr, s = C._trace(ctx, {"grant": g_id}); rec("Tn authoritative state of G", {"grant": g_id}, tr, s)
-
-    out["bound"] = bound
-    out["consequence_rows_before"] = before
-    out["consequence_rows_after"] = after
-    if defeat:
-        ok = (not bound) and after == before
-    else:
-        ok = bound and after == before + 1
-    out["determination"] = "PASS" if ok else "FAIL"
-    return out
-
-
-def _run(ctx):
-    C = _continuity()
-    impl = _implementation(C)
-    digest = hashlib.sha256(_canon(impl).encode()).hexdigest()
-    frz = _current_freeze(ctx, digest)
-    if not frz:
-        return {"error": "not_frozen",
-                "message": "The deployed files do not match any freeze. Freeze first; a "
-                           "new freeze is a new test.", "freeze": BASE + "freeze"}, 409
-
-    now = time.time()
-    with ctx["lock"]:
-        last = ctx["conn"].execute("SELECT MAX(created) FROM standing_run").fetchone()[0]
-        today = ctx["conn"].execute("SELECT COUNT(*) FROM standing_run WHERE created>?",
-                                    (now - 86400,)).fetchone()[0]
-    if last and now - last < MIN_GAP:
-        return {"error": "too_soon", "retry_after_seconds": int(MIN_GAP - (now - last)),
-                "runs": BASE + "runs"}, 429
-    if today >= MAX_PER_DAY:
-        return {"error": "daily_limit", "limit": MAX_PER_DAY, "runs": BASE + "runs"}, 429
-
-    run_id = "r_" + uuid.uuid4().hex[:16]
-    order = ["A", "B"]
-    random.shuffle(order)
-    cases = {}
-    for cid in order:
-        cases[cid] = _case(ctx, C, run_id, cid, defeat=(cid == "A"))
-
-    dets = [cases["A"]["determination"], cases["B"]["determination"]]
-    if "UNRESOLVED" in dets:
-        result = "UNRESOLVED"
-    elif dets == ["PASS", "PASS"]:
-        result = "PASS"
-    else:
-        result = "FAIL"
-
-    package = {
-        "protocol": PROTOCOL,
-        "run": run_id,
-        "result": result,
-        "started_at": _iso(now),
-        "finished_at": _iso(time.time()),
-        "freeze": {"id": frz[0], "digest": digest, "sealed_at": _iso(frz[1]),
-                   "sealed_in_chain": frz[2], "block_index": frz[3]},
-        "implementation": impl,
-        "case_order_as_run": order,
-        "case_A": cases["A"],
-        "case_B": cases["B"],
-        "note": ("Observed on production. Nothing here was edited after the run; the "
-                 "package digest below is sealed in the chain."),
-    }
-    pdigest = hashlib.sha256(_canon(package).encode()).hexdigest()
-    audit_hash, block, t = _seal(ctx, "standing_run",
-                                 "run=%s;result=%s;package=%s" % (run_id, result, pdigest),
-                                 {"run": run_id, "result": result, "package_digest": pdigest})
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO standing_run VALUES(?,?,?,?,?,?,?,?)",
-                            (run_id, frz[0], result, _canon(package), pdigest, now,
-                             audit_hash, block))
-        ctx["conn"].commit()
-    return {"run": run_id, "result": result,
-            "case_A": cases["A"]["determination"], "case_B": cases["B"]["determination"],
-            "package_digest": pdigest, "sealed_in_chain": audit_hash, "block_index": block,
-            "evidence": BASE + "evidence?run=" + run_id}, 200
-
-
-def _evidence(ctx, data):
-    rid = str(data.get("run", "")).strip()
-    with ctx["lock"]:
-        if rid:
-            row = ctx["conn"].execute("SELECT package,digest,audit_hash,block_index FROM "
-                                      "standing_run WHERE id=?", (rid,)).fetchone()
-        else:
-            row = ctx["conn"].execute("SELECT package,digest,audit_hash,block_index FROM "
-                                      "standing_run ORDER BY created DESC LIMIT 1").fetchone()
-    if not row:
-        return {"error": "no_run", "runs": BASE + "runs"}, 404
-    pkg = json.loads(row[0])
-    pkg["package_digest"] = row[1]
-    pkg["package_sealed_in_chain"] = row[2]
-    pkg["package_block_index"] = row[3]
-    pkg["check"] = ("Remove the three package_* fields and the check field, canonicalise "
-                    "(keys sorted, separators ',' ':'), SHA-256, compare with package_digest.")
-    return pkg, 200
-
-
-def _runs(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT id,result,created,block_index FROM standing_run "
-                                   "ORDER BY created DESC").fetchall()
-    return {"count": len(rows),
-            "runs": [{"run": r[0], "result": r[1], "at": _iso(r[2]), "block_index": r[3],
-                      "evidence": BASE + "evidence?run=" + r[0]} for r in rows],
-            "note": "Every run is listed, failures included."}, 200
-
-
-def _status(ctx):
-    C = _continuity()
-    impl = _implementation(C)
-    digest = hashlib.sha256(_canon(impl).encode()).hexdigest()
-    frz = _current_freeze(ctx, digest)
-    with ctx["lock"]:
-        n = ctx["conn"].execute("SELECT COUNT(*) FROM standing_run").fetchone()[0]
-    return {"module": "standing", "version": VERSION, "protocol": PROTOCOL,
-            "continuity_version": impl["continuity_version"],
-            "frozen": bool(frz), "freeze": frz[0] if frz else None,
-            "runs": n,
-            "freeze_url": BASE + "freeze", "run_url": BASE + "run",
-            "runs_url": BASE + "runs"}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/").lower()
-    data = data or {}
-    if method == "GET":
-        if action == "status":
-            return _status(ctx)
-        if action == "freeze":
-            return _freeze(ctx)
-        if action == "run":
-            return _run(ctx)
-        if action == "evidence":
-            return _evidence(ctx, data)
-        if action == "runs":
-            return _runs(ctx)
-    return {"error": "unknown_action",
-            "GET": ["status", "freeze", "run", "evidence", "runs"]}, 404
-
-```
-
-
-## `modules/startpage.py`
-
-286 lines, 23449 bytes
-
-```python
-"""
-modules/startpage.py  v1.0.0
-"Start here" at /start: the customer front door. Three paths (agent builders,
-companies, auditors) on a spinning dial, five-minute steps, pricing and calls
-to action. Sign-up links point at /install.html.
-
-Page module, same family as map.py and passportpage.py: a runtime do_GET
-patch. Armed by /x/startpage/status after each deploy.
-Everything is base64-embedded so no character can break the Python string.
-"""
-
-import base64
-import sys
-
-VERSION = "1.0.0"
-
-_HTML_B64 = (
-    "PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmll"
-    "d3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEsdmlld3BvcnQtZml0PWNvdmVyIj4KPHRp"
-    "dGxlPlN0YXJ0IGhlcmUg4oCUIHNlYmJpLnBybzwvdGl0bGU+CjxtZXRhIG5hbWU9ImRlc2NyaXB0aW9uIiBjb250ZW50PSJNYWtl"
-    "IGV2ZXJ5IEFJIGRlY2lzaW9uIHByb3ZhYmxlLiBTdGFydCBmcmVlIGluIGZpdmUgbWludXRlczogZ2V0IGEga2V5LCBzZWFsIHlv"
-    "dXIgZmlyc3QgZGVjaXNpb24sIHNlZSB0aGUgcHJvb2YuIj4KPGxpbmsgaHJlZj0iaHR0cHM6Ly9mb250cy5nb29nbGVhcGlzLmNv"
-    "bS9jc3MyP2ZhbWlseT1JQk0rUGxleCtNb25vOndnaHRANDAwOzUwMCZmYW1pbHk9SUJNK1BsZXgrU2Fuczp3Z2h0QDQwMDs1MDA7"
-    "NjAwJmZhbWlseT1OZXdzcmVhZGVyOm9wc3osd2dodEA2Li43Miw1MDAmZGlzcGxheT1zd2FwIiByZWw9InN0eWxlc2hlZXQiPgo8"
-    "c3R5bGU+Cjpyb290ey0taW5rOiMwNTA3MGY7LS1pbmsyOiMwZDE0MjQ7LS1nb2xkOiNjOWE4NGM7LS1vazojN2ZlM2IwOy0tYmx1"
-    "ZTojOGZkMGZmOy0tbXV0ZTojOGE5M2FkOy0tbGluZTpyZ2JhKDIwMSwxNjgsNzYsLjIyKTstLW1vbm86J0lCTSBQbGV4IE1vbm8n"
-    "LHVpLW1vbm9zcGFjZSxtb25vc3BhY2U7LS1zYW5zOidJQk0gUGxleCBTYW5zJyxzeXN0ZW0tdWksc2Fucy1zZXJpZjstLXNlcmlm"
-    "OidOZXdzcmVhZGVyJyxHZW9yZ2lhLHNlcmlmfQoqe2JveC1zaXppbmc6Ym9yZGVyLWJveDttYXJnaW46MDtwYWRkaW5nOjA7LXdl"
-    "YmtpdC10YXAtaGlnaGxpZ2h0LWNvbG9yOnRyYW5zcGFyZW50fQpib2R5e2JhY2tncm91bmQ6cmFkaWFsLWdyYWRpZW50KGVsbGlw"
-    "c2UgYXQgNTAlIDAlLCMxNTIwNGEgMCUsIzA1MDcwZiA2MCUpO2NvbG9yOiNlOGVkZjc7Zm9udC1mYW1pbHk6dmFyKC0tc2Fucyk7"
-    "bGluZS1oZWlnaHQ6MS42O21pbi1oZWlnaHQ6MTAwdmh9Ci53cmFwe21heC13aWR0aDo5MDBweDttYXJnaW46MCBhdXRvO3BhZGRp"
-    "bmc6MCAyMHB4fQoudG9we2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVtczpjZW50"
-    "ZXI7cGFkZGluZzpjYWxjKDE0cHggKyBlbnYoc2FmZS1hcmVhLWluc2V0LXRvcCkpIDAgMH0KLmJyYW5ke2ZvbnQtZmFtaWx5OnZh"
-    "cigtLW1vbm8pO2ZvbnQtc2l6ZToxM3B4fS5icmFuZCBie2NvbG9yOnZhcigtLWdvbGQpO2ZvbnQtd2VpZ2h0OjUwMH0KLnRvcCBh"
-    "e2ZvbnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLW11dGUpO3RleHQtZGVjb3JhdGlvbjpu"
-    "b25lO21hcmdpbi1sZWZ0OjE0cHh9Ci5oZXJve3RleHQtYWxpZ246Y2VudGVyO3BhZGRpbmc6NDRweCAwIDEwcHh9Ci5raWNre2Zv"
-    "bnQtZmFtaWx5OnZhcigtLW1vbm8pO2ZvbnQtc2l6ZToxMS41cHg7bGV0dGVyLXNwYWNpbmc6LjJlbTtjb2xvcjp2YXIoLS1nb2xk"
-    "KX0KaDF7Zm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0OjUwMDtmb250LXNpemU6Y2xhbXAoMzRweCw3dncsNjBw"
-    "eCk7bGluZS1oZWlnaHQ6MS4wNDttYXJnaW46MTJweCBhdXRvIDE0cHg7bWF4LXdpZHRoOjE1Y2g7YmFja2dyb3VuZDpsaW5lYXIt"
-    "Z3JhZGllbnQoOTBkZWcsI2ZmZiAwJSwjYzlhODRjIDQ1JSwjN2ZlM2IwIDc1JSwjOGZkMGZmIDEwMCUpOy13ZWJraXQtYmFja2dy"
-    "b3VuZC1jbGlwOnRleHQ7YmFja2dyb3VuZC1jbGlwOnRleHQ7Y29sb3I6dHJhbnNwYXJlbnR9Ci5oZXJvIHB7Y29sb3I6I2I2YzBk"
-    "Njtmb250LXNpemU6MTdweDttYXgtd2lkdGg6NTRjaDttYXJnaW46MCBhdXRvfQouY3Rhe2Rpc3BsYXk6aW5saW5lLWZsZXg7YWxp"
-    "Z24taXRlbXM6Y2VudGVyO2dhcDo4cHg7bWFyZ2luOjIycHggNnB4IDA7cGFkZGluZzoxNHB4IDIycHg7Ym9yZGVyLXJhZGl1czox"
-    "MHB4O2ZvbnQ6NTAwIDE0cHggdmFyKC0tbW9ubyk7dGV4dC1kZWNvcmF0aW9uOm5vbmU7Y3Vyc29yOnBvaW50ZXI7Ym9yZGVyOjB9"
-    "Ci5jdGEuZ29sZHtiYWNrZ3JvdW5kOnZhcigtLWdvbGQpO2NvbG9yOnZhcigtLWluayk7Ym94LXNoYWRvdzowIDAgMzBweCByZ2Jh"
-    "KDIwMSwxNjgsNzYsLjQ1KX0KLmN0YS5naG9zdHtiYWNrZ3JvdW5kOnJnYmEoMTMsMjAsMzYsLjcpO2NvbG9yOiNmZmY7Ym9yZGVy"
-    "OjFweCBzb2xpZCByZ2JhKDI1NSwyNTUsMjU1LC4yNSl9Ci8qIHNwaW5uaW5nIGJhcnMgKi8KLmJhcnN7ZGlzcGxheTpmbGV4O2p1"
-    "c3RpZnktY29udGVudDpjZW50ZXI7Z2FwOjVweDtoZWlnaHQ6NDRweDthbGlnbi1pdGVtczpmbGV4LWVuZDttYXJnaW46MjhweCAw"
-    "IDRweH0KLmJhcnMgaXtkaXNwbGF5OmJsb2NrO3dpZHRoOjZweDtib3JkZXItcmFkaXVzOjNweDtiYWNrZ3JvdW5kOmxpbmVhci1n"
-    "cmFkaWVudCh2YXIoLS1vayksdmFyKC0tZ29sZCkpO2FuaW1hdGlvbjplcSAxLjJzIGVhc2UtaW4tb3V0IGluZmluaXRlO3RyYW5z"
-    "Zm9ybS1vcmlnaW46Ym90dG9tfQpAa2V5ZnJhbWVzIGVxezAlLDEwMCV7dHJhbnNmb3JtOnNjYWxlWSguMjUpfTUwJXt0cmFuc2Zv"
-    "cm06c2NhbGVZKDEpfX0KLyogcGF0aCBkaWFsICovCi5kaWFsd3JhcHtwZXJzcGVjdGl2ZToxMTAwcHg7aGVpZ2h0OjMzMHB4O2Rp"
-    "c3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRlcjttYXJnaW4tdG9wOjEwcHh9Ci5kaWFs"
-    "e3Bvc2l0aW9uOnJlbGF0aXZlO3dpZHRoOjI1MHB4O2hlaWdodDoyNjBweDt0cmFuc2Zvcm0tc3R5bGU6cHJlc2VydmUtM2Q7dHJh"
-    "bnNpdGlvbjp0cmFuc2Zvcm0gMXMgY3ViaWMtYmV6aWVyKC4yLC44LC4yLDEpfQouY2FyZHtwb3NpdGlvbjphYnNvbHV0ZTtpbnNl"
-    "dDowO2JvcmRlci1yYWRpdXM6MTRweDtwYWRkaW5nOjIwcHg7YmFja2dyb3VuZDpsaW5lYXItZ3JhZGllbnQoMTYwZGVnLHJnYmEo"
-    "MjEsMzIsNzQsLjk1KSxyZ2JhKDEzLDIwLDM2LC45NSkpO2JvcmRlcjoxLjVweCBzb2xpZCB2YXIoLS1saW5lKTtiYWNrZmFjZS12"
-    "aXNpYmlsaXR5OmhpZGRlbjtjdXJzb3I6cG9pbnRlcjtib3gtc2hhZG93OjAgMjBweCA1MHB4IHJnYmEoMCwwLDAsLjUpfQouY2Fy"
-    "ZC5vbntib3JkZXItY29sb3I6dmFyKC0tb2spO2JveC1zaGFkb3c6MCAwIDQwcHggcmdiYSgxMjcsMjI3LDE3NiwuMzUpLDAgMjBw"
-    "eCA1MHB4IHJnYmEoMCwwLDAsLjUpfQouY2FyZCAubntmb250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTFweDtjb2xv"
-    "cjp2YXIoLS1nb2xkKTtsZXR0ZXItc3BhY2luZzouMTJlbX0KLmNhcmQgaDN7Zm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQt"
-    "d2VpZ2h0OjUwMDtmb250LXNpemU6MjRweDttYXJnaW46OHB4IDAgOHB4O2xpbmUtaGVpZ2h0OjEuMTV9Ci5jYXJkIHB7Zm9udC1z"
-    "aXplOjE0cHg7Y29sb3I6I2I2YzBkNn0KLmNhcmQgLmdve3Bvc2l0aW9uOmFic29sdXRlO2JvdHRvbToxOHB4O2xlZnQ6MjBweDtm"
-    "b250LWZhbWlseTp2YXIoLS1tb25vKTtmb250LXNpemU6MTJweDtjb2xvcjp2YXIoLS1vayl9Ci5waWNrc3tkaXNwbGF5OmZsZXg7"
-    "anVzdGlmeS1jb250ZW50OmNlbnRlcjtnYXA6OHB4O2ZsZXgtd3JhcDp3cmFwfQoucGlja3MgYnV0dG9ue2ZvbnQ6NTAwIDEycHgg"
-    "dmFyKC0tbW9ubyk7YmFja2dyb3VuZDpyZ2JhKDEzLDIwLDM2LC44KTtjb2xvcjojZThlZGY3O2JvcmRlcjoxcHggc29saWQgdmFy"
-    "KC0tbGluZSk7Ym9yZGVyLXJhZGl1czo5OTlweDtwYWRkaW5nOjhweCAxNHB4O2N1cnNvcjpwb2ludGVyfQoucGlja3MgYnV0dG9u"
-    "Lm9ue2JvcmRlci1jb2xvcjp2YXIoLS1vayk7Y29sb3I6dmFyKC0tb2spfQpzZWN0aW9ue3BhZGRpbmc6NDBweCAwO2JvcmRlci10"
-    "b3A6MXB4IHNvbGlkIHJnYmEoMjU1LDI1NSwyNTUsLjA3KX0KaDJ7Zm9udC1mYW1pbHk6dmFyKC0tc2VyaWYpO2ZvbnQtd2VpZ2h0"
-    "OjUwMDtmb250LXNpemU6Y2xhbXAoMjZweCw0LjV2dywzOHB4KTtsaW5lLWhlaWdodDoxLjEyO21hcmdpbi1ib3R0b206MTBweH0K"
-    "LmxlYWR7Y29sb3I6I2I2YzBkNjttYXgtd2lkdGg6NjBjaDttYXJnaW4tYm90dG9tOjIwcHh9Ci5zdGVwc3tkaXNwbGF5OmdyaWQ7"
-    "Z2FwOjEycHh9Ci5zdGVwe2Rpc3BsYXk6ZmxleDtnYXA6MTZweDtiYWNrZ3JvdW5kOnJnYmEoMTMsMjAsMzYsLjc1KTtib3JkZXI6"
-    "MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6MTJweDtwYWRkaW5nOjE4cHh9Ci5zdGVwIC5udW17ZmxleDpub25l"
-    "O3dpZHRoOjQycHg7aGVpZ2h0OjQycHg7Ym9yZGVyLXJhZGl1czo1MCU7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtq"
-    "dXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO2ZvbnQ6NjAwIDE2cHggdmFyKC0tbW9ubyk7Y29sb3I6dmFyKC0taW5rKTtiYWNrZ3JvdW5k"
-    "OmNvbmljLWdyYWRpZW50KHZhcigtLWdvbGQpLHZhcigtLW9rKSx2YXIoLS1ibHVlKSx2YXIoLS1nb2xkKSk7YW5pbWF0aW9uOnNw"
-    "aW4gNnMgbGluZWFyIGluZmluaXRlfQouc3RlcCAubnVtIHNwYW57ZGlzcGxheTpibG9jazthbmltYXRpb246c3BpbiA2cyBsaW5l"
-    "YXIgaW5maW5pdGUgcmV2ZXJzZX0KQGtleWZyYW1lcyBzcGlue3Rve3RyYW5zZm9ybTpyb3RhdGUoMzYwZGVnKX19Ci5zdGVwIGg0"
-    "e2ZvbnQtc2l6ZToxNnB4O21hcmdpbi1ib3R0b206NHB4fS5zdGVwIHB7Zm9udC1zaXplOjE0cHg7Y29sb3I6I2I2YzBkNn0KcHJl"
-    "e2JhY2tncm91bmQ6IzAzMDUwYjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6OHB4O3BhZGRpbmc6"
-    "MTJweDtmb250OjEycHggdmFyKC0tbW9ubyk7Y29sb3I6I2NmZTZkOTtvdmVyZmxvdy14OmF1dG87bWFyZ2luLXRvcDo4cHg7d2hp"
-    "dGUtc3BhY2U6cHJlfQouc3RhdHN7ZGlzcGxheTpmbGV4O2dhcDoxMnB4O2ZsZXgtd3JhcDp3cmFwO2p1c3RpZnktY29udGVudDpj"
-    "ZW50ZXI7bWFyZ2luLXRvcDoyNnB4fQouc3RhdHttaW4td2lkdGg6MTMwcHg7YmFja2dyb3VuZDpyZ2JhKDEzLDIwLDM2LC43KTti"
-    "b3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6MTBweDtwYWRkaW5nOjEycHggMTZweDt0ZXh0LWFsaWdu"
-    "OmNlbnRlcn0KLnN0YXQgYntkaXNwbGF5OmJsb2NrO2ZvbnQ6NjAwIDIycHggdmFyKC0tbW9ubyk7Y29sb3I6dmFyKC0tb2spfS5z"
-    "dGF0IHNwYW57Zm9udC1zaXplOjExcHg7Y29sb3I6dmFyKC0tbXV0ZSk7bGV0dGVyLXNwYWNpbmc6LjA2ZW19Ci5wcmljZXtkaXNw"
-    "bGF5OmdyaWQ7Z2FwOjEycHg7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmcn1AbWVkaWEobWluLXdpZHRoOjcyMHB4KXsucHJpY2V7"
-    "Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOnJlcGVhdCgyLDFmcil9fQoucGxhbntiYWNrZ3JvdW5kOnJnYmEoMTMsMjAsMzYsLjc1KTti"
-    "b3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRlci1yYWRpdXM6MTJweDtwYWRkaW5nOjIwcHg7cG9zaXRpb246cmVsYXRp"
-    "dmU7b3ZlcmZsb3c6aGlkZGVufQoucGxhbi5ob3R7Ym9yZGVyLWNvbG9yOnZhcigtLWdvbGQpO2JveC1zaGFkb3c6MCAwIDMwcHgg"
-    "cmdiYSgyMDEsMTY4LDc2LC4yKX0KLnBsYW4gLnR7Zm9udDo1MDAgMTFweCB2YXIoLS1tb25vKTtsZXR0ZXItc3BhY2luZzouMTRl"
-    "bTtjb2xvcjp2YXIoLS1nb2xkKX0KLnBsYW4gLmFtdHtmb250LWZhbWlseTp2YXIoLS1zZXJpZik7Zm9udC1zaXplOjM0cHg7bWFy"
-    "Z2luOjZweCAwIDJweH0ucGxhbiAuYW10IHNtYWxse2ZvbnQtc2l6ZToxNHB4O2NvbG9yOnZhcigtLW11dGUpO2ZvbnQtZmFtaWx5"
-    "OnZhcigtLXNhbnMpfQoucGxhbiB1bHtsaXN0LXN0eWxlOm5vbmU7bWFyZ2luLXRvcDoxMHB4fS5wbGFuIGxpe2ZvbnQtc2l6ZTox"
-    "NHB4O2NvbG9yOiNiNmMwZDY7cGFkZGluZzo0cHggMCA0cHggMjJweDtwb3NpdGlvbjpyZWxhdGl2ZX0KLnBsYW4gbGk6YmVmb3Jl"
-    "e2NvbnRlbnQ6IiI7cG9zaXRpb246YWJzb2x1dGU7bGVmdDowO3RvcDoxMXB4O3dpZHRoOjEwcHg7aGVpZ2h0OjEwcHg7Ym9yZGVy"
-    "LXJhZGl1czo1MCU7YmFja2dyb3VuZDp2YXIoLS1vayk7Ym94LXNoYWRvdzowIDAgOHB4IHZhcigtLW9rKX0KLnBsYW4gLnNjYW57"
-    "cG9zaXRpb246YWJzb2x1dGU7bGVmdDowO3JpZ2h0OjA7aGVpZ2h0OjJweDtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCg5MGRl"
-    "Zyx0cmFuc3BhcmVudCx2YXIoLS1vayksdHJhbnNwYXJlbnQpO2FuaW1hdGlvbjpzY2FuIDMuNXMgbGluZWFyIGluZmluaXRlO29w"
-    "YWNpdHk6LjZ9CkBrZXlmcmFtZXMgc2NhbnswJXt0b3A6MH0xMDAle3RvcDoxMDAlfX0KLmdyaWQze2Rpc3BsYXk6Z3JpZDtnYXA6"
-    "MTJweDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6MWZyfUBtZWRpYShtaW4td2lkdGg6NzIwcHgpey5ncmlkM3tncmlkLXRlbXBsYXRl"
-    "LWNvbHVtbnM6cmVwZWF0KDMsMWZyKX19Ci50aWxle2JhY2tncm91bmQ6cmdiYSgxMywyMCwzNiwuNyk7Ym9yZGVyOjFweCBzb2xp"
-    "ZCB2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzoxNnB4fQoudGlsZSBoNHtmb250LXNpemU6MTVweDttYXJn"
-    "aW4tYm90dG9tOjRweH0udGlsZSBwe2ZvbnQtc2l6ZToxMy41cHg7Y29sb3I6I2I2YzBkNn0KLmZpbmFse3RleHQtYWxpZ246Y2Vu"
-    "dGVyO3BhZGRpbmc6NTBweCAwIDcwcHh9CkBtZWRpYShwcmVmZXJzLXJlZHVjZWQtbW90aW9uOnJlZHVjZSl7KnthbmltYXRpb246"
-    "bm9uZSFpbXBvcnRhbnQ7dHJhbnNpdGlvbjpub25lIWltcG9ydGFudH19Cjwvc3R5bGU+PC9oZWFkPjxib2R5Pgo8ZGl2IGNsYXNz"
-    "PSJ3cmFwIj4KPGRpdiBjbGFzcz0idG9wIj48ZGl2IGNsYXNzPSJicmFuZCI+c2ViYmk8Yj4ucHJvPC9iPiDCtyBTVEFSVCBIRVJF"
-    "PC9kaXY+PG5hdj48YSBocmVmPSIvIj5Ib21lPC9hPjxhIGhyZWY9Ii9wcm92ZSI+UHJvb2Y8L2E+PGEgaHJlZj0iL3Bhc3Nwb3J0"
-    "Ij5QYXNzcG9ydDwvYT48L25hdj48L2Rpdj4KCjxkaXYgY2xhc3M9Imhlcm8iPgogPGRpdiBjbGFzcz0ia2ljayI+TUFLRSBFVkVS"
-    "WSBBSSBERUNJU0lPTiBQUk9WQUJMRTwvZGl2PgogPGgxPlN0YXJ0IGluIGZpdmUgbWludXRlcy4gUHJvdmUgaXQgZm9yZXZlci48"
-    "L2gxPgogPHA+RXZlcnkgZGVjaXNpb24geW91ciBBSSBtYWtlcywgc2VhbGVkIHRoZSBtb21lbnQgaXQgaGFwcGVucywgdGltZXN0"
-    "YW1wZWQgaW4gQml0Y29pbiwgaGVsZCBieSBpbmRlcGVuZGVudCB3aXRuZXNzZXMgYW5kIGNoZWNrYWJsZSBieSBhbnlvbmUuIEZy"
-    "ZWUgZm9yIDkwIGRheXMuPC9wPgogPGEgY2xhc3M9ImN0YSBnb2xkIiBocmVmPSIvaW5zdGFsbC5odG1sIj5HZXQgeW91ciBmcmVl"
-    "IGtleSDihpI8L2E+PGEgY2xhc3M9ImN0YSBnaG9zdCIgaHJlZj0iI3N0ZXBzIj5TZWUgaG93IGl0IHdvcmtzPC9hPgogPGRpdiBj"
-    "bGFzcz0iYmFycyIgaWQ9ImJhcnMiPjwvZGl2PgogPGRpdiBjbGFzcz0ic3RhdHMiPjxkaXYgY2xhc3M9InN0YXQiPjxiIGlkPSJz"
-    "Q2hhaW5zIj7igJQ8L2I+PHNwYW4+SU5ERVBFTkRFTlQgQ0hBSU5TPC9zcGFuPjwvZGl2PjxkaXYgY2xhc3M9InN0YXQiPjxiIGlk"
-    "PSJzUGFzcyI+4oCUPC9iPjxzcGFuPlBBU1NQT1JUUyBJU1NVRUQ8L3NwYW4+PC9kaXY+PGRpdiBjbGFzcz0ic3RhdCI+PGI+fjUg"
-    "bXM8L2I+PHNwYW4+T0ZGTElORSBQUk9PRiBDSEVDSzwvc3Bhbj48L2Rpdj48L2Rpdj4KPC9kaXY+Cgo8c2VjdGlvbj4KIDxoMj5X"
-    "aGljaCBvbmUgYXJlIHlvdT88L2gyPgogPHAgY2xhc3M9ImxlYWQiPlNwaW4gdGhlIGRpYWwgb3IgdGFwIHlvdXIgcGF0aC48L3A+"
-    "CiA8ZGl2IGNsYXNzPSJkaWFsd3JhcCI+PGRpdiBjbGFzcz0iZGlhbCIgaWQ9ImRpYWwiPjwvZGl2PjwvZGl2PgogPGRpdiBjbGFz"
-    "cz0icGlja3MiIGlkPSJwaWNrcyI+PC9kaXY+Cjwvc2VjdGlvbj4KCjxzZWN0aW9uIGlkPSJzdGVwcyI+CiA8aDIgaWQ9InN0ZXBz"
-    "VGl0bGUiPlRocmVlIHN0ZXBzLiBGaXZlIG1pbnV0ZXMuPC9oMj4KIDxwIGNsYXNzPSJsZWFkIiBpZD0ic3RlcHNMZWFkIj48L3A+"
-    "CiA8ZGl2IGNsYXNzPSJzdGVwcyIgaWQ9InN0ZXBMaXN0Ij48L2Rpdj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24+CiA8aDI+U2ltcGxl"
-    "IHByaWNpbmcuPC9oMj4KIDxwIGNsYXNzPSJsZWFkIj5TdGFydCBmcmVlLiBQYXkgcGVyIGRldmljZSB3aGVuIGl0J3Mgd29ya2lu"
-    "ZyBmb3IgeW91LjwvcD4KIDxkaXYgY2xhc3M9InByaWNlIj4KICA8ZGl2IGNsYXNzPSJwbGFuIj48ZGl2IGNsYXNzPSJzY2FuIj48"
-    "L2Rpdj48ZGl2IGNsYXNzPSJ0Ij5UUklBTDwvZGl2PjxkaXYgY2xhc3M9ImFtdCI+RnJlZSA8c21hbGw+Zm9yIDkwIGRheXM8L3Nt"
-    "YWxsPjwvZGl2Pjx1bD48bGk+RXZlcnkgZGVjaXNpb24gc2VhbGVkIGFuZCBhbmNob3JlZDwvbGk+PGxpPlNpZ25lZCBwcm9vZnMg"
-    "YW5kIEFnZW50IFBhc3Nwb3J0czwvbGk+PGxpPkZ1bGwgcHVibGljIHZlcmlmaWNhdGlvbjwvbGk+PC91bD48L2Rpdj4KICA8ZGl2"
-    "IGNsYXNzPSJwbGFuIGhvdCI+PGRpdiBjbGFzcz0ic2NhbiI+PC9kaXY+PGRpdiBjbGFzcz0idCI+UEVSIERFVklDRTwvZGl2Pjxk"
-    "aXYgY2xhc3M9ImFtdCI+NTBwIDxzbWFsbD5wZXIgZGV2aWNlLCBwZXIgbW9udGg8L3NtYWxsPjwvZGl2Pjx1bD48bGk+RXZlcnl0"
-    "aGluZyBpbiB0aGUgdHJpYWw8L2xpPjxsaT5RdWFydGVybHkgZXZpZGVuY2UgcGFja3M8L2xpPjxsaT5SZXNlbGwgaXQgdW5kZXIg"
-    "eW91ciBvd24gcHJpY2U8L2xpPjwvdWw+PC9kaXY+CiAgPGRpdiBjbGFzcz0icGxhbiI+PGRpdiBjbGFzcz0ic2NhbiI+PC9kaXY+"
-    "PGRpdiBjbGFzcz0idCI+U0VCRE9HIMK3IE9OLVBSRU1JU0U8L2Rpdj48ZGl2IGNsYXNzPSJhbXQiPlRhbGsgdG8gdXM8L2Rpdj48"
-    "dWw+PGxpPlJ1bnMgb24geW91ciBvd24gaGFyZHdhcmU8L2xpPjxsaT5Ob3RoaW5nIGxlYXZlcyB5b3VyIGJ1aWxkaW5nPC9saT48"
-    "bGk+U3RpbGwgd2l0bmVzc2VkIGZyb20gb3V0c2lkZTwvbGk+PC91bD48L2Rpdj4KICA8ZGl2IGNsYXNzPSJwbGFuIj48ZGl2IGNs"
-    "YXNzPSJzY2FuIj48L2Rpdj48ZGl2IGNsYXNzPSJ0Ij5BVURJVE9SUzwvZGl2PjxkaXYgY2xhc3M9ImFtdCI+RnJlZSA8c21hbGw+"
-    "dG8gdmVyaWZ5LCBhbHdheXM8L3NtYWxsPjwvZGl2Pjx1bD48bGk+VmVyaWZ5IGFueSByZWNvcmQgZnJvbSBhIHNwcmVhZHNoZWV0"
-    "PC9saT48bGk+VGhlIHNhbXBsZSBub2JvZHkgY2hvc2U8L2xpPjxsaT5PU0NBTCBleHBvcnQ8L2xpPjwvdWw+PC9kaXY+CiA8L2Rp"
-    "dj4KPC9zZWN0aW9uPgoKPHNlY3Rpb24+CiA8aDI+V2hhdCB5b3UgZ2V0IG9uIGRheSBvbmUuPC9oMj4KIDxkaXYgY2xhc3M9Imdy"
-    "aWQzIj4KICA8ZGl2IGNsYXNzPSJ0aWxlIj48aDQ+QSByZWNvcmQgbm9ib2R5IGNhbiBlZGl0PC9oND48cD5DaGFuZ2Ugb25lIGVu"
-    "dHJ5IGFuZCBldmVyeSBlbnRyeSBhZnRlciBpdCBicmVha3MuPC9wPjwvZGl2PgogIDxkaXYgY2xhc3M9InRpbGUiPjxoND5UaW1l"
-    "IG5vYm9keSBjb250cm9sczwvaDQ+PHA+VGltZXN0YW1wcyBhbmNob3JlZCBpbiBCaXRjb2luLCBjaGVja2VkIGFnYWluc3QgdHdv"
-    "IGV4cGxvcmVycy48L3A+PC9kaXY+CiAgPGRpdiBjbGFzcz0idGlsZSI+PGg0PldpdG5lc3NlcyB5b3UgZG9uJ3QgY29udHJvbDwv"
-    "aDQ+PHA+SW5kZXBlbmRlbnQgb3JnYW5pc2F0aW9ucyBob2xkIGNvcGllcyBvZiB5b3VyIGNoYWluLjwvcD48L2Rpdj4KICA8ZGl2"
-    "IGNsYXNzPSJ0aWxlIj48aDQ+QXV0aG9yaXR5IGF0IHRoZSBtb21lbnQgb2YgYWN0aW9uPC9oND48cD5SZXZva2VkIGEgc2Vjb25k"
-    "IGFnbz8gVGhlIGFjdGlvbiBkb2Vzbid0IGhhcHBlbi48L3A+PC9kaXY+CiAgPGRpdiBjbGFzcz0idGlsZSI+PGg0PlByb29mIHRo"
-    "YXQgdHJhdmVsczwvaDQ+PHA+U2lnbmVkIGJ1bmRsZXMgYW55b25lIGNhbiB2ZXJpZnkgb2ZmbGluZS48L3A+PC9kaXY+CiAgPGRp"
-    "diBjbGFzcz0idGlsZSI+PGg0PkFuIGluZGVwZW5kZW50IHRlc3QgYmVoaW5kIGl0PC9oND48cD5QcmUtcmVnaXN0ZXJlZCwgcnVu"
-    "IG9uIHByb2R1Y3Rpb24sIHB1Ymxpc2hlZCBhcyBvYnNlcnZlZC48L3A+PC9kaXY+CiA8L2Rpdj4KPC9zZWN0aW9uPgoKPGRpdiBj"
-    "bGFzcz0iZmluYWwiPgogPGgyPllvdXIgQUkgaXMgYWxyZWFkeSBtYWtpbmcgZGVjaXNpb25zLjxicj5TdGFydCBwcm92aW5nIHRo"
-    "ZW0uPC9oMj4KIDxhIGNsYXNzPSJjdGEgZ29sZCIgaHJlZj0iL2luc3RhbGwuaHRtbCI+R2V0IHlvdXIgZnJlZSBrZXkg4oaSPC9h"
-    "PjxhIGNsYXNzPSJjdGEgZ2hvc3QiIGhyZWY9Im1haWx0bzpqdXN0cmlnaHRkZWNvcmF0b3JzQGdtYWlsLmNvbT9zdWJqZWN0PXNl"
-    "YmJpLnBybyUyMC0lMjBsZXQlMjdzJTIwdGFsayI+Qm9vayBhIGNhbGw8L2E+CjwvZGl2Pgo8L2Rpdj4KPHNjcmlwdD4KKGZ1bmN0"
-    "aW9uKCl7CnZhciBiPSIiO2Zvcih2YXIgaT0wO2k8Mjg7aSsrKWIrPSc8aSBzdHlsZT0iaGVpZ2h0OicrKDE4K01hdGgucm91bmQo"
-    "TWF0aC5yYW5kb20oKSoyNikpKydweDthbmltYXRpb24tZGVsYXk6JysoLU1hdGgucmFuZG9tKCkqMS4yKS50b0ZpeGVkKDIpKydz"
-    "Ij48L2k+Jztkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgiYmFycyIpLmlubmVySFRNTD1iOwp2YXIgUEFUSFM9Wwoge2s6ImJ1aWxk"
-    "ZXIiLG5hbWU6IkkgYnVpbGQgQUkgYWdlbnRzIix0YWc6IjAxIMK3IEFHRU5UIEJVSUxERVJTIixibHVyYjoiR2l2ZSBldmVyeSBh"
-    "Z2VudCBhIHBhc3Nwb3J0LiBJdCBhY3RzIG9ubHkgd2hlbiBhIGh1bWFuJ3MgYXV0aG9yaXR5IHN0aWxsIHN0YW5kcy4iLAogIGxl"
-    "YWQ6Ik9uZSBsaW5lIG9mIGNvZGUgYW5kIHlvdXIgYWdlbnQgY2FycmllcyBwcm9vZiBvZiBhdXRob3JpdHkgZm9yIGV2ZXJ5IGFj"
-    "dGlvbi4iLAogIHN0ZXBzOltbIkdldCB5b3VyIGZyZWUga2V5IiwiVGFrZXMgYSBtaW51dGUuIEZyZWUgZm9yIDkwIGRheXMuIiwi"
-    "Il0sCiAgICAgICAgIFsiQWRkIG9uZSBsaW5lIiwiWW91ciBhZ2VudCByZXF1ZXN0cyBhIHNpZ25lZCBwYXNzcG9ydCBiZWZvcmUg"
-    "aXQgYWN0cy4iLCdAbmVlZHNfcGFzc3BvcnQoInBheW1lbnRzLnNlbmQiLFxuICAgIGF1ZGllbmNlPSJzaG9wLmV4YW1wbGUuY29t"
-    "IixcbiAgICBwYXJhbXM9WyJhbW91bnQiXSlcbmRlZiBwYXkoYW1vdW50LCBwYXNzcG9ydD1Ob25lKTpcbiAgICAuLi4nXSwKICAg"
-    "ICAgICAgWyJXYXRjaCBpdCBvbiB0aGUgY2hhaW4iLCJFdmVyeSBwYXNzcG9ydCwgcmVkZW1wdGlvbiBhbmQgcmVmdXNhbCBpcyBz"
-    "ZWFsZWQuIFRyeSB0aGUgbGl2ZSBkZW1vIGZpcnN0LiIsImh0dHBzOi8vc2ViYmkucHJvL3Bhc3Nwb3J0Il1dfSwKIHtrOiJjb21w"
-    "YW55IixuYW1lOiJNeSBjb21wYW55IHVzZXMgQUkiLHRhZzoiMDIgwrcgQ09NUEFOSUVTIixibHVyYjoiU2VhbCBldmVyeSBBSSBk"
-    "ZWNpc2lvbiB0aGUgbW9tZW50IGl0IGhhcHBlbnMsIHJlYWR5IGZvciB0aGUgcmVndWxhdG9yLCB0aGUgYXVkaXRvciBhbmQgdGhl"
-    "IGNvdXJ0LiIsCiAgbGVhZDoiUGx1ZyBzZWJiaS5wcm8gaW4gYmVuZWF0aCB0aGUgQUkgeW91IGFscmVhZHkgcnVuLiBOb3RoaW5n"
-    "IGFib3V0IHlvdXIgQUkgY2hhbmdlcy4iLAogIHN0ZXBzOltbIkdldCB5b3VyIGZyZWUga2V5IiwiVGhyZWUgZmllbGRzLCBvbmUg"
-    "bWludXRlLCBmcmVlIGZvciA5MCBkYXlzLiIsIiJdLAogICAgICAgICBbIlNlYWwgeW91ciBmaXJzdCBkZWNpc2lvbiIsIlBhc3Rl"
-    "IHRoZSBzbmlwcGV0IHlvdXIgc2lnbnVwIGdpdmVzIHlvdS4gRnJvbSB0aGVuIG9uIGV2ZXJ5IGRlY2lzaW9uIGlzIHNlYWxlZCwg"
-    "YW5jaG9yZWQgYW5kIHdpdG5lc3NlZC4iLCIiXSwKICAgICAgICAgWyJTaG93IGFueW9uZSB0aGUgcHJvb2YiLCJFdmVyeSByZWNv"
-    "cmQgdmVyaWZpZXMgcHVibGljbHkgd2l0aCBubyBhY2NvdW50LiBLZWVwIGRhdGEgb24gc2l0ZSB3aXRoIFNlYmRvZy4iLCJodHRw"
-    "czovL3NlYmJpLnByby9wcm92ZSJdXX0sCiB7azoiYXVkaXRvciIsbmFtZToiSSBhdWRpdCBBSSIsdGFnOiIwMyDCtyBBVURJVE9S"
-    "UyIsYmx1cmI6IlZlcmlmeSByZWNvcmRzIGZyb20gaW5zaWRlIHlvdXIgc3ByZWFkc2hlZXQsIGFuZCBzYW1wbGUgd2hhdCBub2Jv"
-    "ZHkgY291bGQgY2hvb3NlLiIsCiAgbGVhZDoiTm8gbG9naW4sIG5vIHBsdWctaW4uIFlvdXIgc3ByZWFkc2hlZXQgYXNrcyB0aGUg"
-    "Y2hhaW4gZGlyZWN0bHkuIiwKICBzdGVwczpbWyJPcGVuIHRoZSBhdWRpdG9yIHRvb2xzIiwiRXZlcnl0aGluZyBpcyBmcmVlIHRv"
-    "IHZlcmlmeSwgZm9yZXZlci4iLCIiXSwKICAgICAgICAgWyJEcmFnIG9uZSBmb3JtdWxhIGRvd24gYSBjb2x1bW4iLCJFdmVyeSBy"
-    "b3cgdmVyaWZpZXMgaXRzZWxmIGxpdmUuIiwnPUlNUE9SVERBVEEoImh0dHBzOi8vc2ViYmkucHJvL2EvdmVyaWZ5P2hhc2g9IiZB"
-    "MiknXSwKICAgICAgICAgWyJUYWtlIHRoZSBzYW1wbGUgbm9ib2R5IGNob3NlIiwiU2VlZGVkIGJ5IGEgQml0Y29pbiBibG9jayB0"
-    "aGF0IGRvZXNuJ3QgZXhpc3QgeWV0IHdoZW4geW91IGFzay4iLCJodHRwczovL3NlYmJpLnByby9hdWRpdG9ycyJdXX1dOwp2YXIg"
-    "Y3VyPTAsZGlhbD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgiZGlhbCIpOwpmdW5jdGlvbiBlc2Mocyl7cmV0dXJuIFN0cmluZyhz"
-    "KS5yZXBsYWNlKC9bJjw+Il0vZyxmdW5jdGlvbihjKXtyZXR1cm57IiYiOiImYW1wOyIsIjwiOiImbHQ7IiwiPiI6IiZndDsiLCci"
-    "JzoiJnF1b3Q7In1bY119KX0KUEFUSFMuZm9yRWFjaChmdW5jdGlvbihwLGkpe3ZhciBjPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQo"
-    "ImRpdiIpO2MuY2xhc3NOYW1lPSJjYXJkIjtjLnN0eWxlLnRyYW5zZm9ybT0icm90YXRlWSgiKygxMjAqaSkrImRlZykgdHJhbnNs"
-    "YXRlWigyMTBweCkiOwogYy5pbm5lckhUTUw9JzxkaXYgY2xhc3M9Im4iPicrcC50YWcrJzwvZGl2PjxoMz4nK2VzYyhwLm5hbWUp"
-    "Kyc8L2gzPjxwPicrZXNjKHAuYmx1cmIpKyc8L3A+PGRpdiBjbGFzcz0iZ28iPkNob29zZSB0aGlzIHBhdGgg4oaSPC9kaXY+Jztj"
-    "Lm9uY2xpY2s9ZnVuY3Rpb24oKXtwaWNrKGksdHJ1ZSl9O2RpYWwuYXBwZW5kQ2hpbGQoYyl9KTsKZG9jdW1lbnQuZ2V0RWxlbWVu"
-    "dEJ5SWQoInBpY2tzIikuaW5uZXJIVE1MPVBBVEhTLm1hcChmdW5jdGlvbihwLGkpe3JldHVybiAnPGJ1dHRvbiBkYXRhLWk9Iicr"
-    "aSsnIj4nK2VzYyhwLm5hbWUpKyc8L2J1dHRvbj4nfSkuam9pbigiIik7CkFycmF5LnByb3RvdHlwZS5mb3JFYWNoLmNhbGwoZG9j"
-    "dW1lbnQucXVlcnlTZWxlY3RvckFsbCgiI3BpY2tzIGJ1dHRvbiIpLGZ1bmN0aW9uKGIpe2Iub25jbGljaz1mdW5jdGlvbigpe3Bp"
-    "Y2soK2IuZGF0YXNldC5pLHRydWUpfX0pOwp2YXIgYXV0bz1zZXRJbnRlcnZhbChmdW5jdGlvbigpe3BpY2soKGN1cisxKSUzLGZh"
-    "bHNlKX0sNDIwMCk7CmZ1bmN0aW9uIHBpY2soaSx1c2VyKXtjdXI9aTtpZih1c2VyKXtjbGVhckludGVydmFsKGF1dG8pfWRpYWwu"
-    "c3R5bGUudHJhbnNmb3JtPSJyb3RhdGVZKCIrKC0xMjAqaSkrImRlZykiOwogQXJyYXkucHJvdG90eXBlLmZvckVhY2guY2FsbChk"
-    "aWFsLmNoaWxkcmVuLGZ1bmN0aW9uKGMsayl7Yy5jbGFzc0xpc3QudG9nZ2xlKCJvbiIsaz09PWkpfSk7CiBBcnJheS5wcm90b3R5"
-    "cGUuZm9yRWFjaC5jYWxsKGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoIiNwaWNrcyBidXR0b24iKSxmdW5jdGlvbihiLGspe2Iu"
-    "Y2xhc3NMaXN0LnRvZ2dsZSgib24iLGs9PT1pKX0pOwogdmFyIHA9UEFUSFNbaV07ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInN0"
-    "ZXBzTGVhZCIpLnRleHRDb250ZW50PXAubGVhZDsKIHZhciBsaW5rcz17MDoiL2luc3RhbGwuaHRtbCIsMToiL2luc3RhbGwuaHRt"
-    "bCIsMjoiL2F1ZGl0b3JzIn07CiBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgic3RlcExpc3QiKS5pbm5lckhUTUw9cC5zdGVwcy5t"
-    "YXAoZnVuY3Rpb24ocyxrKXt2YXIgZXh0cmE9IiI7CiAgaWYoaz09PTApZXh0cmE9JzxhIGNsYXNzPSJjdGEgZ29sZCIgc3R5bGU9"
-    "Im1hcmdpbjoxMHB4IDAgMDtwYWRkaW5nOjEwcHggMTZweDtmb250LXNpemU6MTIuNXB4IiBocmVmPSInK2xpbmtzW2ldKyciPicr"
-    "KGk9PT0yPyJPcGVuIHRoZSBhdWRpdG9yIHRvb2xzIOKGkiI6IkdldCB5b3VyIGZyZWUga2V5IOKGkiIpKyc8L2E+JzsKICBlbHNl"
-    "IGlmKHNbMl0uaW5kZXhPZigiaHR0cHM6Ly8iKT09PTApZXh0cmE9JzxhIGNsYXNzPSJjdGEgZ2hvc3QiIHN0eWxlPSJtYXJnaW46"
-    "MTBweCAwIDA7cGFkZGluZzoxMHB4IDE2cHg7Zm9udC1zaXplOjEyLjVweCIgaHJlZj0iJytzWzJdKyciPk9wZW4gaXQg4oaSPC9h"
-    "Pic7CiAgZWxzZSBpZihzWzJdKWV4dHJhPSc8cHJlPicrZXNjKHNbMl0pKyc8L3ByZT4nOwogIHJldHVybiAnPGRpdiBjbGFzcz0i"
-    "c3RlcCI+PGRpdiBjbGFzcz0ibnVtIj48c3Bhbj4nKyhrKzEpKyc8L3NwYW4+PC9kaXY+PGRpdj48aDQ+Jytlc2Moc1swXSkrJzwv"
-    "aDQ+PHA+Jytlc2Moc1sxXSkrJzwvcD4nK2V4dHJhKyc8L2Rpdj48L2Rpdj4nfSkuam9pbigiIik7CiBpZih1c2VyKWRvY3VtZW50"
-    "LmdldEVsZW1lbnRCeUlkKCJzdGVwcyIpLnNjcm9sbEludG9WaWV3KHtiZWhhdmlvcjoic21vb3RoIn0pfQpwaWNrKDAsZmFsc2Up"
-    "OwpmZXRjaCgiL3gvcm9zdGVyL2xpc3QiLHtjYWNoZToibm8tc3RvcmUifSkudGhlbihmdW5jdGlvbihyKXtyZXR1cm4gci5qc29u"
-    "KCl9KS50aGVuKGZ1bmN0aW9uKGQpe2lmKGQmJmQuY291bnQhPW51bGwpZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInNDaGFpbnMi"
-    "KS50ZXh0Q29udGVudD1kLmNvdW50fSkuY2F0Y2goZnVuY3Rpb24oKXt9KTsKZmV0Y2goIi94L3Bhc3Nwb3J0L3N0YXR1cyIse2Nh"
-    "Y2hlOiJuby1zdG9yZSJ9KS50aGVuKGZ1bmN0aW9uKHIpe3JldHVybiByLmpzb24oKX0pLnRoZW4oZnVuY3Rpb24oZCl7aWYoZCYm"
-    "ZC5wYXNzcG9ydHNfaXNzdWVkIT1udWxsKWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJzUGFzcyIpLnRleHRDb250ZW50PWQucGFz"
-    "c3BvcnRzX2lzc3VlZH0pLmNhdGNoKGZ1bmN0aW9uKCl7fSk7Cn0pKCk7Cjwvc2NyaXB0PjwvYm9keT48L2h0bWw+Cg=="
-)
-
-
-def _d(b):
-    return base64.b64decode("".join(b.split()))
-
-
-_FILES = {
-    "/start": (_d(_HTML_B64), "text/html; charset=utf-8"),
-}
-_patched = False
-
-
-def _find_handler_class(ctx):
-    if isinstance(ctx, dict):
-        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
-            v = ctx.get(k)
-            if v is None:
-                continue
-            cls = v if isinstance(v, type) else type(v)
-            if hasattr(cls, "do_GET"):
-                return cls
-    f = sys._getframe()
-    while f is not None:
-        s = f.f_locals.get("self")
-        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
-            return type(s)
-        f = f.f_back
-    return None
-
-
-def _install_page(ctx):
-    global _patched
-    if _patched:
-        return True
-    cls = _find_handler_class(ctx)
-    if cls is None:
-        return False
-    if getattr(cls, "_startpage_patched", False):
-        _patched = True
-        return True
-
-    original_do_GET = cls.do_GET
-
-    def do_GET(self):
-        path = self.path.split("?")[0].split("#")[0].rstrip("/") or "/"
-        hit = _FILES.get(path)
-        if hit:
-            body, ctype = hit
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        return original_do_GET(self)
-
-    cls.do_GET = do_GET
-    cls._startpage_patched = True
-    _patched = True
-    return True
-
-
-def handle(method, action, data, api_key, ctx):
-    armed = _install_page(ctx)
-    return ({"module": "startpage", "version": VERSION, "armed": armed,
-             "serves": sorted(_FILES.keys())}, 200)
-
-
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-```
-
-
-## `modules/stats.py`
-
-143 lines, 5540 bytes
-
-```python
-"""
-Live figures for the Proving Ground - /x/stats
-
-Charts on a compliance site are usually decoration. These are not, provided
-they show something a visitor could otherwise only take on trust: that the
-chain is genuinely growing, that decisions really are distributed across the
-thresholds rather than hand-picked, and that people who click through a
-review case behave exactly as the oversight argument predicts.
-
-WHAT IS PUBLISHED, AND WHAT IS NOT
-----------------------------------
-Public and no key, because a figure nobody can see proves nothing.
-
-Published: total chain height, hourly block counts, the verdict mix and score
-distribution of PUBLIC DEMO decisions only, and dwell times from public review
-cases.
-
-Never published: anything scoped to a customer key. No customer verdict mix,
-no customer volumes, no per-key anything. A visitor learns how the engine
-behaves, not how any operator's business is going. That distinction is the
-whole reason this endpoint can be open.
-
-    GET /x/stats        everything below
-    GET /x/stats/chain  chain height and hourly growth only
-"""
-
-import json, time
-from datetime import datetime, timezone
-
-VERSION = "1.0"
-PUBLIC = {("GET", ""), ("GET", "stats"), ("GET", "chain")}
-
-DEMO_KEY = "public_demo"
-
-
-def _iso(ts):
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-
-def _chain(ctx):
-    t = time.time()
-    with ctx["lock"]:
-        row = ctx["conn"].execute("SELECT COUNT(*),MIN(ts),MAX(ts) FROM audit_log").fetchone()
-        recent = ctx["conn"].execute("SELECT ts FROM audit_log WHERE ts>? ORDER BY ts ASC", (t - 86400,)).fetchall()
-    height = row[0] if row else 0
-    buckets = [0] * 24
-    for (ts,) in recent:
-        h = int((t - ts) // 3600)
-        if 0 <= h < 24:
-            buckets[23 - h] += 1
-    return {"height": height,
-            "first_block": _iso(row[1] if row else None),
-            "latest_block": _iso(row[2] if row else None),
-            "last_24h": buckets,
-            "blocks_last_24h": sum(buckets),
-            "note": "Every block, from every source. The chain is one sequence."}
-
-
-def _demo(ctx):
-    with ctx["lock"]:
-        rows = ctx["conn"].execute("SELECT result_json,ts FROM audit_log WHERE api_key=? ORDER BY id DESC LIMIT 2000", (DEMO_KEY,)).fetchall()
-    verdicts = {"ALLOW": 0, "CHALLENGE": 0, "BLOCK": 0}
-    # ten buckets of 0.1 across the score range
-    hist = [0] * 10
-    scores = []
-    for res, _ts in rows:
-        try:
-            r = json.loads(res)
-        except Exception:
-            continue
-        d = r.get("decision")
-        if d in verdicts:
-            verdicts[d] += 1
-            s = r.get("score")
-            if isinstance(s, (int, float)):
-                scores.append(s)
-                b = min(int(float(s) * 10), 9)
-                hist[b] += 1
-    total = sum(verdicts.values())
-    out = {"decisions": total, "verdicts": verdicts,
-           "score_histogram": hist,
-           "buckets": ["0.0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5",
-                       "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"],
-           "thresholds": {"allow_below": 0.35, "block_at_or_above": 0.70}}
-    if scores:
-        scores.sort()
-        out["median_score"] = round(scores[len(scores) // 2], 4)
-    return out
-
-
-def _oversight(ctx):
-    try:
-        with ctx["lock"]:
-            rows = ctx["conn"].execute("SELECT dwell,human_verdict,machine_verdict FROM demo_cases WHERE committed IS NOT NULL").fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return {"reviews": 0,
-                "note": "Nobody has taken a review case yet."}
-    dwells = sorted(r[0] for r in rows if r[0] is not None)
-    agreed = len([r for r in rows if (r[1] or "").upper() == (r[2] or "").upper()])
-    # dwell buckets in seconds
-    edges = [2, 5, 10, 20, 45, 90]
-    labels = ["under 2s", "2-5s", "5-10s", "10-20s", "20-45s", "45-90s", "over 90s"]
-    hist = [0] * 7
-    for d in dwells:
-        placed = False
-        for i, e in enumerate(edges):
-            if d < e:
-                hist[i] += 1
-                placed = True
-                break
-        if not placed:
-            hist[6] += 1
-    n = len(dwells)
-    return {"reviews": len(rows),
-            "agreed_with_engine": agreed,
-            "agreement_rate_pct": round(100 * agreed / len(rows), 1),
-            "median_dwell_seconds": (dwells[n // 2] if n else None),
-            "under_2_seconds": hist[0],
-            "under_2_seconds_pct": (round(100 * hist[0] / n, 1) if n else 0),
-            "dwell_histogram": hist,
-            "dwell_labels": labels,
-            "note": "Visitors who committed in under two seconds did not read the case. That is the pattern the oversight record is designed to make visible."}
-
-
-def handle(method, action, data, api_key, ctx):
-    if method != "GET":
-        return {"error": "unknown_action", "action": action}, 404
-    if action == "chain":
-        return {"stats_version": VERSION, "chain": _chain(ctx)}, 200
-    if action in ("", "stats"):
-        return {"stats_version": VERSION,
-                "generated": _iso(time.time()),
-                "chain": _chain(ctx),
-                "public_decisions": _demo(ctx),
-                "public_reviews": _oversight(ctx),
-                "scope": "Public demonstration activity and total chain height only. Nothing scoped to a customer key is published here."}, 200
-    return {"error": "unknown_action", "action": action,
-            "available": ["GET stats", "GET chain"]}, 404
 
 ```
