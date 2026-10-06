@@ -1174,6 +1174,7 @@ NOTARY_PAGE = _HEAD + r"""<title>Bitcoin Notary — sebbi.pro</title>
 <p class="sub" style="margin-top:12px">Or let an AI assistant do it: connect <a href="/connect">https://sebbi.pro/mcp</a> and ask it to notarise a file — agents can also read the discovery file below. Show you are anchored with a live badge:</p>
 <pre>&lt;img src="https://sebbi.pro/n/NT-XXXX-XXXX.svg" alt="Anchored in Bitcoin via sebbi.pro"&gt;</pre>
 <p class="sub" style="margin-top:12px">Machine-readable: <a href="/.well-known/sebbi-notary.json">/.well-known/sebbi-notary.json</a> · <a href="/x/notary/spec">full spec</a></p>
+<p class="sub" style="margin-top:12px">Want it all set up for you? <a href="/pilot">Governed in 7 days — £495</a>, live in 7 days or your money back.</p>
 </section>
 
 <section class="card">
@@ -1371,8 +1372,8 @@ HOME_STRIP = r"""<section class="ntx" aria-label="Bitcoin Notary">
 .ntx-k i{width:8px;height:8px;border-radius:50%;background:#f7931a;display:inline-block}
 .ntx h3{font-family:'Newsreader',Georgia,serif;font-weight:500;font-size:clamp(28px,4vw,42px);line-height:1.08;margin:0 0 10px}.ntx h3 em{color:#c9a84c}
 .ntx p.l{color:rgba(255,255,255,.66);font-size:15.5px;max-width:62ch;margin:0 0 22px}
-.ntx-g{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid rgba(247,147,26,.25);border-radius:14px;overflow:hidden}
-@media(max-width:760px){.ntx-g{grid-template-columns:1fr}}
+.ntx-g{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid rgba(247,147,26,.25);border-radius:14px;overflow:hidden}
+@media(max-width:980px){.ntx-g{grid-template-columns:1fr 1fr}}@media(max-width:560px){.ntx-g{grid-template-columns:1fr}}
 .ntx-g a{display:block;padding:22px;background:#0b1122;color:#fff;text-decoration:none;border-right:1px solid rgba(247,147,26,.15);transition:background .2s}
 .ntx-g a:hover,.ntx-g a:focus-visible{background:#111a33;outline:none}
 .ntx-g b{display:block;font-family:'Newsreader',Georgia,serif;font-weight:500;font-size:21px;margin-bottom:6px}
@@ -1386,6 +1387,7 @@ HOME_STRIP = r"""<section class="ntx" aria-label="Bitcoin Notary">
 <a href="/bitcoin"><b>Bitcoin Notary</b><span>Drop any file. Get a receipt written into Bitcoin. Free for everyone, open to every AI company.</span><em>sebbi.pro/bitcoin →</em></a>
 <a href="/forever"><b>Forever Proof</b><span>Check any sealed decision against Bitcoin itself, in your own browser. No account, no trust.</span><em>sebbi.pro/forever →</em></a>
 <a href="/keys"><b>Human Keys, in Bitcoin</b><span>Proof a human typed it — now dated by Bitcoin, so the original always comes first.</span><em>sebbi.pro/keys →</em></a>
+<a href="/pilot"><b>Governed in 7 days · £495</b><span>We set it up with you, write your rules and hand you a regulator-ready evidence file. Live in 7 days or your money back.</span><em>sebbi.pro/pilot →</em></a>
 </div></div></section>"""
 
 # shown on every Human Keys check page
@@ -1404,7 +1406,7 @@ var a=document.getElementById('ntxhk-v');a.href='/forever?code='+c;document.getE
 HOME_BUTTONS_B = (b'<a href="/bitcoin" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">BITCOIN</span>Bitcoin Notary &rarr;</a>'
                   b'<a href="/forever" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">FOREVER</span>Forever Proof &rarr;</a>'
                   b'<a href="/gateway" style="border:1.5px solid #8fd0ff"><span class="tag" style="background:#8fd0ff">ONE LINE</span>Govern every AI call &rarr;</a>'
-                  b'<a href="/pilot" style="border:1.5px solid #f0d78a"><span class="tag" style="background:#f0d78a">PILOT</span>Governed in 7 days &rarr;</a>')
+                  b'<a href="/pilot" style="border:1.5px solid #f0d78a"><span class="tag" style="background:#f0d78a">\xc2\xa3495</span>Governed in 7 days &rarr;</a>')
 HOME_BUTTONS_AT = b'<a href="/dossier" style='
 HOME_STRIP_B = HOME_STRIP.encode("utf-8")
 HK_PANEL_B = HK_PANEL.encode("utf-8")

@@ -766,7 +766,7 @@ def _gateway_page():
 <h1>Change one line.<br><em>Govern every AI call.</em></h1>
 <p>Point your app's OpenAI or Anthropic base URL at sebbi.pro. Every call is scored before it leaves, stopped if it should be, sealed into the chain, and answered with a receipt anyone can check against Bitcoin. No SDK. No integration project. Your provider key passes straight through.</p>
 </section>
-<section class="card"><h2>1 · Get your gateway URL</h2><p class="sub">Paste your sebbi.pro API key. No key yet? <a href="/connect">Get one free</a>. Your first 1,000 gateway calls are free; then add a card — 50p per device a month. Want us to set it all up? <a href="/pilot">Governed in 7 days</a>.</p>
+<section class="card"><h2>1 · Get your gateway URL</h2><p class="sub">Paste your sebbi.pro API key. No key yet? <a href="/connect">Get one free</a>. Your first 1,000 gateway calls are free; then add a card — 50p per device a month. Want us to set it all up? <a href="/pilot">Governed in 7 days — £495</a>.</p>
 <div class="row"><input type="text" id="k" placeholder="sebbi.pro API key" autocomplete="off"><button class="btn b" id="go">Get my gateway URL</button></div>
 <p class="msg" id="m"></p><pre id="out" hidden></pre></section>
 <section class="card"><h2>2 · Change one line</h2>
