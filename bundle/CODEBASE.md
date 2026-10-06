@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-174 files across 51 parts.
+175 files across 51 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -19,13 +19,14 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-03.md](CODEBASE-03.md)
 
 - `modules/auditbridge.py`
+- `modules/autopilot.py`
 - `modules/bind.py`
 - `modules/binddesk.py`
-- `modules/blocks.py`
-- `modules/brand.py`
 
 ## [CODEBASE-04.md](CODEBASE-04.md)
 
+- `modules/blocks.py`
+- `modules/brand.py`
 - `modules/capture.py`
 - `modules/cinema.py`
 - `modules/cinemafeed.py`

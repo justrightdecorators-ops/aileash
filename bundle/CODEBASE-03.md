@@ -2,10 +2,9 @@
 
 Contains:
 - `modules/auditbridge.py`
+- `modules/autopilot.py`
 - `modules/bind.py`
 - `modules/binddesk.py`
-- `modules/blocks.py`
-- `modules/brand.py`
 
 
 ## `modules/auditbridge.py`
@@ -502,6 +501,636 @@ def handle(method, action, data, api_key, ctx):
     return {"module": "auditbridge", "version": VERSION, "armed": armed,
             "serves": [PAGE] + ["/a/" + k for k in CMDS],
             "page": BASE + PAGE}, 200
+
+```
+
+
+## `modules/autopilot.py`
+
+622 lines, 30593 bytes
+
+```python
+"""
+modules/autopilot.py  v1.0.0  -  follows up everyone who comes in, on its own
+
+    Arm:     https://sebbi.pro/x/arm/status
+    Admin:   https://sebbi.pro/admin   (Monitor tab -> Autopilot)
+
+Every 30 minutes it looks at who signed up, what they have done, and where
+they are in their trial, and sends the one email that moves them on:
+
+  welcome     AI-opened accounts (the MCP connector sends no email itself):
+              their key and the one line to change
+  day 3       signed up, not one decision yet: the 2-minute setup, or the pilot
+  day 7       using it: a Forever Proof of one of their own decisions
+  trial -7    seven days left: keep going for 50p a device, with their figure
+  trial -1    last day
+  trial end   trial over: their chain is safe, one tap to carry on
+  pilot +1h   opened the £495 checkout and did not pay
+  pilot +24h  second and last reminder
+
+Only people who signed up or started a checkout are ever emailed. Every email
+carries an unsubscribe link (and the one-click unsubscribe header mail apps
+show), names a real reply address, and includes the customer's own referral
+code. Each step goes to each person once, ever. At most one email per person
+in 36 hours (pilot reminders apart), 40 per run, 150 a day.
+
+The payment link in trial emails never goes stale: it opens a page here that
+makes a fresh Stripe checkout for the real device count at the moment it is
+tapped.
+
+Switch: pause and resume from the admin Monitor, or set AUTOPILOT=0 on
+Railway. AUTOPILOT_DRY=1 records what it would send without sending.
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+SITE = "https://sebbi.pro"
+PUBLIC = {("GET", "status"), ("GET", "queue"), ("GET", "log"), ("POST", "pause"), ("POST", "resume"), ("POST", "run"),
+          ("GET", "")}
+TRIAL_DAYS = 90
+INTERVAL = int(os.environ.get("AUTOPILOT_INTERVAL", "1800"))
+PER_RUN = int(os.environ.get("AUTOPILOT_PER_RUN", "40"))
+PER_DAY = int(os.environ.get("AUTOPILOT_PER_DAY", "150"))
+GAP = 36 * 3600
+BREVO = os.environ.get("AUTOPILOT_BREVO_BASE", "https://api.brevo.com/v3").rstrip("/")
+SENDER = {"name": "sebbi.pro", "email": "justrightdecorators@gmail.com"}
+REPLY_TO = {"name": "Monop Content", "email": "justrightdecorators@gmail.com"}
+SKIP_DOMAIN = re.compile(r"@(example\.(com|org|net)|[^@]*\.(test|invalid|example|localhost))$", re.I)
+EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,24}$")
+
+_state = {"ready": False, "worker": False, "paused": os.environ.get("AUTOPILOT", "1") == "0", "runs": 0,
+          "sent_since_start": 0, "last_run": None, "last_result": None, "last_error": None, "pages": False}
+_lock = threading.Lock()
+_run_lock = threading.Lock()
+_EPHEMERAL = secrets.token_bytes(32)
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if not hasattr(m, "get_bearer"):
+        m = sys.modules.get("server")
+    return m
+
+
+def _secret():
+    s = os.environ.get("LICENCE_SECRET") or ""
+    return s.encode() if s else _EPHEMERAL
+
+
+def _iso(ts):
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _db(sql, args=(), one=False, write=False):
+    s = _srv()
+    with s._db_lock:
+        cur = s._conn.execute(sql, args)
+        if write:
+            s._conn.commit()
+            return cur.lastrowid
+        return cur.fetchone() if one else cur.fetchall()
+
+
+def _safe(sql, args=()):
+    try:
+        return _db(sql, args)
+    except Exception:
+        return []
+
+
+def _setup():
+    s = _srv()
+    with s._db_lock:
+        c = s._conn
+        c.execute("CREATE TABLE IF NOT EXISTS autopilot_sent(email TEXT, step TEXT, ref TEXT, at REAL, status TEXT,"
+                  "subject TEXT, PRIMARY KEY(email, step, ref))")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ap_at ON autopilot_sent(at)")
+        c.execute("CREATE TABLE IF NOT EXISTS autopilot_optout(email TEXT PRIMARY KEY, at REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS autopilot_link(token TEXT PRIMARY KEY, api_key TEXT, created REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS autopilot_meta(k TEXT PRIMARY KEY, v TEXT)")
+        c.commit()
+    r = _db("SELECT v FROM autopilot_meta WHERE k='paused'", one=True)
+    if r is not None and os.environ.get("AUTOPILOT", "1") != "0":
+        _state["paused"] = r[0] == "1"
+
+
+def _set_paused(p):
+    _state["paused"] = p
+    _db("INSERT OR REPLACE INTO autopilot_meta(k,v) VALUES('paused',?)", ("1" if p else "0",), write=True)
+
+
+# ---------------------------------------------------------------------------
+# links
+# ---------------------------------------------------------------------------
+
+def _unsub_token(email):
+    return hmac.new(_secret(), ("unsub|" + email.lower()).encode(), hashlib.sha256).hexdigest()[:24]
+
+
+def unsubscribe_url(email):
+    return "%s/unsubscribe?e=%s&t=%s" % (SITE, urllib.parse.quote(email), _unsub_token(email))
+
+
+def continue_url(api_key):
+    r = _db("SELECT token FROM autopilot_link WHERE api_key=?", (api_key,), one=True)
+    if r:
+        tok = r[0]
+    else:
+        tok = secrets.token_urlsafe(18)
+        _db("INSERT INTO autopilot_link(token,api_key,created) VALUES(?,?,?)", (tok, api_key, time.time()), write=True)
+    return "%s/continue?t=%s" % (SITE, tok)
+
+
+def _referral(key, email, name):
+    r = _db("SELECT code FROM referrals WHERE referrer_key=? ORDER BY created LIMIT 1", (key,), one=True)
+    if r:
+        return r[0]
+    try:
+        return _srv().create_referral(key, email, name or email.split("@")[0])
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# the emails
+# ---------------------------------------------------------------------------
+
+def _esc(t):
+    return str(t if t is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _wrap(preheader, heading, paras, cta=None, after=None, email="", ref=None):
+    btn = ""
+    if cta:
+        btn = ('<tr><td style="padding:8px 0 22px"><a href="%s" style="display:inline-block;background:#c9a84c;color:#0a0f1e;'
+               'text-decoration:none;font-weight:700;font-size:16px;padding:14px 22px;border-radius:8px">%s</a></td></tr>'
+               % (_esc(cta[1]), _esc(cta[0])))
+    body = "".join('<p style="margin:0 0 14px;font-size:16px;line-height:1.6;color:#2b2f3a">%s</p>' % p for p in paras)
+    tail = "".join('<p style="margin:0 0 12px;font-size:14px;line-height:1.6;color:#555b6b">%s</p>' % p for p in (after or []))
+    refline = ""
+    if ref:
+        refline = ('<p style="margin:0 0 10px;font-size:13px;color:#6b7180">Know someone who should be using this? Your referral '
+                   'code is <b style="color:#0a0f1e;font-family:monospace">%s</b> &mdash; they enter it when they sign up and you\'re '
+                   'credited for every device they bring.</p>' % _esc(ref))
+    return ('<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f3f4f7">'
+            '<span style="display:none;max-height:0;overflow:hidden;opacity:0">%s</span>'
+            '<table width="100%%" cellpadding="0" cellspacing="0" style="background:#f3f4f7;padding:22px 10px"><tr><td align="center">'
+            '<table width="100%%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif">'
+            '<tr><td style="background:#0a0f1e;padding:22px 26px;border-bottom:3px solid #c9a84c">'
+            '<span style="font-family:Georgia,serif;font-size:24px;color:#ffffff;font-weight:700">sebbi<span style="color:#c9a84c">.pro</span></span></td></tr>'
+            '<tr><td style="padding:28px 26px 8px"><h1 style="margin:0 0 16px;font-family:Georgia,serif;font-weight:600;font-size:25px;line-height:1.25;color:#0a0f1e">%s</h1>'
+            '%s<table cellpadding="0" cellspacing="0">%s</table>%s</td></tr>'
+            '<tr><td style="padding:16px 26px 24px;border-top:1px solid #eceef3">%s'
+            '<p style="margin:0;font-size:12px;color:#8a8f9c;line-height:1.6">Monop Content &middot; sebbi.pro &middot; Just reply to this email to reach us.<br>'
+            'You\'re getting this because you signed up at sebbi.pro. <a href="%s" style="color:#8a8f9c">Unsubscribe</a></p>'
+            '</td></tr></table></td></tr></table></body></html>'
+            % (_esc(preheader), heading, body, btn, tail, refline, _esc(unsubscribe_url(email))))
+
+
+def _text(heading, paras, cta=None, after=None, email="", ref=None):
+    strip = lambda h: re.sub(r"<[^>]+>", "", h).replace("&amp;", "&").replace("&mdash;", "-").replace("&pound;", "£").replace("&rsquo;", "'")
+    out = [strip(heading), ""] + [strip(p) for p in paras]
+    if cta:
+        out += ["", "%s: %s" % (cta[0], cta[1])]
+    out += [""] + [strip(p) for p in (after or [])]
+    if ref:
+        out += ["", "Your referral code: %s" % ref]
+    out += ["", "Monop Content · sebbi.pro · reply to reach us", "Unsubscribe: %s" % unsubscribe_url(email)]
+    return "\n".join(out)
+
+
+def compose(step, c):
+    """Build (subject, html, text) for one step and one customer dict."""
+    first = _esc((c.get("name") or "").split()[0]) if c.get("name") else ""
+    hi = ("%s, " % first) if first else ""
+    E, R = c["email"], c.get("ref")
+    if step == "welcome":
+        subject = "You're live on sebbi.pro — your key inside"
+        head = "You're set up%s." % ((", " + first) if first else "")
+        paras = ["Your AI assistant opened your sebbi.pro account. Here's everything in one place.",
+                 "<b>Your API key</b> (keep it secret):<br><code style=\"font-size:13px;background:#f3f4f7;padding:6px 8px;border-radius:5px;display:inline-block;word-break:break-all\">%s</code>" % _esc(c["key"]),
+                 "<b>The one line to change:</b> point your app's OpenAI or Anthropic base URL at your private sebbi.pro gateway. Every AI call is then scored, sealed and provable against Bitcoin."]
+        cta = ("Get your gateway URL", SITE + "/gateway")
+        after = ["Rather we did it all for you? <a href=\"%s/pilot\" style=\"color:#8a6f2a\">Governed in 7 days — £495</a>, live in 7 days or your money back." % SITE]
+    elif step == "day3":
+        subject = "Two minutes to your first sealed AI decision"
+        head = "%sone line and you're governed." % (hi.capitalize() if hi else "")
+        head = head[0].upper() + head[1:]
+        paras = ["You signed up for sebbi.pro a few days ago but haven't sealed a decision yet. Here's the quickest way in:",
+                 "1. Get your private gateway URL.<br>2. Paste it as the base URL in your OpenAI or Anthropic code.<br>3. Run your app as normal. Every call is now scored, sealed and written into Bitcoin.",
+                 "No SDK, no project. Your provider key stays in your app."]
+        cta = ("Do it now — 2 minutes", SITE + "/gateway")
+        after = ["Building with Lovable, Zapier, Python or something else? Every stack is covered at <a href=\"%s/connect\" style=\"color:#8a6f2a\">sebbi.pro/connect</a>." % SITE,
+                 "Or let us set it up with you: <a href=\"%s/pilot\" style=\"color:#8a6f2a\">governed in 7 days — £495</a>." % SITE]
+    elif step == "day7":
+        n = int(c.get("decisions") or 0)
+        subject = "%s decision%s sealed — check one against Bitcoin" % ("{:,}".format(n), "" if n == 1 else "s")
+        head = "Your AI decisions are now provable."
+        paras = ["%syou've sealed <b>%s</b> decision%s on sebbi.pro. Each one is chained, witnessed and written into Bitcoin every hour." % (hi.capitalize() if hi else "", "{:,}".format(n), "" if n == 1 else "s"),
+                 "Here's the part your customers, auditors and regulators will love: anyone can check one of your decisions against Bitcoin, in their own browser, without trusting you or us."]
+        cta = ("Check your latest decision", "%s/forever?block=%s" % (SITE, c.get("last_block") or ""))
+        after = ["Send that link to anyone who asks how you govern your AI."]
+    elif step in ("trial7", "trial1", "trialend"):
+        devs = max(1, int(c.get("devices") or 0))
+        cost = "£%.2f" % (devs * 0.5)
+        link = c.get("continue_url") or SITE
+        if step == "trial7":
+            dl = max(2, int(c.get("days_left") or 7))
+            subject = "%d days left on your sebbi.pro trial" % dl
+            head = "%d days left — keep every decision provable." % dl
+            paras = ["%syour free trial ends in %d days. Everything you've sealed stays in your chain and in Bitcoin, whatever you decide." % (hi.capitalize() if hi else "", dl),
+                     "To carry on it's 50p per device a month. You're on <b>%d device%s</b>, so that's <b>%s a month</b>. No contract, cancel any time." % (devs, "" if devs == 1 else "s", cost)]
+            cta = ("Keep going — %s a month" % cost, link)
+        elif step == "trial1":
+            subject = "Your sebbi.pro trial ends tomorrow"
+            head = "Last day of your free trial."
+            paras = ["%syour trial ends tomorrow. After that, new decisions stop being sealed until a card is added." % (hi.capitalize() if hi else ""),
+                     "%d device%s at 50p each — <b>%s a month</b>." % (devs, "" if devs == 1 else "s", cost)]
+            cta = ("Add a card — 30 seconds", link)
+        else:
+            subject = "Your trial has ended — your chain is safe"
+            head = "Your trial has ended. Nothing is lost."
+            paras = ["%syour free trial is over. Every decision you sealed is still in your chain and still provable against Bitcoin." % (hi.capitalize() if hi else ""),
+                     "Pick up exactly where you left off for <b>%s a month</b> (%d device%s at 50p)." % (cost, devs, "" if devs == 1 else "s")]
+            cta = ("Carry on", link)
+        after = ["Questions? Just reply — a person reads every email."]
+    elif step in ("pilot1h", "pilot24h"):
+        co = _esc(c.get("company") or "your business")
+        if step == "pilot1h":
+            subject = "Your pilot is one step away"
+            head = "%sgoverned in 7 days is one step away." % (hi.capitalize() if hi else "")
+            head = head[0].upper() + head[1:]
+            paras = ["You started the sebbi.pro pilot for %s but didn't finish checking out. No problem — it takes a minute." % co,
+                     "The moment you pay, your API key and gateway are live. Within 7 days: a setup call, rules for your business and a regulator-ready evidence file. Live in 7 days or your money back."]
+            cta = ("Finish — £495", SITE + "/pilot")
+        else:
+            subject = "Still want your AI governed this week?"
+            head = "Still want it done this week?"
+            paras = ["Yesterday you started the pilot for %s. If now's not the time, no hard feelings — this is the last reminder." % co,
+                     "If it is: every AI decision scored, sealed and provable against Bitcoin, set up with you, in 7 days or your money back."]
+            cta = ("Start the pilot", SITE + "/pilot")
+        after = ["Want to talk it through first? Just reply."]
+        R = None
+    else:
+        raise ValueError(step)
+    preheader = re.sub(r"<[^>]+>", "", paras[0])[:110]
+    return subject, _wrap(preheader, head, paras, cta, after, E, R), _text(head, paras, cta, after, E, R)
+
+
+# ---------------------------------------------------------------------------
+# who is due
+# ---------------------------------------------------------------------------
+
+def _excluded(email):
+    s = _srv()
+    e = (email or "").strip().lower()
+    if not EMAIL_RE.match(e) or SKIP_DOMAIN.search(e):
+        return True
+    if e == str(getattr(s, "OWNER_EMAIL", "")).lower():
+        return True
+    return False
+
+
+def due(now=None, include_test_domains=False):
+    now = now or time.time()
+    out = []
+    optout = {r[0] for r in _safe("SELECT email FROM autopilot_optout")}
+    sent = {(r[0], r[1], r[2]) for r in _safe("SELECT email, step, ref FROM autopilot_sent")}
+    ai_fps = {r[0] for r in _safe("SELECT email_fp FROM mcp_agreement")}
+    pilot_keys = {r[0] for r in _safe("SELECT api_key FROM pilot_order WHERE status='paid'")}
+    dec = {}
+    for k, n, last in _safe("SELECT api_key, COUNT(*), MAX(id) FROM audit_log WHERE api_key IS NOT NULL AND api_key!='' GROUP BY api_key"):
+        dec[k] = (n, last)
+    devs = dict(_safe("SELECT api_key, COUNT(*) FROM device_seen GROUP BY api_key"))
+
+    def add(step, ref, c):
+        e = c["email"].strip().lower()
+        if e in optout or (e, step, ref) in sent:
+            return
+        if not include_test_domains and _excluded(e):
+            return
+        c = dict(c, email=e)
+        out.append((step, ref, c))
+
+    for key, email, name, org, product, created, paid, active in _safe(
+            "SELECT key,email,name,org,product,created,is_paid,active FROM api_keys"):
+        if not email or not active:
+            continue
+        created = created or now
+        age = now - created
+        n, last = dec.get(key, (0, None))
+        c = {"key": key, "email": email, "name": name or "", "org": org or "", "product": product or "aileash",
+             "decisions": n, "last_block": last, "devices": devs.get(key, 0)}
+        efp = hashlib.sha256(email.strip().lower().encode()).hexdigest()
+        if efp in ai_fps and age < 2 * 86400 and key not in pilot_keys:
+            add("welcome", key[-12:], c)
+        if not paid and n == 0 and 3 * 86400 <= age < 10 * 86400:
+            add("day3", key[-12:], c)
+        if n > 0 and 7 * 86400 <= age < 14 * 86400:
+            add("day7", key[-12:], c)
+        if not paid:
+            left = created + TRIAL_DAYS * 86400 - now
+            c["days_left"] = int(left // 86400) + (1 if left % 86400 else 0)
+            if 0 < left <= 7 * 86400 and left > 2 * 86400:
+                add("trial7", key[-12:], c)
+            elif 0 < left <= 1.5 * 86400:
+                add("trial1", key[-12:], c)
+            elif -3 * 86400 < left <= 0:
+                add("trialend", key[-12:], c)
+    for sid, created, name, email, company, status in _safe(
+            "SELECT session_id, created, name, email, company, status FROM pilot_order WHERE status!='paid'"):
+        if not email:
+            continue
+        paid_since = _safe("SELECT 1 FROM pilot_order WHERE email=? AND status='paid' AND created>=?", (email, created))
+        if paid_since:
+            continue
+        age = now - (created or now)
+        c = {"email": email, "name": name or "", "company": company or ""}
+        if 3600 <= age < 20 * 3600:
+            add("pilot1h", sid[-16:], c)
+        elif 24 * 3600 <= age < 72 * 3600:
+            add("pilot24h", sid[-16:], c)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# sending
+# ---------------------------------------------------------------------------
+
+def _brevo(to_email, to_name, subject, html, text, step):
+    key = os.environ.get("BREVO_API_KEY", "").strip()
+    if not key:
+        return "no_email_key"
+    payload = {"sender": SENDER, "replyTo": REPLY_TO, "to": [{"email": to_email, "name": to_name or to_email}],
+               "subject": subject, "htmlContent": html, "textContent": text, "tags": ["autopilot", step],
+               "headers": {"List-Unsubscribe": "<%s>" % unsubscribe_url(to_email),
+                           "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"}}
+    try:
+        req = urllib.request.Request(BREVO + "/smtp/email", data=json.dumps(payload).encode(), method="POST",
+                                     headers={"api-key": key, "Content-Type": "application/json", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return "sent" if 200 <= r.status < 300 else "error_%d" % r.status
+    except urllib.error.HTTPError as e:
+        return "error_%d" % e.code
+    except Exception as e:
+        return "error_%s" % type(e).__name__
+
+
+def run_once(force=False, include_test_domains=False):
+    if not _run_lock.acquire(blocking=False):
+        return {"busy": True}
+    try:
+        if _state["paused"] and not force:
+            return {"paused": True}
+        now = time.time()
+        dry = os.environ.get("AUTOPILOT_DRY", "0") == "1"
+        today = now - (now % 86400)
+        sent_today = _db("SELECT COUNT(*) FROM autopilot_sent WHERE at>=? AND status='sent'", (today,), one=True)[0]
+        recent = {r[0]: r[1] for r in _safe("SELECT email, MAX(at) FROM autopilot_sent WHERE status='sent' GROUP BY email")}
+        result = {"due": 0, "sent": 0, "dry": 0, "held": 0, "errors": 0, "steps": {}}
+        items = due(now, include_test_domains)
+        result["due"] = len(items)
+        order = {"pilot1h": 0, "pilot24h": 1, "trial1": 2, "trialend": 3, "trial7": 4, "welcome": 5, "day3": 6, "day7": 7}
+        items.sort(key=lambda x: order.get(x[0], 9))
+        done_this_run = set()
+        for step, ref, c in items:
+            if result["sent"] + result["dry"] >= PER_RUN or sent_today + result["sent"] >= PER_DAY:
+                break
+            e = c["email"]
+            if not step.startswith("pilot") and (e in done_this_run or (recent.get(e) and now - recent[e] < GAP)):
+                result["held"] += 1
+                continue
+            if step.startswith("trial"):
+                c["continue_url"] = continue_url(c["key"])
+            if "key" in c:
+                c["ref"] = _referral(c["key"], e, c.get("name"))
+            subject, html, text = compose(step, c)
+            status = "dry" if dry else _brevo(e, c.get("name"), subject, html, text, step)
+            if status == "no_email_key":
+                result["errors"] += 1
+                _state["last_error"] = "BREVO_API_KEY is not set, so nothing can be emailed"
+                break
+            if status in ("sent", "dry"):
+                _db("INSERT OR IGNORE INTO autopilot_sent(email,step,ref,at,status,subject) VALUES(?,?,?,?,?,?)",
+                    (e, step, ref, now, status, subject), write=True)
+                done_this_run.add(e)
+                result["sent" if status == "sent" else "dry"] += 1
+                result["steps"][step] = result["steps"].get(step, 0) + 1
+            else:
+                result["errors"] += 1
+                _state["last_error"] = "send %s: %s" % (step, status)
+        _state["runs"] += 1
+        _state["sent_since_start"] += result["sent"]
+        _state["last_run"] = _iso(now)
+        _state["last_result"] = result
+        return result
+    except Exception as e:
+        _state["last_error"] = "run: %s" % str(e)[:150]
+        return {"error": str(e)[:150]}
+    finally:
+        _run_lock.release()
+
+
+def _worker():
+    time.sleep(int(os.environ.get("AUTOPILOT_FIRST_DELAY", "600")))
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            _state["last_error"] = "worker: %s" % str(e)[:120]
+        time.sleep(INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# pages: unsubscribe, and the payment link that never goes stale
+# ---------------------------------------------------------------------------
+
+def _page(title, heading, body, status=200):
+    return ('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<meta name="robots" content="noindex"><title>%s — sebbi.pro</title><style>body{margin:0;background:#0a0f1e;color:#fff;'
+            'font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif}.w{max-width:520px;margin:12vh auto;padding:0 18px}'
+            '.b{font-family:Georgia,serif;font-size:22px}.b span{color:#c9a84c}h1{font-family:Georgia,serif;font-weight:600;font-size:30px;'
+            'margin:28px 0 12px}p{color:rgba(255,255,255,.7);line-height:1.6}a{color:#f0d78a}</style></head><body><div class="w">'
+            '<div class="b">sebbi<span>.pro</span></div><h1>%s</h1>%s</div></body></html>' % (_esc(title), heading, body)), status
+
+
+def _send(h, page):
+    body, status = page
+    raw = body.encode("utf-8")
+    h.send_response(status)
+    h.send_header("Content-Type", "text/html; charset=utf-8")
+    h.send_header("Content-Length", str(len(raw)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    if getattr(h, "command", "GET") != "HEAD":
+        h.wfile.write(raw)
+
+
+def _redirect(h, url):
+    h.send_response(302)
+    h.send_header("Location", url)
+    h.send_header("Content-Length", "0")
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+
+
+def _unsubscribe(q):
+    e = (q.get("e") or [""])[0].strip().lower()
+    t = (q.get("t") or [""])[0]
+    if not e or not hmac.compare_digest(t, _unsub_token(e)):
+        return _page("Unsubscribe", "That link didn't work.", "<p>Reply to any of our emails and we'll take you off by hand.</p>", 400)
+    _db("INSERT OR IGNORE INTO autopilot_optout(email,at) VALUES(?,?)", (e, time.time()), write=True)
+    return _page("Unsubscribed", "You're unsubscribed.",
+                 "<p>We won't send you follow-up emails again. Your account, key and sealed decisions are untouched.</p>"
+                 "<p><a href=\"%s\">Back to sebbi.pro</a></p>" % SITE)
+
+
+def _continue(h, q):
+    t = (q.get("t") or [""])[0]
+    r = _db("SELECT api_key FROM autopilot_link WHERE token=?", (t,), one=True) if t else None
+    if not r:
+        return _send(h, _page("Continue", "That link has expired.", "<p>Reply to our email, or sign in again at <a href=\"%s\">sebbi.pro</a>.</p>" % SITE, 404))
+    s = _srv()
+    ki = s.get_key(r[0])
+    if not ki:
+        return _send(h, _page("Continue", "We couldn't find that account.", "<p>Reply to our email and we'll sort it.</p>", 404))
+    if ki[3]:
+        return _send(h, _page("All set", "You're already paying — thank you.", "<p>Nothing else to do. Every decision keeps sealing.</p>"))
+    url = None
+    try:
+        url = s.trial_checkout(r[0], ki[0], ki[6] or "aileash")
+    except Exception as e:
+        _state["last_error"] = "continue: %s" % str(e)[:120]
+    if url and url.startswith("https://checkout.stripe.com"):
+        return _redirect(h, url)
+    return _send(h, _page("Continue", "Card payments are briefly unavailable.", "<p>Reply to our email and we'll send a payment link by hand.</p>", 503))
+
+
+def _install_pages():
+    if _state["pages"]:
+        return True
+    H = getattr(_srv(), "Handler", None)
+    if H is None:
+        return False
+    if getattr(H, "_autopilot_pages", False):
+        _state["pages"] = True
+        return True
+    orig_get, orig_post = H.do_GET, H.do_POST
+
+    def do_GET(self):
+        p, _, q = (self.path or "").partition("?")
+        p = p.rstrip("/")
+        try:
+            if p == "/unsubscribe":
+                return _send(self, _unsubscribe(urllib.parse.parse_qs(q)))
+            if p == "/continue":
+                return _continue(self, urllib.parse.parse_qs(q))
+        except Exception as e:
+            _state["last_error"] = "page: %s" % str(e)[:120]
+        return orig_get(self)
+
+    def do_POST(self):
+        p, _, q = (self.path or "").partition("?")
+        if p.rstrip("/") == "/unsubscribe":   # mail apps' one-click unsubscribe
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(min(n, 4096))
+                return _send(self, _unsubscribe(urllib.parse.parse_qs(q)))
+            except Exception as e:
+                _state["last_error"] = "unsub: %s" % str(e)[:120]
+        return orig_post(self)
+
+    H.do_GET = do_GET
+    H.do_POST = do_POST
+    H._autopilot_pages = True
+    _state["pages"] = True
+    return True
+
+
+# ---------------------------------------------------------------------------
+# admin
+# ---------------------------------------------------------------------------
+
+def _is_admin():
+    try:
+        from modules import monitor as M
+    except Exception:
+        import monitor as M
+    return M._is_admin()
+
+
+def _queue():
+    items = due()
+    return [{"step": s, "email": c["email"], "name": c.get("name"), "company": c.get("org") or c.get("company")} for s, r, c in items[:100]]
+
+
+def _log(limit=100):
+    return [{"utc": _iso(a), "email": e, "step": s, "status": st, "subject": sub} for e, s, a, st, sub in
+            _safe("SELECT email, step, at, status, subject FROM autopilot_sent ORDER BY at DESC LIMIT ?", (limit,))]
+
+
+def arm():
+    with _lock:
+        if not _state["ready"]:
+            _setup()
+            _state["ready"] = True
+        _install_pages()
+        if not _state["worker"]:
+            _state["worker"] = True
+            threading.Thread(target=_worker, name="autopilot", daemon=True).start()
+
+
+def status():
+    t0 = time.time() - time.time() % 86400
+    return {"module": "autopilot", "version": VERSION, "armed": _state["pages"], "paused": _state["paused"],
+            "email_configured": bool(os.environ.get("BREVO_API_KEY")), "dry_run": os.environ.get("AUTOPILOT_DRY", "0") == "1",
+            "every_minutes": INTERVAL // 60, "sent_today": _db("SELECT COUNT(*) FROM autopilot_sent WHERE at>=? AND status='sent'", (t0,), one=True)[0],
+            "sent_total": _db("SELECT COUNT(*) FROM autopilot_sent WHERE status='sent'", one=True)[0],
+            "unsubscribed": _db("SELECT COUNT(*) FROM autopilot_optout", one=True)[0],
+            "last_run": _state["last_run"], "last_result": _state["last_result"], "last_error": _state["last_error"]}
+
+
+def handle(method, action, data, api_key, ctx):
+    try:
+        arm()
+    except Exception as e:
+        _state["last_error"] = "arm: %s" % str(e)[:150]
+    data = data or {}
+    if action in ("", "status"):
+        return status(), 200
+    if not _is_admin():
+        return {"error": "admin_only", "message": "Log in at https://sebbi.pro/admin"}, 401
+    if action == "queue":
+        q = _queue()
+        return {"due_now": len(q), "queue": q, "status": status()}, 200
+    if action == "log":
+        return {"log": _log()}, 200
+    if action == "pause" and method == "POST":
+        _set_paused(True)
+        return {"paused": True}, 200
+    if action == "resume" and method == "POST":
+        _set_paused(False)
+        return {"paused": False}, 200
+    if action == "run" and method == "POST":
+        return run_once(force=True, include_test_domains=bool(data.get("include_test_domains"))), 200
+    return {"error": "unknown_action", "action": action}, 404
 
 ```
 
@@ -1563,635 +2192,5 @@ def handle(method, action, data, api_key, ctx):
                 "note": "Use the page at /bind-desk."}, 401
 
     return {"error": "unknown_action", "GET": ["status"]}, 404
-
-```
-
-
-## `modules/blocks.py`
-
-397 lines, 15562 bytes
-
-```python
-"""
-modules/blocks.py  v1.0.1
-=========================
-Paged reads of the audit chain, for the command centre.
-
-WHY THIS EXISTS
----------------
-/admin/audit calls verify_chain() on every single request. That rewalks and
-rehashes every block in the chain while holding the database lock, so the
-cost of asking for twenty rows is the cost of re-verifying the whole log.
-On a single replica that hold is long enough for Railway to decide the app
-has stopped responding, and the container gets killed -- which also wipes
-the in-memory admin tokens, so the next call comes back 401.
-
-This module does the one thing the block view actually needs: read rows.
-No verification, no rehashing, no full-table walk. Verification stays where
-it belongs, on its own route, run deliberately.
-
-WHAT IT ADDS
-------------
-offset. /admin/audit has no offset and caps at 1000, so nothing older than
-the newest thousand blocks could ever be reached. This pages through the
-entire chain, oldest to newest or newest to oldest, in small bites.
-
-v1.0.1 -- THE COMMENT WAS WRONG, SO THE CODE IS NOW RIGHT
----------------------------------------------------------
-v1.0 said column names were read from the live schema so a future ALTER TABLE
-could not silently break it. They were not. The SELECT was hardcoded and rows
-were unpacked by position, r[0] through r[5], with the discovered column set
-passed into the row shaper and never used. Renaming or reordering a column
-would have 500'd every route.
-
-Now it genuinely does what it said: PRAGMA table_info picks the real column
-names once, each candidate is resolved against what actually exists, rows come
-back as dicts keyed by name, and a missing column is reported in /status
-instead of surfacing as a query error later. Same discipline complete.py uses.
-
-ROUTES
-------
-  GET  /x/blocks/status                       module state, row count, schema
-  GET  /x/blocks/list?limit=&offset=&order=   a page of blocks
-  GET  /x/blocks/get?seq=                     one block in full
-  GET  /x/blocks/around?seq=&span=            a window either side of a block
-  GET  /x/blocks/links?limit=&offset=         link check over a page only
-  GET  /x/blocks/spec                         what this serves
-
-Every route is keyed. Audit rows are not public.
-
-LINK CHECKING
--------------
-/links checks prev_hash against the preceding row's audit_hash across the
-page you asked for, and nothing else. It reports which pairs it compared so
-a caller can never mistake a clean page for a clean chain. Whole-chain
-verification is /api/verify-chain and is deliberately not duplicated here.
-"""
-
-import json
-
-VERSION = "1.0.1"
-
-# Nothing here is public. Audit rows are customer data.
-PUBLIC = set()
-
-MAX_LIMIT = 200          # a page, not a dump
-DEFAULT_LIMIT = 50
-MAX_SPAN = 100
-
-# What this module needs, and the column names it will accept for each. The
-# first name that exists in the live table wins. Nothing is assumed.
-WANTED = {
-    "seq": ["id", "rowid", "block_index", "seq"],
-    "ts": ["ts", "timestamp", "created", "time"],
-    "user_id": ["user_id", "subject", "customer_id"],
-    "result": ["result_json", "result", "payload", "event_json"],
-    "prev_hash": ["prev_hash", "previous_hash", "prev"],
-    "audit_hash": ["audit_hash", "hash", "seal"],
-}
-
-_schema = {"resolved": None, "missing": None, "columns": None}
-
-
-def _ctx_get(ctx, name):
-    """ctx may be an object with attributes or a plain dict, depending on how
-    the router builds it. Take either rather than assuming."""
-    v = getattr(ctx, name, None)
-    if v is None and isinstance(ctx, dict):
-        v = ctx.get(name)
-    return v
-
-
-class _NoLock(object):
-    """Used only if the router hands us no lock, so a missing lock degrades
-    to running without one instead of raising on entry."""
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-
-def _one(v):
-    """A query value can arrive as a string or as a one-item list, depending
-    on how the querystring was parsed. Take either."""
-    if isinstance(v, (list, tuple)):
-        return v[0] if v else ""
-    return v
-
-
-def _cols(conn):
-    try:
-        return [r[1] for r in conn.execute("PRAGMA table_info(audit_log)").fetchall()]
-    except Exception:
-        return []
-
-
-def _resolve(conn):
-    """Work out, once, which real column serves each role. Cached because the
-    schema does not change between requests, re-derived if it ever comes back
-    empty so a transient failure does not stick."""
-    if _schema["resolved"]:
-        return _schema["resolved"], _schema["missing"]
-    cols = _cols(conn)
-    lower = {c.lower(): c for c in cols}
-    resolved, missing = {}, []
-    for role, candidates in WANTED.items():
-        hit = None
-        for cand in candidates:
-            if cand.lower() in lower:
-                hit = lower[cand.lower()]
-                break
-        if hit:
-            resolved[role] = hit
-        else:
-            missing.append(role)
-    if resolved:
-        _schema["resolved"] = resolved
-        _schema["missing"] = missing
-        _schema["columns"] = cols
-    return resolved, missing
-
-
-def _select(resolved, roles):
-    """Build a SELECT from real column names, aliased to the role names, so
-    rows come back keyed by role and never by position."""
-    parts = ["%s AS %s" % (resolved[r], r) for r in roles if r in resolved]
-    return "SELECT " + ",".join(parts) + " FROM audit_log"
-
-
-def _dicts(cur):
-    names = [d[0] for d in cur.description]
-    return [dict(zip(names, row)) for row in cur.fetchall()]
-
-
-def _int(data, name, default, lo, hi):
-    try:
-        v = int(_one(data.get(name, default)))
-    except Exception:
-        return default
-    if v < lo:
-        return lo
-    if v > hi:
-        return hi
-    return v
-
-
-def _str(data, name, default=""):
-    v = _one(data.get(name, default))
-    return "" if v is None else str(v).strip()
-
-
-def _shape(d):
-    """One row, from a dict keyed by role. Missing roles come back as None
-    rather than raising, so a partial schema degrades instead of failing."""
-    out = {
-        "seq": d.get("seq"),
-        "ts": d.get("ts"),
-        "user_id": d.get("user_id"),
-        "prev_hash": d.get("prev_hash"),
-        "audit_hash": d.get("audit_hash"),
-    }
-    raw = d.get("result")
-    try:
-        res = json.loads(raw) if raw else {}
-    except Exception:
-        res = {}
-    if isinstance(res, dict):
-        out["decision"] = res.get("decision", res.get("result", ""))
-        out["score"] = res.get("score", "")
-        rs = res.get("reasons", [])
-        out["reasons"] = rs if isinstance(rs, list) else ([str(rs)] if rs else [])
-    else:
-        out["decision"] = ""
-        out["score"] = ""
-        out["reasons"] = []
-    return out
-
-
-ROLES = ["seq", "ts", "user_id", "result", "prev_hash", "audit_hash"]
-
-
-def handle(method, action, data, api_key, ctx):
-    if not isinstance(data, dict):
-        data = {}
-
-    conn = _ctx_get(ctx, "conn")
-    lock = _ctx_get(ctx, "lock") or _NoLock()
-    if conn is None:
-        return {"error": "no database handle on ctx",
-                "ctx_type": type(ctx).__name__}, 500
-
-    with lock:
-        resolved, missing = _resolve(conn)
-    if not resolved or "seq" not in resolved or "audit_hash" not in resolved:
-        return {"error": "audit_log schema not recognised",
-                "columns_found": _schema.get("columns") or _cols(conn),
-                "roles_missing": missing,
-                "note": ("This module maps roles onto real column names. Add the "
-                         "actual name to WANTED rather than assuming a shape.")}, 500
-
-    SEL = _select(resolved, ROLES)
-    idc = resolved["seq"]
-    hashc = resolved["audit_hash"]
-    prevc = resolved.get("prev_hash")
-
-    # ---------------------------------------------------------------- status
-    if action == "status":
-        with lock:
-            try:
-                n = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-                lo = conn.execute("SELECT MIN(%s) FROM audit_log" % idc).fetchone()[0]
-                hi = conn.execute("SELECT MAX(%s) FROM audit_log" % idc).fetchone()[0]
-            except Exception as e:
-                return {"error": "audit_log unreadable: " + str(e)}, 500
-        return {
-            "module": "blocks",
-            "version": VERSION,
-            "rows": n,
-            "lowest_seq": lo,
-            "highest_seq": hi,
-            "schema_columns": _schema.get("columns"),
-            "role_mapping": resolved,
-            "roles_missing": missing,
-            "has_api_key_column": "api_key" in [c.lower() for c in (_schema.get("columns") or [])],
-            "max_limit": MAX_LIMIT,
-            "note": "reads only. no chain verification happens on this route.",
-        }, 200
-
-    # ------------------------------------------------------------------ list
-    if action == "list":
-        limit = _int(data, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
-        offset = _int(data, "offset", 0, 0, 10000000)
-        order = _str(data, "order", "desc").lower()
-        order = "ASC" if order == "asc" else "DESC"
-        filt = _str(data, "api_key", "")
-        has_key_col = "api_key" in [c.lower() for c in (_schema.get("columns") or [])]
-
-        with lock:
-            try:
-                if filt and has_key_col:
-                    cur = conn.execute(
-                        SEL + " WHERE api_key=? ORDER BY %s %s LIMIT ? OFFSET ?" % (idc, order),
-                        (filt, limit, offset))
-                    recs = [_shape(d) for d in _dicts(cur)]
-                    total = conn.execute(
-                        "SELECT COUNT(*) FROM audit_log WHERE api_key=?", (filt,)).fetchone()[0]
-                else:
-                    cur = conn.execute(
-                        SEL + " ORDER BY %s %s LIMIT ? OFFSET ?" % (idc, order),
-                        (limit, offset))
-                    recs = [_shape(d) for d in _dicts(cur)]
-                    total = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-            except Exception as e:
-                return {"error": "query failed: " + str(e)}, 500
-
-        return {
-            "blocks": recs,
-            "count": len(recs),
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "order": order.lower(),
-            "has_more": (offset + len(recs)) < total,
-            "next_offset": offset + len(recs),
-            "filtered_by_key": bool(filt and has_key_col),
-            "filter_ignored": bool(filt and not has_key_col) or None,
-        }, 200
-
-    # ------------------------------------------------------------------- get
-    if action == "get":
-        try:
-            seq = int(_one(data.get("seq", 0)))
-        except Exception:
-            return {"error": "seq must be a number"}, 400
-        with lock:
-            cur = conn.execute(SEL + " WHERE %s=?" % idc, (seq,))
-            rows = _dicts(cur)
-            if not rows:
-                return {"error": "no block with that seq", "seq": seq}, 404
-            below = conn.execute(
-                "SELECT %s,%s FROM audit_log WHERE %s<? ORDER BY %s DESC LIMIT 1"
-                % (idc, hashc, idc, idc), (seq,)).fetchone()
-        block = _shape(rows[0])
-        if below and prevc:
-            block["links_to"] = below[0]
-            block["link_holds"] = (str(block.get("prev_hash") or "") == str(below[1] or ""))
-            block["expected_prev"] = below[1]
-        elif not prevc:
-            block["links_to"] = None
-            block["link_holds"] = None
-            block["note"] = "this table has no prev_hash column, so no link can be checked"
-        else:
-            block["links_to"] = None
-            block["link_holds"] = None
-            block["note"] = "oldest row in the table; nothing beneath it to link to"
-        return {"block": block}, 200
-
-    # ---------------------------------------------------------------- around
-    if action == "around":
-        try:
-            seq = int(_one(data.get("seq", 0)))
-        except Exception:
-            return {"error": "seq must be a number"}, 400
-        span = _int(data, "span", 10, 1, MAX_SPAN)
-        with lock:
-            cur = conn.execute(
-                SEL + " WHERE %s BETWEEN ? AND ? ORDER BY %s DESC" % (idc, idc),
-                (seq - span, seq + span))
-            rows = _dicts(cur)
-        return {
-            "centre": seq,
-            "span": span,
-            "blocks": [_shape(d) for d in rows],
-        }, 200
-
-    # ----------------------------------------------------------------- links
-    if action == "links":
-        if not prevc:
-            return {"error": "no prev_hash column in this table",
-                    "note": "there is no link to check without one"}, 400
-        limit = _int(data, "limit", DEFAULT_LIMIT, 2, MAX_LIMIT)
-        offset = _int(data, "offset", 0, 0, 10000000)
-        with lock:
-            rows = conn.execute(
-                "SELECT %s,%s,%s FROM audit_log ORDER BY %s DESC LIMIT ? OFFSET ?"
-                % (idc, prevc, hashc, idc), (limit, offset)).fetchall()
-        broken = []
-        for i in range(len(rows) - 1):
-            newer, older = rows[i], rows[i + 1]
-            if str(newer[1] or "") != str(older[2] or ""):
-                broken.append({
-                    "between": newer[0],
-                    "and": older[0],
-                    "expected_prev": older[2],
-                    "found_prev": newer[1],
-                })
-        checked = max(0, len(rows) - 1)
-        return {
-            "pairs_checked": checked,
-            "broken": broken,
-            "clean": len(broken) == 0,
-            "range": {"newest_seq": rows[0][0] if rows else None,
-                      "oldest_seq": rows[-1][0] if rows else None},
-            "scope": ("this page only. a clean page is not a clean chain — "
-                      "whole-chain verification is /api/verify-chain"),
-        }, 200
-
-    # ------------------------------------------------------------------ spec
-    if action == "spec":
-        return {
-            "module": "blocks",
-            "version": VERSION,
-            "purpose": ("paged reads of audit_log for the operator block view, "
-                        "without re-verifying the whole chain on every request"),
-            "auth": "every route requires a key",
-            "schema_handling": ("column names are resolved against PRAGMA "
-                                "table_info at first use and rows are read by "
-                                "name, so a renamed column is reported in "
-                                "/status rather than breaking a query"),
-            "role_mapping": resolved,
-            "routes": {
-                "GET status": "row count, lowest and highest seq, resolved column names",
-                "GET list": "limit (max %d), offset, order=asc|desc, api_key" % MAX_LIMIT,
-                "GET get": "seq — one block, plus whether its link to the row below holds",
-                "GET around": "seq, span (max %d) — a window either side" % MAX_SPAN,
-                "GET links": "limit, offset — link check across that page only",
-            },
-            "deliberately_not_here": [
-                "whole-chain verification — that is /api/verify-chain",
-                "writes of any kind",
-                "any public route",
-            ],
-        }, 200
-
-    return {"error": "unknown_action", "action": action,
-            "available": ["GET status", "GET list", "GET get",
-                          "GET around", "GET links", "GET spec"]}, 404
-
-```
-
-
-## `modules/brand.py`
-
-217 lines, 8075 bytes
-
-```python
-"""
-modules/brand.py  v1.0.0  -  one brand on every page: Monop Content
-
-    Arm:  https://sebbi.pro/x/brand/status   (also armed by /x/arm/status)
-
-The pages carry the founder's name and town in footers, taglines, buttons and
-form placeholders. This presents them as Monop Content instead, without
-editing a single page file: every HTML response is rewritten on its way out
-of the server, whichever file or module produced it.
-
-HOW
----
-It wraps the request handler's handle_one_request, so it sits outside every
-page patch whatever order modules were armed in. The response is held only
-until its headers show what it is: anything that is not HTML (JSON, images,
-video, downloads, event streams) is passed straight through untouched and
-unbuffered. HTML is rewritten and its Content-Length corrected.
-
-LEFT AS THEY ARE, ON PURPOSE
-----------------------------
-  /terms, /data-protection, /risk-policy, /human-oversight   the law and auditors
-      expect the privacy notice and policies to name who is responsible
-  /investor-prospectus                                investors expect the founder
-  /admin, /console and other operator screens         your own tools
-
-To switch it off without a deploy: https://sebbi.pro/x/brand/off
-(back on with /x/brand/on). Both need your API key.
-"""
-
-import sys
-import threading
-
-VERSION = "1.0.0"
-
-PUBLIC = {("GET", "status"), ("GET", "spec")}
-
-# Longest and most specific first, so a shorter rule never splits a longer one.
-RULES = [
-    ("&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, Northumberland, UK &middot; ",
-     "&copy; 2026 Monop Content &middot; "),
-    ("&copy; 2026 Monop Content &middot; Justin Antony Dobson &middot; Blyth, UK", "&copy; 2026 Monop Content"),
-    ("built by Monop Content in Blyth, United Kingdom", "built by Monop Content"),
-    ("Monop Content &middot; Blyth, Northumberland, UK", "Monop Content"),
-    ("Monop Content · Blyth, Northumberland, UK", "Monop Content"),
-    ("Monop Content &middot; Blyth, Northumberland", "Monop Content"),
-    ("Monop Content &middot; Blyth, UK", "Monop Content"),
-    ("Monop Content · Blyth, UK", "Monop Content"),
-    ("Monop Content, Blyth, UK", "Monop Content"),
-    ("Monop Content, Blyth", "Monop Content"),
-    (" &middot; Blyth, Northumberland, UK", ""),
-    (" &middot; Blyth, UK", ""),
-    (" · Blyth, UK", ""),
-    (" &middot; Justin Antony Dobson", ""),
-    (" · Justin Antony Dobson", ""),
-    ("Contact Justin at Monop Content", "Contact Monop Content"),
-    ("Contact Justin", "Contact us"),
-    ("talk to Justin", "talk to us"),
-    ("Justin has been notified", "Our team has been notified"),
-    ('placeholder="Justin Antony Dobson"', 'placeholder="Your full name"'),
-    ('placeholder="Justin"', 'placeholder="First name"'),
-    ("Building tamper-evident AI compliance from Blyth.", "Building tamper-evident AI compliance."),
-]
-RULES_B = [(a.encode("utf-8"), b.encode("utf-8")) for a, b in RULES]
-
-SKIP_PATHS = ("/terms", "/data-protection", "/risk-policy", "/human-oversight", "/investor-prospectus",
-              "/admin", "/console", "/peers", "/pack", "/lineage-desk")
-
-_state = {"installed": False, "on": True, "rewritten": 0, "replacements": 0, "last_error": None}
-_lock = threading.Lock()
-
-
-def rewrite(body):
-    n = 0
-    for old, new in RULES_B:
-        if old in body:
-            n += body.count(old)
-            body = body.replace(old, new)
-    return body, n
-
-
-class _Out(object):
-    """Stands in for wfile for one request. Passes non-HTML straight through."""
-
-    def __init__(self, real):
-        self.real = real
-        self.buf = bytearray()
-        self.mode = None  # None = reading headers, "pass", "html"
-
-    def write(self, data):
-        if self.mode == "pass":
-            return self.real.write(data)
-        self.buf += data
-        if self.mode is None:
-            end = self.buf.find(b"\r\n\r\n")
-            if end < 0:
-                if len(self.buf) > 65536:
-                    self._go_pass()
-                return len(data)
-            head = bytes(self.buf[:end]).lower()
-            if b"content-type: text/html" in head and b"content-encoding" not in head:
-                self.mode = "html"
-            else:
-                self._go_pass()
-        elif len(self.buf) > 8 * 1024 * 1024:
-            self._go_pass()  # an enormous page is sent as it is rather than held
-        return len(data)
-
-    def _go_pass(self):
-        self.mode = "pass"
-        if self.buf:
-            self.real.write(bytes(self.buf))
-        self.buf = bytearray()
-
-    def flush(self):
-        if self.mode == "pass":
-            try:
-                self.real.flush()
-            except Exception:
-                pass
-
-    @property
-    def closed(self):
-        return getattr(self.real, "closed", False)
-
-    def __getattr__(self, name):
-        return getattr(self.real, name)
-
-    def finish(self):
-        if self.mode == "pass" or not self.buf:
-            return
-        raw = bytes(self.buf)
-        self.buf = bytearray()
-        end = raw.find(b"\r\n\r\n")
-        if self.mode != "html" or end < 0:
-            self.real.write(raw)
-            return
-        head, body = raw[:end], raw[end + 4:]
-        new_body, n = rewrite(body)
-        if n:
-            lines = head.split(b"\r\n")
-            lines = [l for l in lines if not l.lower().startswith(b"content-length:")]
-            lines.append(b"Content-Length: " + str(len(new_body)).encode())
-            head = b"\r\n".join(lines)
-            _state["rewritten"] += 1
-            _state["replacements"] += n
-        self.real.write(head + b"\r\n\r\n" + new_body)
-        try:
-            self.real.flush()
-        except Exception:
-            pass
-
-
-def _handler_class():
-    m = sys.modules.get("__main__")
-    if not hasattr(m, "Handler"):
-        m = sys.modules.get("server")
-    return getattr(m, "Handler", None)
-
-
-def _install():
-    with _lock:
-        if _state["installed"]:
-            return True
-        H = _handler_class()
-        if H is None:
-            return False
-        if getattr(H, "_brand_patched", False):
-            _state["installed"] = True
-            return True
-        original = H.handle_one_request
-
-        def handle_one_request(self):
-            if not _state["on"]:
-                return original(self)
-            real = self.wfile
-            out = _Out(real)
-            self.wfile = out
-            try:
-                original(self)
-            finally:
-                self.wfile = real
-                try:
-                    path = (getattr(self, "path", "") or "").split("?")[0]
-                    if path.startswith(SKIP_PATHS) and out.mode == "html":
-                        out.mode = "pass_html"
-                        real.write(bytes(out.buf))
-                        out.buf = bytearray()
-                    out.finish()
-                except Exception as e:
-                    _state["last_error"] = str(e)[:200]
-                    try:
-                        if out.buf:
-                            real.write(bytes(out.buf))
-                    except Exception:
-                        pass
-
-        H.handle_one_request = handle_one_request
-        H._brand_patched = True
-        _state["installed"] = True
-        return True
-
-
-def handle(method, action, data, api_key, ctx):
-    armed = _install()
-    if action in ("off", "on"):
-        if not api_key:
-            return {"error": "api_key_required"}, 401
-        _state["on"] = action == "on"
-    if action == "spec":
-        return {"module": "brand", "version": VERSION,
-                "what": "Every HTML page presented as Monop Content, rewritten as it is served. No page file is edited.",
-                "rules": [{"from": a, "to": b} for a, b in RULES],
-                "left_as_they_are": list(SKIP_PATHS)}, 200
-    return {"module": "brand", "version": VERSION, "armed": armed, "on": _state["on"],
-            "pages_rewritten": _state["rewritten"], "replacements": _state["replacements"],
-            "left_as_they_are": list(SKIP_PATHS), "last_error": _state["last_error"]}, 200
 
 ```
