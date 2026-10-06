@@ -61,7 +61,7 @@ jobs:
             "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
             name: "pro.sebbi/governance",
             title: "sebbi.pro - seal every AI decision",
-            description: "Score, seal and prove any AI decision, and timestamp it into Bitcoin - checkable by anyone, without trusting us.",
+            description: "Score, seal and prove any AI decision, timestamped into Bitcoin - checkable by anyone.",
             version: "1.0.0",
             remotes: [ { type: "streamable-http", url: "https://sebbi.pro/mcp" } ]
           }' > server.json
