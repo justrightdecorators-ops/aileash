@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-179 files across 52 parts.
+180 files across 52 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -147,45 +147,46 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-25.md](CODEBASE-25.md)
 
 - `modules/prove.py`
+- `modules/proveit.py`
 - `modules/publish.py`
 - `modules/pwa.py`
-- `modules/ratchet.py`
-- `modules/ratelimit.py`
 
 ## [CODEBASE-26.md](CODEBASE-26.md)
 
+- `modules/ratchet.py`
+- `modules/ratelimit.py`
 - `modules/reconcile.py`
-- `modules/register.py`
 
 ## [CODEBASE-27.md](CODEBASE-27.md)
 
+- `modules/register.py`
 - `modules/replay.py`
+
+## [CODEBASE-28.md](CODEBASE-28.md)
+
 - `modules/roster.py`
 - `modules/roundlyverify.py`
 - `modules/router.py`
 - `modules/rulebind.py`
-
-## [CODEBASE-28.md](CODEBASE-28.md)
-
 - `modules/savings.py`
 - `modules/sebbi_engine.py`
-- `modules/selfcheck.py`
 
 ## [CODEBASE-29.md](CODEBASE-29.md)
 
+- `modules/selfcheck.py`
 - `modules/signed.py`
 - `modules/social_meta.py`
-- `modules/sortition.py`
 
 ## [CODEBASE-30.md](CODEBASE-30.md)
 
+- `modules/sortition.py`
 - `modules/sound.py`
 - `modules/spec.py`
 - `modules/spendgate.py`
-- `modules/standard.py`
 
 ## [CODEBASE-31.md](CODEBASE-31.md)
 
+- `modules/standard.py`
 - `modules/standing.py`
 - `modules/startpage.py`
 - `modules/stats.py`
