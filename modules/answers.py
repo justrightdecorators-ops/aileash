@@ -126,6 +126,16 @@ ANSWERS = [
              "Independent witness chains hold copies, so removing a record means fooling all of them."],
      "do": [("Consistency root", "/x/consistency/root"), ("Forever Proof", "/forever")]},
 
+    {"slug": "stop-ai-spending-without-approval",
+     "q": "How do I stop an AI agent spending money without approval?",
+     "a": "Make the agent get a signed sign-off before every payment. With sebbi.pro Spend Gate you set each agent's limits (most per payment, most per day, an allow-list of payees); the agent calls sebbi.pro before it pays, the request is scored and checked against those limits, and it gets back a signed APPROVED or DENIED token. Your own payment system releases the money only on an approved token. sebbi.pro is the sign-off, never the wallet - it never holds your money.",
+     "how": ["Set the agent's limits once: POST %s/x/spendgate/policy with per_tx, daily and optional payees." % SITE,
+             "Before any payment, the agent calls %s/x/spendgate/request with the amount and payee." % SITE,
+             "Over the limit, wrong payee, or flagged by the engine? It returns DENIED and no signature.",
+             "On APPROVED, release the money, then confirm the token so it can't be used twice. Every decision is sealed and provable against Bitcoin."],
+     "more": ["Anyone can check a token's signature against the published key with no call to sebbi.pro. An AI assistant connected at sebbi.pro/mcp can run the whole thing."],
+     "do": [("Try Spend Gate", "/spend"), ("Connect your AI", "/connect")]},
+
     {"slug": "audit-trail-for-ai-agents",
      "q": "How do I give an AI agent an audit trail?",
      "a": "Have the agent send each action to sebbi.pro before it acts, and keep the sealed receipt. Agents can do it themselves through the MCP connector at sebbi.pro/mcp, and an Agent Passport gives one signed, single-use permission for a single action that can be checked offline.",
@@ -306,7 +316,7 @@ def standard_page():
 
 def sitemap():
     urls = [SITE + "/answers", SITE + "/standard/forever-proof", SITE + "/forever", SITE + "/bitcoin",
-            SITE + "/bitcoin/code", SITE + "/gateway", SITE + "/standard/ai-decision-receipt", SITE + "/pilot"] + [SITE + "/answers/" + a["slug"] for a in ANSWERS]
+            SITE + "/bitcoin/code", SITE + "/gateway", SITE + "/standard/ai-decision-receipt", SITE + "/pilot", SITE + "/spend"] + [SITE + "/answers/" + a["slug"] for a in ANSWERS]
     return ('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
             "".join("  <url><loc>%s</loc><changefreq>weekly</changefreq></url>\n" % u for u in urls) + "</urlset>\n")
 

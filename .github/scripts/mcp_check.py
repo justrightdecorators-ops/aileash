@@ -66,7 +66,7 @@ try:
     chk("notification accepted", st == 202, st)
     st, d, _ = rpc("tools/list")
     names = [t["name"] for t in d["result"]["tools"]]
-    extra = {"sebbi_notarize", "sebbi_notary_receipt", "sebbi_forever_proof", "sebbi_gateway_setup"}
+    extra = {"sebbi_notarize", "sebbi_notary_receipt", "sebbi_forever_proof", "sebbi_gateway_setup", "sebbi_spend_policy", "sebbi_spend_request", "sebbi_spend_verify"}
     base13 = len([n for n in names if n not in extra])
     chk("13 tools listed (+ notary and gateway tools when those modules are armed)", base13 == 13 and len(names) == len(set(names)), names)
     o, e = tool("sebbi_overview")

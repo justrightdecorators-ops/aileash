@@ -1406,7 +1406,8 @@ var a=document.getElementById('ntxhk-v');a.href='/forever?code='+c;document.getE
 HOME_BUTTONS_B = (b'<a href="/bitcoin" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">BITCOIN</span>Bitcoin Notary &rarr;</a>'
                   b'<a href="/forever" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">FOREVER</span>Forever Proof &rarr;</a>'
                   b'<a href="/gateway" style="border:1.5px solid #8fd0ff"><span class="tag" style="background:#8fd0ff">ONE LINE</span>Govern every AI call &rarr;</a>'
-                  b'<a href="/pilot" style="border:1.5px solid #f0d78a"><span class="tag" style="background:#f0d78a">\xc2\xa3495</span>Governed in 7 days &rarr;</a>')
+                  b'<a href="/pilot" style="border:1.5px solid #f0d78a"><span class="tag" style="background:#f0d78a">\xc2\xa3495</span>Governed in 7 days &rarr;</a>'
+                  b'<a href="/spend" style="border:1.5px solid #8fd0ff"><span class="tag" style="background:#8fd0ff">NEW</span>Spend Gate &rarr;</a>')
 HOME_BUTTONS_AT = b'<a href="/dossier" style='
 HOME_STRIP_B = HOME_STRIP.encode("utf-8")
 HK_PANEL_B = HK_PANEL.encode("utf-8")
