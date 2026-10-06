@@ -399,6 +399,8 @@ def snapshot():
         feed.append((_iso(t), "gateway", "Gateway call %s" % (dec or ""), "%s %s" % (pv, mdl or "")))
     for t, r in _safe("SELECT ts, result_json FROM audit_log WHERE result_json LIKE '%\"decision\": \"BLOCK\"%' ORDER BY id DESC LIMIT 10"):
         feed.append((_iso(t), "block", "Decision BLOCKED", ""))
+    for t, e, st, sub in _safe("SELECT at, email, step, subject FROM autopilot_sent WHERE status='sent' ORDER BY at DESC LIMIT 25"):
+        feed.append((_iso(t), "autopilot", "Autopilot emailed %s" % e, sub or st))
     feed = [{"utc": a, "kind": b, "title": c, "detail": d} for a, b, c, d in sorted((f for f in feed if f[0]), reverse=True)[:80]]
 
     # health
@@ -413,7 +415,7 @@ def snapshot():
     except Exception:
         pass
     mods = {n: _mod_state(n) for n in ("notary", "gateway", "pilot", "ratelimit", "humankeys", "mcp", "connect", "dossier",
-                                        "heartbeat", "ots", "ainews", "brand", "homelink", "answers")}
+                                        "heartbeat", "ots", "ainews", "brand", "homelink", "answers", "autopilot", "monitor")}
 
     # alerts
     alerts = []
@@ -435,7 +437,7 @@ def snapshot():
         age = (now - datetime.strptime(btc["last_confirmed_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()) / 3600
         if age > 12:
             alerts.append({"level": "warning", "text": "No new Bitcoin confirmation for %.0f hours." % age})
-    core = ("notary", "gateway", "pilot", "ratelimit", "humankeys", "mcp", "dossier", "heartbeat", "ots", "homelink")
+    core = ("notary", "gateway", "pilot", "ratelimit", "humankeys", "mcp", "dossier", "heartbeat", "ots", "homelink", "autopilot")
     for n, m in mods.items():
         if n in core and m.get("loaded") and m.get("last_error"):
             alerts.append({"level": "warning", "text": "%s: %s" % (n, str(m["last_error"])[:120])})

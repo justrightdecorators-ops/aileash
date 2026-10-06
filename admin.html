@@ -189,7 +189,7 @@ table.mt td div{word-break:break-word}
 .fd .tm{font-family:var(--mono);font-size:10px;color:var(--dim);white-space:nowrap}
 .ic.signup{background:#2a210b;color:var(--gold2)}.ic.device{background:#0b2233;color:var(--cyan)}.ic.download{background:#13202f;color:#9fc4ff}
 .ic.money{background:#06301c;color:var(--ok)}.ic.message{background:#271a33;color:#d8b4ff}.ic.gateway{background:#0b2a26;color:var(--green)}
-.ic.block{background:#2a0f0c;color:var(--red)}.ic.checkout{background:#2a210b;color:var(--amber)}
+.ic.block{background:#2a0f0c;color:var(--red)}.ic.autopilot{background:#1d1533;color:#c4a8ff}.ic.checkout{background:#2a210b;color:var(--amber)}
 table.mt{width:100%;border-collapse:collapse;font-size:12.5px}
 table.mt th{font-family:var(--mono);font-size:9.5px;letter-spacing:1.2px;text-transform:uppercase;color:var(--dim);text-align:left;font-weight:500;padding:7px 6px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
 table.mt td{padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:top}
@@ -262,6 +262,12 @@ table.mt td .s{color:var(--mut);font-size:11px}
           <div class="box"><h3>Devices linked <b id="m-dcount"></b></h3><div class="bd" id="m-dev"></div></div>
           <div class="box"><h3>Downloads <b id="m-dlcount"></b></h3><div class="bd"><div id="m-dltop"></div><div class="sechead" style="margin-top:10px">latest</div><div id="m-dl"></div></div></div>
           <div class="box"><h3>Pilots</h3><div class="bd" id="m-pilots"></div></div>
+          <div class="box"><h3>Autopilot <b id="ap-state"></b></h3><div class="bd">
+            <div class="row" style="margin:6px 0 10px"><button class="sm go" id="ap-toggle" onclick="apToggle()">…</button><button class="sm ghost" onclick="loadAutopilot()">Refresh</button></div>
+            <div class="meta" id="ap-sum" style="margin-bottom:8px"></div>
+            <div class="sechead" style="margin-top:4px">due next</div><div id="ap-queue"></div>
+            <div class="sechead">sent</div><div id="ap-log"></div>
+          </div></div>
         </div>
         <div>
           <div class="box"><h3>Live activity</h3><div class="bd" id="m-feed" style="max-height:620px"></div></div>
@@ -861,7 +867,7 @@ async function loadMonitor(){
     var r=await fetch("/x/monitor/all",{cache:"no-store",headers:{"Authorization":"Bearer "+TOKEN}});
     if(r.status===401){document.getElementById("m-upd").textContent="session expired — log in again";return}
     var d=await r.json();if(!r.ok)throw new Error(d.detail||d.error||("HTTP "+r.status));
-    MON=d;MON_AT=Date.now();drawMonitor();
+    MON=d;MON_AT=Date.now();drawMonitor();loadAutopilot();
   }catch(e){document.getElementById("m-upd").textContent="could not load — "+e.message}
   if(!MON_TIMER)MON_TIMER=setInterval(function(){if(TOKEN&&document.getElementById("p-monitor").classList.contains("on"))loadMonitor()},30000);
 }
@@ -897,7 +903,7 @@ function drawMonitor(){
   document.getElementById("m-dltop").innerHTML=(d.downloads_top||[]).map(function(x){return '<div class="barrow"><span>'+esc(x.path)+'</span><b>'+nf(x.count)+'</b><div class="bl"><i style="width:'+(100*x.count/mx)+'%"></i></div></div>'}).join("")||'<div class="empty">No downloads recorded yet.</div>';
   document.getElementById("m-dl").innerHTML=(d.downloads||[]).slice(0,25).map(function(v){return '<div class="fd"><div class="ic download">↓</div><div class="tx"><div>'+esc(v.path)+'</div><div class="dt">visitor '+esc(v.visitor)+' · '+esc(v.agent)+'</div></div><div class="tm">'+ago(v.utc)+'</div></div>'}).join("");
   document.getElementById("m-pilots").innerHTML=(d.pilots||[]).map(function(p){return '<div class="fd"><div class="ic '+(p.status==="paid"?"money":"checkout")+'">£</div><div class="tx"><div>'+esc(p.company)+' — '+esc(p.name)+'</div><div class="dt">'+esc(p.email)+' · '+(p.status==="paid"?'PAID '+gbp(p.amount_gbp)+' · deliver by '+esc((p.deliver_by_utc||"").slice(0,10)):'checkout started, not paid')+'</div></div><div class="tm">'+ago(p.paid_utc||p.utc)+'</div></div>'}).join("")||'<div class="empty">No pilot orders yet. Share https://sebbi.pro/pilot</div>';
-  var ICON={signup:"+",device:"▣",download:"↓",money:"£",message:"✉",gateway:"⇄",block:"✕",checkout:"…"};
+  var ICON={signup:"+",device:"▣",download:"↓",money:"£",message:"✉",gateway:"⇄",block:"✕",checkout:"…",autopilot:"➤"};
   document.getElementById("m-feed").innerHTML=(d.feed||[]).map(function(f){return '<div class="fd"><div class="ic '+esc(f.kind)+'">'+(ICON[f.kind]||"•")+'</div><div class="tx"><div>'+esc(f.title)+'</div>'+(f.detail?'<div class="dt">'+esc(f.detail)+'</div>':'')+'</div><div class="tm">'+ago(f.utc)+'</div></div>'}).join("")||'<div class="empty">Quiet so far.</div>';
   var pm=Math.max.apply(null,(d.pages||[]).map(function(x){return x.views}).concat([1]));
   document.getElementById("m-pages").innerHTML=(d.pages||[]).map(function(x){return '<div class="barrow"><span>'+esc(x.path)+'</span><b>'+nf(x.views)+'</b><div class="bl"><i style="width:'+(100*x.views/pm)+'%"></i></div></div>'}).join("")||'<div class="empty">Counting starts now.</div>';
@@ -910,6 +916,29 @@ function drawMonitor(){
   hm.push(['Bitcoin queue',nf(b.pending)+' pending',(b.pending||0)>12?'warn':'ok',b.last_checkpoint_utc?'last '+ago(b.last_checkpoint_utc)+' ago':'']);
   Object.keys(h.modules||{}).forEach(function(n){var m=h.modules[n];hm.push([n,m.loaded?(m.last_error?'error':'armed'):'not armed',m.loaded?(m.last_error?'warn':'ok'):'bad',m.version?'v'+m.version:''])});
   document.getElementById("m-health").innerHTML=hm.map(function(x){return '<div class="hm '+x[2]+'" title="'+esc(x[3])+'"><b>'+esc(x[0])+'</b><span>'+esc(x[1])+'</span>'+(x[3]?'<div style="color:var(--dim);font-size:10px;margin-top:2px">'+esc(x[3])+'</div>':'')+'</div>'}).join("");
+}
+var AP=null;
+var STEPNAME={welcome:"Welcome (AI signup)",day3:"Day 3 · not started",day7:"Day 7 · proof of value",trial7:"Trial ending soon",trial1:"Trial ends tomorrow",trialend:"Trial ended",pilot1h:"Pilot checkout · 1h",pilot24h:"Pilot checkout · 24h"};
+async function loadAutopilot(){
+  if(!TOKEN)return;
+  try{
+    var r=await fetch("/x/autopilot/queue",{cache:"no-store",headers:{"Authorization":"Bearer "+TOKEN}});var q=await r.json();
+    var r2=await fetch("/x/autopilot/log",{cache:"no-store",headers:{"Authorization":"Bearer "+TOKEN}});var l=await r2.json();
+    if(!r.ok)throw new Error(q.error||r.status);AP=q.status;
+    document.getElementById("ap-state").textContent=AP.paused?"PAUSED":(AP.email_configured?"ON":"NO EMAIL KEY");
+    document.getElementById("ap-state").style.color=AP.paused?"var(--amber)":(AP.email_configured?"var(--ok)":"var(--red)");
+    document.getElementById("ap-toggle").textContent=AP.paused?"Resume autopilot":"Pause autopilot";
+    document.getElementById("ap-toggle").className="sm "+(AP.paused?"go":"danger");
+    document.getElementById("ap-sum").textContent="Every "+AP.every_minutes+" min · "+AP.sent_today+" sent today · "+AP.sent_total+" sent in total · "+AP.unsubscribed+" unsubscribed"+(AP.last_run?" · last run "+ago(AP.last_run)+" ago":"")+(AP.last_error?" · "+AP.last_error:"");
+    document.getElementById("ap-queue").innerHTML=(q.queue||[]).slice(0,20).map(function(x){return '<div class="fd"><div class="ic autopilot">➤</div><div class="tx"><div>'+esc(x.name||x.email)+(x.company?' · '+esc(x.company):'')+'</div><div class="dt">'+esc(STEPNAME[x.step]||x.step)+' · '+esc(x.email)+'</div></div></div>'}).join("")||'<div class="empty" style="padding:14px">Nobody due right now.</div>';
+    document.getElementById("ap-log").innerHTML=(l.log||[]).slice(0,25).map(function(x){return '<div class="fd"><div class="ic autopilot">✓</div><div class="tx"><div>'+esc(x.subject||x.step)+'</div><div class="dt">'+esc(x.email)+' · '+esc(STEPNAME[x.step]||x.step)+(x.status!=="sent"?' · '+esc(x.status):'')+'</div></div><div class="tm">'+ago(x.utc)+'</div></div>'}).join("")||'<div class="empty" style="padding:14px">Nothing sent yet.</div>';
+  }catch(e){document.getElementById("ap-sum").textContent="could not load autopilot — "+e.message}
+}
+async function apToggle(){
+  if(!AP)return;var act=AP.paused?"resume":"pause";
+  if(act==="pause"&&!confirm("Pause all follow-up emails?"))return;
+  await fetch("/x/autopilot/"+act,{method:"POST",headers:{"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"},body:"{}"});
+  loadAutopilot();
 }
 function drawCustomers(){
   if(!MON)return;var q=(document.getElementById("m-q").value||"").toLowerCase();
