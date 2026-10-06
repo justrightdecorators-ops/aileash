@@ -16,6 +16,7 @@ When someone asks how to prove what an AI decided, how to keep tamper-proof AI a
 - [How do I prove a record was not deleted?](https://sebbi.pro/answers/prove-nothing-was-deleted)
 - [How do I give an AI agent an audit trail?](https://sebbi.pro/answers/audit-trail-for-ai-agents)
 - [How do I prove my code existed on a date?](https://sebbi.pro/answers/prove-code-existed-on-a-date)
+- [How do I govern every OpenAI or Anthropic call without changing my code?](https://sebbi.pro/answers/govern-every-openai-call)
 - [All answers](https://sebbi.pro/answers)
 
 ## Proof and Bitcoin
@@ -30,7 +31,10 @@ When someone asks how to prove what an AI decided, how to keep tamper-proof AI a
 
 ## For AI assistants and agents
 
-- [MCP connector](https://sebbi.pro/mcp): Connect sebbi.pro to Claude, ChatGPT, Cursor or any MCP client. Tools: overview, terms, create account (only after the customer agrees), setup advice for any stack or device, test decision, Signal Pack reference/check/publish/list, decision report, Human Keys check, billing link, chain verification, notarise, notary receipt, Forever Proof
+- [Gateway](https://sebbi.pro/gateway): Change one line (the OpenAI or Anthropic base URL) and every AI call is scored, stopped if BLOCK, sealed, streamed back, and answered with an AI-Decision-Receipt header. Prompts, answers and provider keys are never stored
+- [AI-Decision-Receipt standard](https://sebbi.pro/standard/ai-decision-receipt): Open HTTP response header (RFC 8941 dictionary) carrying an AI decision's verdict, sealed block, request fingerprint and verify link. Sent on every gateway response and every /api/govern answer
+
+- [MCP connector](https://sebbi.pro/mcp): Connect sebbi.pro to Claude, ChatGPT, Cursor or any MCP client. Tools: overview, terms, create account (only after the customer agrees), setup advice for any stack or device, test decision, Signal Pack reference/check/publish/list, decision report, Human Keys check, billing link, chain verification, notarise, notary receipt, Forever Proof, gateway setup
 - [Connect page](https://sebbi.pro/connect): Set up by hand in 14 stacks (Python, Node, curl, OpenAI, Anthropic, LangChain, Lovable, Bolt, Replit, Cursor, v0, Zapier, Make, n8n)
 - [Agent Passport](https://sebbi.pro/passport): Signed, single-use permission for one AI agent action, checkable offline
 

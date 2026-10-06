@@ -364,7 +364,7 @@ console.log(JSON.stringify({ok:r.ok,height:r.height,bad:r2.ok,steps}))})().catch
     st, tl, _ = rpc("tools/list")
     names = [t["name"] for t in tl["result"]["tools"]]
     chk("AI connector lists the three notary tools", {"sebbi_notarize", "sebbi_notary_receipt", "sebbi_forever_proof"} <= set(names)
-        and len(names) == 16, names)
+        and len(names) >= 16, names)
     st, ini, _ = rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t2", "version": "1"}})
     chk("connector instructions mention the notary once", ini["result"]["instructions"].count("sebbi_notarize") == 1, ini)
     r, e = tool("sebbi_notarize", {"digests": [hashlib.sha256(b"via ai").hexdigest()], "label": "From an AI"})

@@ -1047,7 +1047,7 @@ footer{border-top:1px solid var(--line);margin-top:34px;padding:22px 0 30px;font
 </style>"""
 
 _TOP = r"""<header class="top"><div class="wrap"><a class="brand" href="/">sebbi<b>.pro</b></a>
-<nav><a href="/bitcoin">Notary</a><a href="/forever">Forever Proof</a><a href="/keys">Human Keys</a><a href="/connect">Connect</a></nav></div></header>"""
+<nav><a href="/bitcoin">Notary</a><a href="/forever">Forever Proof</a><a href="/gateway">Gateway</a><a href="/keys">Human Keys</a></nav></div></header>"""
 
 _FOOT = r"""<footer><div class="wrap"><a href="/bitcoin">Bitcoin Notary</a><a href="/forever">Forever Proof</a><a href="/forever-verify.py">Verifier</a><a href="/bitcoin/code">Our code in Bitcoin</a><a href="/answers">Answers</a><a href="/standard/forever-proof">Standard</a><a href="/x/notary/spec">Spec</a><a href="/terms">Terms</a>
 <p style="margin-top:12px">&copy; 2026 Monop Content &middot; sebbi.pro</p></div></footer>"""
@@ -1402,7 +1402,8 @@ var a=document.getElementById('ntxhk-v');a.href='/forever?code='+c;document.getE
 
 # two buttons added to the homepage button list, just above the machine-proof report
 HOME_BUTTONS_B = (b'<a href="/bitcoin" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">BITCOIN</span>Bitcoin Notary &rarr;</a>'
-                  b'<a href="/forever" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">FOREVER</span>Forever Proof &rarr;</a>')
+                  b'<a href="/forever" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">FOREVER</span>Forever Proof &rarr;</a>'
+                  b'<a href="/gateway" style="border:1.5px solid #8fd0ff"><span class="tag" style="background:#8fd0ff">ONE LINE</span>Govern every AI call &rarr;</a>')
 HOME_BUTTONS_AT = b'<a href="/dossier" style='
 HOME_STRIP_B = HOME_STRIP.encode("utf-8")
 HK_PANEL_B = HK_PANEL.encode("utf-8")
