@@ -13,18 +13,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Install mcp-publisher
-        run: go install github.com/modelcontextprotocol/registry/cmd/mcp-publisher@latest
+      - name: Install mcp-publisher (prebuilt binary)
+        run: |
+          set -e
+          curl -fsSL https://api.github.com/repos/modelcontextprotocol/registry/releases/latest -o rel.json
+          echo "latest tag: $(jq -r .tag_name rel.json)"
+          URL=$(jq -r '.assets[].browser_download_url
+                       | select(test("(?i)(linux).*(amd64|x86_64)"))' rel.json \
+                | grep -ivE 'sha256|checksums|\.sig' | head -1)
+          echo "asset: $URL"
+          if [ -z "$URL" ]; then echo "no linux asset found"; jq -r '.assets[].name' rel.json; exit 1; fi
+          curl -fsSL "$URL" -o pub.download
+          mkdir -p binout
+          if file pub.download | grep -qi 'gzip\|tar'; then
+            tar -xzf pub.download -C binout || tar -xf pub.download -C binout
+          else
+            cp pub.download binout/mcp-publisher
+          fi
+          BIN=$(find binout -type f -name 'mcp-publisher*' | head -1)
+          [ -z "$BIN" ] && BIN=$(find binout -type f -perm -u+x | head -1)
+          [ -z "$BIN" ] && BIN=$(find binout -type f | head -1)
+          echo "binary: $BIN"
+          chmod +x "$BIN"
+          sudo mv "$BIN" /usr/local/bin/mcp-publisher
+          mcp-publisher --help 2>&1 | head -3 || true
 
       - name: Build server.json
         run: |
           set -e
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          # init to harvest the current $schema default, then write our own fields
           mcp-publisher init || true
           SCHEMA=$(jq -r '."$schema" // "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json"' server.json 2>/dev/null || echo "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json")
           jq -n --arg s "$SCHEMA" '{
@@ -37,16 +53,7 @@ jobs:
           echo "----- server.json -----"; cat server.json
 
       - name: Log in (domain HTTP auth)
-        run: |
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          mcp-publisher login http --domain=sebbi.pro --private-key="${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}"
-
-      - name: Validate (dry run)
-        run: |
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          mcp-publisher publish --dry-run || echo "dry-run not supported on this version; continuing"
+        run: mcp-publisher login http --domain=sebbi.pro --private-key="${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}"
 
       - name: Publish
-        run: |
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          mcp-publisher publish
+        run: mcp-publisher publish
