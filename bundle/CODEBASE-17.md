@@ -1,11 +1,11 @@
-# Codebase — part 17 of 50
+# Codebase — part 17 of 51
 
 Contains:
 - `modules/mcp.py`
 - `modules/meter.py`
+- `modules/monitor.py`
 - `modules/mutual.py`
 - `modules/network.py`
-- `modules/noexec.py`
 
 
 ## `modules/mcp.py`
@@ -895,6 +895,492 @@ def handle(method, action, data, api_key, ctx):
              "keys_metered_this_month": len(watch()) if armed else 0,
              "keys_flagged": len(flags),
              "stripe_sync": "every 6 hours, follows the meter up and down"}, 200)
+
+```
+
+
+## `modules/monitor.py`
+
+478 lines, 22452 bytes
+
+```python
+"""
+modules/monitor.py  v1.0.0  -  the data behind the admin Monitor
+
+    Arm:    https://sebbi.pro/x/arm/status
+    Admin:  https://sebbi.pro/admin   (Monitor tab)
+    Data:   GET /x/monitor/all        (admin login token only)
+
+Everything Justin needs on one screen: who signed up, which devices they
+linked, what they used, what was downloaded, who visited and from where,
+money in, and whether every part of the machine is healthy.
+
+VISITS AND DOWNLOADS
+--------------------
+server.py does not record visits, so this records them, lightly:
+  - page views per path per day, and unique visitors per day. A visitor is a
+    salted hash of address + browser + the day, so nobody can be identified
+    and the hash changes every day. Bots are counted separately.
+  - where visitors came from (the referring site's name only)
+  - every download of a tool or verifier, with the time and the same daily hash
+Records are buffered in memory and written every 15 seconds, so a page view
+never waits on the database. Machine traffic (/x/, /api/, /mcp, /g/) is
+counted as a total, not logged.
+
+ACCESS
+------
+/x/monitor/all answers only to a valid admin login token (the one /admin
+gets from /admin/auth). Nothing here writes to the chain.
+"""
+
+import hashlib
+import hmac
+import inspect
+import json
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+PUBLIC = {("GET", "all"), ("GET", "status"), ("GET", "")}
+TRIAL_DAYS = 90
+
+DOWNLOAD_RE = re.compile(r"\.(py|zip|tar\.gz|tgz|ots|whl|js|sh|exe|dmg|apk|pdf)$", re.I)
+SKIP_PREFIX = ("/x/", "/api/", "/mcp", "/g/", "/c/", "/admin", "/static/", "/favicon", "/robots", "/.well-known/",
+               "/sitemap", "/n/", "/k/")
+ASSET_RE = re.compile(r"\.(css|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|map|mp4|webm|mp3|txt|xml|json)$", re.I)
+BOT_RE = re.compile(r"bot|crawl|spider|slurp|preview|monitor|curl|wget|python-requests|httpx|go-http|headless|scrapy|facebookexternalhit|bingpreview", re.I)
+
+_state = {"installed": False, "writer": False, "last_error": None, "machine_calls": 0, "flushed": 0}
+_lock = threading.Lock()
+_buf_lock = threading.Lock()
+_buf = {"hits": defaultdict(int), "visitors": set(), "bots": defaultdict(int), "refs": defaultdict(int), "downloads": []}
+_salt = secrets.token_bytes(16)
+_cache = {"chain": None, "chain_at": 0}
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if not hasattr(m, "get_bearer"):
+        m = sys.modules.get("server")
+    return m
+
+
+def _iso(ts):
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _day(ts=None):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts or time.time()))
+
+
+def _db(sql, args=(), one=False):
+    s = _srv()
+    with s._db_lock:
+        cur = s._conn.execute(sql, args)
+        return cur.fetchone() if one else cur.fetchall()
+
+
+def _q(sql, args=(), default=0):
+    try:
+        r = _db(sql, args, one=True)
+        return r[0] if r and r[0] is not None else default
+    except Exception:
+        return default
+
+
+def _setup():
+    s = _srv()
+    with s._db_lock:
+        c = s._conn
+        c.execute("CREATE TABLE IF NOT EXISTS monitor_hits(day TEXT, path TEXT, n INTEGER, PRIMARY KEY(day, path))")
+        c.execute("CREATE TABLE IF NOT EXISTS monitor_visitors(day TEXT, vh TEXT, PRIMARY KEY(day, vh))")
+        c.execute("CREATE TABLE IF NOT EXISTS monitor_bots(day TEXT, n INTEGER, PRIMARY KEY(day))")
+        c.execute("CREATE TABLE IF NOT EXISTS monitor_refs(day TEXT, host TEXT, n INTEGER, PRIMARY KEY(day, host))")
+        c.execute("CREATE TABLE IF NOT EXISTS monitor_download(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, path TEXT,"
+                  "vh TEXT, agent TEXT)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_mon_dl_ts ON monitor_download(ts)")
+        c.commit()
+
+
+# ---------------------------------------------------------------------------
+# recording
+# ---------------------------------------------------------------------------
+
+def _record(h):
+    try:
+        if getattr(h, "command", "") != "GET":
+            return
+        path = (getattr(h, "path", "") or "").split("?")[0].split("#")[0] or "/"
+        if path.startswith(("/x/", "/api/", "/mcp", "/g/", "/c/")):
+            _state["machine_calls"] += 1
+            return
+        hd = getattr(h, "headers", None)
+        if hd is None:
+            return
+        ua = hd.get("User-Agent", "") or ""
+        is_dl = bool(DOWNLOAD_RE.search(path)) and not path.startswith(("/static/",))
+        if not is_dl and (path.startswith(SKIP_PREFIX) or ASSET_RE.search(path)):
+            return
+        day = _day()
+        if BOT_RE.search(ua) or not ua:
+            with _buf_lock:
+                _buf["bots"][day] += 1
+            return
+        xff = hd.get("X-Forwarded-For", "")
+        ip = xff.split(",")[0].strip() if xff else str((getattr(h, "client_address", None) or ["?"])[0])
+        vh = hmac.new(_salt, ("%s|%s|%s" % (ip, ua[:200], day)).encode(), hashlib.sha256).hexdigest()[:16]
+        ref = ""
+        r = hd.get("Referer", "") or ""
+        m = re.match(r"https?://([^/:?#]+)", r)
+        if m:
+            host = m.group(1).lower()
+            if not host.endswith("sebbi.pro"):
+                ref = host[:80]
+        agent = re.sub(r"[^\w .;:/()-]", "", ua)[:80]
+        with _buf_lock:
+            _buf["hits"][(day, path[:120])] += 1
+            _buf["visitors"].add((day, vh))
+            if ref:
+                _buf["refs"][(day, ref)] += 1
+            if is_dl:
+                _buf["downloads"].append((time.time(), path[:160], vh, agent))
+    except Exception as e:
+        _state["last_error"] = "record: %s" % str(e)[:120]
+
+
+def _flush():
+    with _buf_lock:
+        hits, vis, bots, refs, dls = (dict(_buf["hits"]), set(_buf["visitors"]), dict(_buf["bots"]),
+                                      dict(_buf["refs"]), list(_buf["downloads"]))
+        _buf["hits"].clear(); _buf["visitors"].clear(); _buf["bots"].clear(); _buf["refs"].clear(); _buf["downloads"].clear()
+    if not (hits or vis or bots or refs or dls):
+        return
+    s = _srv()
+    with s._db_lock:
+        c = s._conn
+        for (day, path), n in hits.items():
+            c.execute("INSERT INTO monitor_hits(day,path,n) VALUES(?,?,?) ON CONFLICT(day,path) DO UPDATE SET n=n+?", (day, path, n, n))
+        c.executemany("INSERT OR IGNORE INTO monitor_visitors(day,vh) VALUES(?,?)", list(vis))
+        for day, n in bots.items():
+            c.execute("INSERT INTO monitor_bots(day,n) VALUES(?,?) ON CONFLICT(day) DO UPDATE SET n=n+?", (day, n, n))
+        for (day, host), n in refs.items():
+            c.execute("INSERT INTO monitor_refs(day,host,n) VALUES(?,?,?) ON CONFLICT(day,host) DO UPDATE SET n=n+?", (day, host, n, n))
+        c.executemany("INSERT INTO monitor_download(ts,path,vh,agent) VALUES(?,?,?,?)", dls)
+        c.commit()
+    _state["flushed"] += 1
+
+
+def _writer():
+    while True:
+        time.sleep(15)
+        try:
+            _flush()
+        except Exception as e:
+            _state["last_error"] = "flush: %s" % str(e)[:120]
+
+
+def _install():
+    with _lock:
+        if _state["installed"]:
+            return True
+        H = getattr(_srv(), "Handler", None)
+        if H is None:
+            return False
+        if not getattr(H, "_monitor_patched", False):
+            original = H.handle_one_request
+
+            def handle_one_request(self):
+                try:
+                    original(self)
+                finally:
+                    _record(self)
+
+            H.handle_one_request = handle_one_request
+            H._monitor_patched = True
+        if not _state["writer"]:
+            _state["writer"] = True
+            threading.Thread(target=_writer, name="monitor", daemon=True).start()
+        _state["installed"] = True
+        return True
+
+
+# ---------------------------------------------------------------------------
+# reading
+# ---------------------------------------------------------------------------
+
+def _handler():
+    f = inspect.currentframe()
+    try:
+        for _ in range(12):
+            f = f.f_back
+            if f is None:
+                break
+            h = f.f_locals.get("h") or f.f_locals.get("self")
+            if h is not None and hasattr(h, "headers") and hasattr(h, "wfile"):
+                return h
+    finally:
+        del f
+    return None
+
+
+def _is_admin():
+    h = _handler()
+    s = _srv()
+    try:
+        return bool(h is not None and s.check_admin(h))
+    except Exception:
+        return False
+
+
+def _chain():
+    now = time.time()
+    if _cache["chain"] is None or now - _cache["chain_at"] > 300:
+        try:
+            v = _srv().verify_chain()
+            _cache["chain"] = {"valid": v.get("valid"), "blocks": v.get("blocks"), "tip": v.get("tip"),
+                               "checked_utc": _iso(now)}
+        except Exception as e:
+            _cache["chain"] = {"valid": None, "error": str(e)[:120]}
+        _cache["chain_at"] = now
+    return _cache["chain"]
+
+
+def _mod_state(name):
+    m = sys.modules.get("modules." + name) or sys.modules.get(name)
+    if not m:
+        return {"loaded": False}
+    st = getattr(m, "_state", {}) or {}
+    return {"loaded": True, "version": getattr(m, "VERSION", None), "last_error": st.get("last_error")}
+
+
+def snapshot():
+    try:
+        _flush()
+    except Exception:
+        pass
+    s = _srv()
+    now = time.time()
+    t0 = now - (now % 86400)
+    d7 = now - 7 * 86400
+    today = _day()
+    days = [_day(now - i * 86400) for i in range(13, -1, -1)]
+
+    # customers
+    keys = _db("SELECT key,email,name,org,product,created,is_paid,plan_type,actions_used FROM api_keys ORDER BY created DESC")
+    dev_by_key = dict(_db("SELECT api_key, COUNT(*) FROM device_seen GROUP BY api_key"))
+    dec_by_key = {}
+    last_by_key = {}
+    try:
+        for k, n, last in _db("SELECT api_key, COUNT(*), MAX(ts) FROM audit_log WHERE api_key IS NOT NULL AND api_key!='' GROUP BY api_key"):
+            dec_by_key[k] = n
+            last_by_key[k] = last
+    except Exception:
+        pass
+    gw_by_kh = {}
+    try:
+        gw_by_kh = dict(_db("SELECT key_hash, COUNT(*) FROM gateway_call GROUP BY key_hash"))
+    except Exception:
+        pass
+    pilot_keys = {}
+    try:
+        for k, paid_at in _db("SELECT api_key, paid_at FROM pilot_order WHERE status='paid'"):
+            pilot_keys[k] = paid_at
+    except Exception:
+        pass
+    ai_emails = set()
+    try:
+        ai_emails = {r[0] for r in _db("SELECT email_fp FROM mcp_agreement")}
+    except Exception:
+        pass
+
+    def kh(k):
+        return hashlib.sha256(("gw|" + k).encode()).hexdigest()[:24]
+
+    customers = []
+    mrr = 0.0
+    trials_ending = 0
+    for k, email, name, org, product, created, paid, plan, used in keys:
+        devs = dev_by_key.get(k, 0)
+        left = None if paid else int(max(0, (created or now) + TRIAL_DAYS * 86400 - now) // 86400)
+        if paid:
+            mrr += 0.5 * max(1, devs)
+        elif left is not None and left <= 7:
+            trials_ending += 1
+        efp = hashlib.sha256((email or "").strip().lower().encode()).hexdigest()
+        customers.append({"name": name or "", "email": email or "", "org": org or "", "product": product or "",
+                          "joined_utc": _iso(created), "paid": bool(paid), "trial_days_left": left, "devices": devs,
+                          "decisions": dec_by_key.get(k, 0), "last_active_utc": _iso(last_by_key.get(k)) if last_by_key.get(k) else None,
+                          "gateway_calls": gw_by_kh.get(kh(k), 0), "pilot": bool(k in pilot_keys),
+                          "via_ai": efp in ai_emails, "key_hint": (k[:10] + "…" + k[-4:]) if k else ""})
+
+    def cnt(sql, a=()):
+        return _q(sql, a, 0)
+
+    kpi = {
+        "signups_total": len(keys), "signups_today": sum(1 for c in keys if (c[5] or 0) >= t0),
+        "signups_7d": sum(1 for c in keys if (c[5] or 0) >= d7), "paying": sum(1 for c in keys if c[6]),
+        "trials_ending_7d": trials_ending, "mrr_gbp": round(mrr, 2),
+        "devices_total": cnt("SELECT COUNT(*) FROM device_seen"),
+        "devices_today": cnt("SELECT COUNT(*) FROM device_seen WHERE first_seen>=?", (t0,)),
+        "decisions_total": cnt("SELECT COUNT(*) FROM audit_log"),
+        "decisions_today": cnt("SELECT COUNT(*) FROM audit_log WHERE ts>=?", (t0,)),
+        "customer_decisions_today": cnt("SELECT COUNT(*) FROM audit_log WHERE ts>=? AND api_key IS NOT NULL AND api_key!=''", (t0,)),
+        "blocked_today": cnt("SELECT COUNT(*) FROM audit_log WHERE ts>=? AND result_json LIKE '%\"decision\": \"BLOCK\"%'", (t0,)),
+        "visitors_today": cnt("SELECT COUNT(*) FROM monitor_visitors WHERE day=?", (today,)),
+        "visitors_7d": cnt("SELECT COUNT(*) FROM monitor_visitors WHERE day>=?", (days[-7],)),
+        "page_views_today": cnt("SELECT SUM(n) FROM monitor_hits WHERE day=?", (today,)),
+        "bots_today": cnt("SELECT n FROM monitor_bots WHERE day=?", (today,)),
+        "downloads_today": cnt("SELECT COUNT(*) FROM monitor_download WHERE ts>=?", (t0,)),
+        "downloads_7d": cnt("SELECT COUNT(*) FROM monitor_download WHERE ts>=?", (d7,)),
+        "gateway_calls_today": cnt("SELECT COUNT(*) FROM gateway_call WHERE ts>=?", (t0,)),
+        "notary_today": cnt("SELECT COUNT(*) FROM notary_leaf WHERE submitted>=? AND who NOT IN ('codebase','humankeys')", (t0,)),
+        "human_keys_total": cnt("SELECT COUNT(*) FROM humankeys_proof"),
+        "accounts_by_ai": cnt("SELECT COUNT(*) FROM mcp_agreement"),
+        "pilots_paid": cnt("SELECT COUNT(*) FROM pilot_order WHERE status='paid'"),
+        "pilot_revenue_gbp": round(cnt("SELECT SUM(amount) FROM pilot_order WHERE status='paid'") / 100.0, 2),
+        "wallet_topups_gbp": round(cnt("SELECT SUM(pence) FROM credit_payment WHERE status='paid'") / 100.0, 2),
+        "messages_7d": cnt("SELECT COUNT(*) FROM contact_log WHERE ts>=?", (d7,)),
+        "machine_calls_since_start": _state["machine_calls"],
+    }
+
+    # 14-day series
+    def series(sql, keyfn=None):
+        out = dict.fromkeys(days, 0)
+        try:
+            for d, n in _db(sql, (days[0],)):
+                if d in out:
+                    out[d] = n
+        except Exception:
+            pass
+        return [out[d] for d in days]
+
+    ser = {
+        "days": days,
+        "visitors": series("SELECT day, COUNT(*) FROM monitor_visitors WHERE day>=? GROUP BY day"),
+        "signups": series("SELECT strftime('%Y-%m-%d', created, 'unixepoch'), COUNT(*) FROM api_keys WHERE strftime('%Y-%m-%d', created, 'unixepoch')>=? GROUP BY 1"),
+        "decisions": series("SELECT strftime('%Y-%m-%d', ts, 'unixepoch'), COUNT(*) FROM audit_log WHERE strftime('%Y-%m-%d', ts, 'unixepoch')>=? GROUP BY 1"),
+        "devices": series("SELECT strftime('%Y-%m-%d', first_seen, 'unixepoch'), COUNT(*) FROM device_seen WHERE strftime('%Y-%m-%d', first_seen, 'unixepoch')>=? GROUP BY 1"),
+        "downloads": series("SELECT strftime('%Y-%m-%d', ts, 'unixepoch'), COUNT(*) FROM monitor_download WHERE strftime('%Y-%m-%d', ts, 'unixepoch')>=? GROUP BY 1"),
+    }
+
+    pages = [{"path": p, "views": n} for p, n in _safe("SELECT path, SUM(n) FROM monitor_hits WHERE day>=? GROUP BY path ORDER BY 2 DESC LIMIT 15", (days[-7],))]
+    refs = [{"site": h, "visits": n} for h, n in _safe("SELECT host, SUM(n) FROM monitor_refs WHERE day>=? GROUP BY host ORDER BY 2 DESC LIMIT 12", (days[-7],))]
+    downloads = [{"utc": _iso(t), "path": p, "visitor": v[:8], "agent": a} for t, p, v, a in
+                 _safe("SELECT ts, path, vh, agent FROM monitor_download ORDER BY ts DESC LIMIT 60")]
+    dl_top = [{"path": p, "count": n} for p, n in _safe("SELECT path, COUNT(*) FROM monitor_download GROUP BY path ORDER BY 2 DESC LIMIT 12")]
+    email_by_key = {k[0]: k[1] for k in keys}
+    devices = [{"utc": _iso(t), "device": (d or "")[:40], "customer": email_by_key.get(k, "?")} for k, d, t in
+               _safe("SELECT api_key, device_id, first_seen FROM device_seen ORDER BY first_seen DESC LIMIT 60")]
+    messages = [{"utc": _iso(t), "name": n, "email": e, "org": o, "message": (m or "")[:400]} for t, n, e, o, m in
+                _safe("SELECT ts, name, email, org, message FROM contact_log ORDER BY ts DESC LIMIT 20")]
+    pilots = [{"utc": _iso(c), "name": n, "email": e, "company": co, "status": st, "paid_utc": _iso(p) if p else None,
+               "deliver_by_utc": _iso(p + 7 * 86400) if p else None, "amount_gbp": (a or 0) / 100.0} for c, n, e, co, st, p, a in
+              _safe("SELECT created, name, email, company, status, paid_at, amount FROM pilot_order ORDER BY created DESC LIMIT 30")]
+
+    # live feed
+    feed = []
+    for c in customers[:40]:
+        feed.append((c["joined_utc"], "signup", "%s signed up%s" % (c["name"] or c["email"], " via an AI assistant" if c["via_ai"] else ""), c["org"] or c["product"]))
+    for d in devices[:40]:
+        feed.append((d["utc"], "device", "New device linked", "%s · %s" % (d["customer"], d["device"])))
+    for d in downloads[:40]:
+        feed.append((d["utc"], "download", "Downloaded %s" % d["path"], d["agent"][:40]))
+    for m in messages[:10]:
+        feed.append((m["utc"], "message", "Message from %s" % (m["name"] or m["email"]), m["message"][:90]))
+    for p in pilots[:10]:
+        if p["status"] == "paid":
+            feed.append((p["paid_utc"], "money", "PILOT PAID £%.0f — %s" % (p["amount_gbp"], p["company"]), p["email"]))
+        else:
+            feed.append((p["utc"], "checkout", "Pilot checkout started — %s" % p["company"], p["email"]))
+    for t, pv, mdl, dec in _safe("SELECT ts, provider, model, decision FROM gateway_call ORDER BY ts DESC LIMIT 20"):
+        feed.append((_iso(t), "gateway", "Gateway call %s" % (dec or ""), "%s %s" % (pv, mdl or "")))
+    for t, r in _safe("SELECT ts, result_json FROM audit_log WHERE result_json LIKE '%\"decision\": \"BLOCK\"%' ORDER BY id DESC LIMIT 10"):
+        feed.append((_iso(t), "block", "Decision BLOCKED", ""))
+    feed = [{"utc": a, "kind": b, "title": c, "detail": d} for a, b, c, d in sorted((f for f in feed if f[0]), reverse=True)[:80]]
+
+    # health
+    chain = _chain()
+    btc = {}
+    try:
+        r = _db("SELECT MAX(chain_size), MAX(btc_height), MAX(confirmed_at) FROM notary_batch WHERE kind='chain' AND state='confirmed'", one=True)
+        last_cp = _q("SELECT MAX(created) FROM notary_batch WHERE kind='chain'")
+        btc = {"blocks_in_bitcoin": r[0] or 0, "latest_bitcoin_block": r[1], "last_confirmed_utc": _iso(r[2]) if r[2] else None,
+               "last_checkpoint_utc": _iso(last_cp) if last_cp else None,
+               "pending": cnt("SELECT COUNT(*) FROM notary_batch WHERE state IN ('new','pending')")}
+    except Exception:
+        pass
+    mods = {n: _mod_state(n) for n in ("notary", "gateway", "pilot", "ratelimit", "humankeys", "mcp", "connect", "dossier",
+                                        "heartbeat", "ots", "ainews", "brand", "homelink", "answers")}
+
+    # alerts
+    alerts = []
+    if chain.get("valid") is False:
+        alerts.append({"level": "critical", "text": "Chain verification FAILED — open the Chain tab now."})
+    for p in pilots:
+        if p["status"] == "paid" and p["paid_utc"]:
+            due = datetime.strptime(p["deliver_by_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            dleft = (due - now) / 86400
+            if dleft > -30:
+                alerts.append({"level": "money" if dleft > 2 else "serious",
+                               "text": "Pilot for %s — deliver by %s (%s)" % (p["company"], p["deliver_by_utc"][:10],
+                                                                            "%.0f days left" % dleft if dleft >= 0 else "OVERDUE")})
+    if trials_ending:
+        alerts.append({"level": "warning", "text": "%d trial%s end within 7 days — chase for a card." % (trials_ending, "" if trials_ending == 1 else "s")})
+    if kpi["messages_7d"]:
+        alerts.append({"level": "info", "text": "%d message%s in the last 7 days." % (kpi["messages_7d"], "" if kpi["messages_7d"] == 1 else "s")})
+    if btc.get("last_confirmed_utc"):
+        age = (now - datetime.strptime(btc["last_confirmed_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()) / 3600
+        if age > 12:
+            alerts.append({"level": "warning", "text": "No new Bitcoin confirmation for %.0f hours." % age})
+    core = ("notary", "gateway", "pilot", "ratelimit", "humankeys", "mcp", "dossier", "heartbeat", "ots", "homelink")
+    for n, m in mods.items():
+        if n in core and m.get("loaded") and m.get("last_error"):
+            alerts.append({"level": "warning", "text": "%s: %s" % (n, str(m["last_error"])[:120])})
+    unloaded = [n for n in ("notary", "gateway", "pilot", "ratelimit", "homelink") if not mods[n]["loaded"]]
+    if unloaded:
+        alerts.append({"level": "serious", "text": "Not armed: %s — tap https://sebbi.pro/x/arm/status" % ", ".join(unloaded)})
+
+    return {"generated_utc": _iso(now), "kpi": kpi, "series": ser, "customers": customers[:300], "devices": devices,
+            "downloads": downloads, "downloads_top": dl_top, "pages": pages, "referrers": refs, "messages": messages,
+            "pilots": pilots, "feed": feed, "alerts": alerts,
+            "health": {"chain": chain, "bitcoin": btc, "modules": mods, "server_version": getattr(s, "VERSION", None)}}
+
+
+def _safe(sql, args=()):
+    try:
+        return _db(sql, args)
+    except Exception:
+        return []
+
+
+def handle(method, action, data, api_key, ctx):
+    try:
+        _setup()
+        _install()
+    except Exception as e:
+        _state["last_error"] = "arm: %s" % str(e)[:120]
+    if action in ("", "status"):
+        return {"module": "monitor", "version": VERSION, "armed": _state["installed"], "recording": _state["writer"],
+                "flushes": _state["flushed"], "last_error": _state["last_error"],
+                "data": "GET /x/monitor/all with the admin login token"}, 200
+    if action == "all":
+        if not _is_admin():
+            return {"error": "admin_only", "message": "Log in at https://sebbi.pro/admin"}, 401
+        try:
+            return snapshot(), 200
+        except Exception as e:
+            _state["last_error"] = "snapshot: %s" % str(e)[:150]
+            return {"error": "snapshot_failed", "detail": str(e)[:200]}, 500
+    return {"error": "unknown_action", "action": action}, 404
 
 ```
 
@@ -1941,503 +2427,5 @@ def handle(method, action, data, api_key, ctx):
 
     return {"error": "unknown_action", "action": action,
             "GET": ["status"]}, 404
-
-```
-
-
-## `modules/noexec.py`
-
-490 lines, 22739 bytes
-
-```python
-"""
-modules/noexec.py  v1.1.0
-The NO-EXEC blind bundle: six real objects from the live system, each one
-authentic, each one attached to a claim it may not support.
-
-Arm after each deploy:  https://sebbi.pro/x/noexec/status
-
-    GET /x/noexec/build              mint the six objects on the live chain,
-                                     pack them into one bundle, seal the
-                                     bundle fingerprint and a salted
-                                     commitment to the answer key, and hand
-                                     back the links (one build per 10 minutes)
-    GET /x/noexec/bundle?id=         the bundle exactly as sent: claims and
-                                     objects only, no verdicts, no hints
-    GET /x/noexec/reveal?id=&secret= the answer key plus its salt, so anyone
-                                     can recompute the sealed commitment
-    GET /x/noexec/reveal?id=&admin=  the operator's own unlock (ADMIN_PASSWORD), for
-                                     when the reveal link is lost. It publishes the
-                                     key: from then on the plain link works for anyone
-                                     and the reveal itself is sealed in the chain
-    GET /x/noexec/status             module status
-
-How the six are made (nothing faked, nothing edited afterwards):
-  1  a passport minted, then redeemed once, redemption sealed
-  2  a passport minted, then its grant revoked, revocation sealed
-  3  a passport minted for one site, never presented anywhere
-  4  a signed authority proof bundle for an ALLOW evaluation whose grant
-     window is fifteen minutes long
-  5  the sealed Temporal Standing Test evidence package, run r_72d2d93a5c2a4988
-  6  the latest self-proving archive file and the sealed custody count
-
-Built on continuity.py (1.6.0+) and passport.py. Neither is changed.
-"""
-
-import hashlib
-import importlib
-import importlib.util
-import json
-import os
-import secrets
-import sys
-import time
-import uuid
-from datetime import datetime, timezone
-
-VERSION = "1.1.0"
-PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "build"), ("GET", "bundle"), ("GET", "reveal")}
-
-SITE = "https://sebbi.pro"
-KEY = "noexec-blind-bundle"
-GAP = 600
-CAP = "noexec.pay"
-TAGS = ["noexec"]
-AUD = "checkout.sebbi.pro"
-AUD_OTHER = "bookings.sebbi.pro"
-PARAMS = {"amount": 20}
-TST_RUN = "r_72d2d93a5c2a4988"
-TST_REVIEW = "https://studio.moralclarity.ai/temporal-standing-test"
-
-_ready = False
-_last = [0.0]
-
-
-def _iso(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
-
-
-def _canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _sha(obj):
-    return hashlib.sha256(_canon(obj).encode("utf-8")).hexdigest()
-
-
-def _block_url(n):
-    return SITE + "/x/walk/block?index=%s" % n if n is not None else None
-
-
-def _load(name, must_have):
-    for m in list(sys.modules.values()):
-        f = getattr(m, "__file__", "") or ""
-        if f.endswith(os.sep + name + ".py") and all(hasattr(m, a) for a in must_have):
-            return m
-    pkg = __package__ or ""
-    try:
-        m = importlib.import_module(pkg + "." + name if pkg else name)
-        if all(hasattr(m, a) for a in must_have):
-            return m
-    except Exception:
-        pass
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
-    spec = importlib.util.spec_from_file_location("noexec_" + name, path)
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
-
-
-def _call(name, action, data, ctx):
-    """Ask another live module for one of its public answers. Never raises."""
-    try:
-        m = _load(name, ("handle",))
-        out = m.handle("GET", action, data, None, ctx)
-        body = out[0] if isinstance(out, tuple) else out
-        return body if isinstance(body, dict) else {"raw": str(body)[:4000]}
-    except Exception as e:
-        return {"unavailable": str(e)[:200]}
-
-
-def _setup(ctx):
-    global _ready
-    if _ready:
-        return
-    with ctx["lock"]:
-        c = ctx["conn"]
-        c.execute("CREATE TABLE IF NOT EXISTS noexec_bundle(id TEXT PRIMARY KEY,created REAL,"
-                  "bundle TEXT,bundle_sha256 TEXT,answer_key TEXT,key_commitment TEXT,"
-                  "secret_digest TEXT,audit_hash TEXT,block_index INTEGER)")
-        c.execute("CREATE TABLE IF NOT EXISTS noexec_revealed(id TEXT PRIMARY KEY,at REAL,"
-                  "how TEXT,audit_hash TEXT,block_index INTEGER)")
-        c.commit()
-    _ready = True
-
-
-def _seal(ctx, kind, extra):
-    ev = {"user_id": "noexec:" + kind[:20], "action": kind, "amount": 0, "country": "UK",
-          "device_id": "noexec", "anomaly": 0, "device_risk": 0}
-    res = {"decision": kind.upper(), "score": 0, "noexec_version": VERSION}
-    res.update(extra)
-    out = ctx["seal"](ev, res, time.time(), KEY)
-    if isinstance(out, (list, tuple)):
-        return out[0], (out[1] if len(out) > 1 else None)
-    return out, None
-
-
-def _grant(C, ctx, gid, subject, now):
-    g = {"id": gid, "issuer": "justin-dobson", "issuer_kind": "human", "subject": subject,
-         "scope": [CAP], "constraints": {"max_amount": 50},
-         "purpose": "NO-EXEC blind bundle for independent review", "purpose_tags": TAGS,
-         "not_after": now + 900}
-    r, s = C._issue(ctx, KEY, g)
-    if s != 200:
-        raise RuntimeError("grant %s not issued: %s" % (gid, _canon(r)[:300]))
-    return r
-
-
-def _mint(P, C, ctx, gid, audience):
-    r, s = P._mint(ctx, C, KEY, {"grant": gid, "action": CAP, "params": PARAMS,
-                                 "purpose_tag": TAGS[0], "audience": audience})
-    if s != 200 or not r.get("issued"):
-        raise RuntimeError("passport for %s not issued: %s" % (gid, _canon(r)[:300]))
-    return r
-
-
-def _passport_sources(token, gid, issued_block):
-    return {"live_check": SITE + "/x/passport/verify?token=" + token,
-            "token_format": SITE + "/x/passport/spec",
-            "public_key": SITE + "/x/continuity/pubkey",
-            "grant_lineage": SITE + "/x/continuity/trace?grant=" + gid,
-            "issued_in_block": _block_url(issued_block)}
-
-
-def _build(ctx):
-    now = time.time()
-    if now - _last[0] < GAP:
-        return {"error": "too_soon", "retry_after_seconds": int(GAP - (now - _last[0]))}, 429
-    _last[0] = now
-    C = _load("continuity", ("_issue", "_evaluate", "_revoke", "_proof", "_confirm"))
-    P = _load("passport", ("_mint", "_redeem", "_check"))
-    C._setup(ctx)
-    P._setup(ctx)
-
-    tag = uuid.uuid4().hex[:10]
-    agent = "agent-" + tag
-    cases, key = [], []
-
-    # 1 - the spent passport
-    g1 = "nx_%s_1" % tag
-    _grant(C, ctx, g1, agent, now)
-    p1 = _mint(P, C, ctx, g1, AUD)
-    r1, _s = P._redeem(ctx, C, {"token": p1["passport"], "audience": AUD, "params": PARAMS})
-    if not r1.get("redeemed"):
-        raise RuntimeError("case 1 redemption did not bind: %s" % _canon(r1)[:300])
-    cases.append({"case": 1,
-                  "claim": "This agent is authorised to perform this action.",
-                  "presented_at": AUD, "action": CAP, "params": PARAMS,
-                  "object": {"passport": p1["passport"]},
-                  "sources": _passport_sources(p1["passport"], g1, p1.get("block_index"))})
-    key.append({"case": 1, "verdict": "NOT PROVEN",
-                "what_it_proves": "Authorised once, for %s of %s at %s." % (CAP, _canon(PARAMS), AUD),
-                "why_not": "Already redeemed; the redemption is sealed in block %s. Nothing "
-                           "authorises a further execution." % r1.get("block_index"),
-                "evidence": [_block_url(r1.get("block_index"))]})
-
-    # 2 - the revoked passport
-    g2 = "nx_%s_2" % tag
-    _grant(C, ctx, g2, agent, now)
-    p2 = _mint(P, C, ctx, g2, AUD)
-    rv, _s = C._revoke(ctx, KEY, {"grant": g2, "reason": "human withdrew the authority"})
-    cases.append({"case": 2,
-                  "claim": "This agent was authorised at the moment of action.",
-                  "presented_at": AUD, "action": CAP, "params": PARAMS,
-                  "object": {"passport": p2["passport"]},
-                  "sources": _passport_sources(p2["passport"], g2, p2.get("block_index"))})
-    key.append({"case": 2, "verdict": "NOT PROVEN",
-                "what_it_proves": "The signature is genuine and the passport was in date: an "
-                                  "offline verifier says VALID.",
-                "why_not": "The grant behind it was revoked (block %s) after issue. Standing is "
-                           "lost, so no moment of action after that is authorised. Signature "
-                           "validity is not standing." % rv.get("block_index"),
-                "evidence": [_block_url(rv.get("block_index")),
-                             SITE + "/x/continuity/trace?grant=" + g2]})
-
-    # 3 - the misdirected passport (never presented anywhere, so still unspent)
-    g3 = "nx_%s_3" % tag
-    _grant(C, ctx, g3, agent, now)
-    p3 = _mint(P, C, ctx, g3, AUD_OTHER)
-    cases.append({"case": 3,
-                  "claim": "This agent is authorised to act at %s." % AUD,
-                  "presented_at": AUD, "action": CAP, "params": PARAMS,
-                  "object": {"passport": p3["passport"]},
-                  "sources": _passport_sources(p3["passport"], g3, p3.get("block_index"))})
-    key.append({"case": 3, "verdict": "NOT PROVEN",
-                "what_it_proves": "Genuine, unspent and unrevoked authority at %s." % AUD_OTHER,
-                "why_not": "The passport's audience is %s. It says nothing about %s."
-                           % (AUD_OTHER, AUD),
-                "evidence": [SITE + "/x/passport/spec"]})
-
-    # 4 - the signed proof of a past ALLOW
-    g4 = "nx_%s_4" % tag
-    gr4 = _grant(C, ctx, g4, agent, now)
-    ev, s = C._evaluate(ctx, KEY, {"grant": g4, "action": CAP, "params": PARAMS,
-                                   "purpose_tag": TAGS[0]})
-    if s != 200 or ev.get("verdict") != "ALLOW":
-        raise RuntimeError("case 4 evaluation was not ALLOW: %s" % _canon(ev)[:300])
-    proof, s = C._proof(ctx, {"evaluation": ev["evaluation"]})
-    if s != 200:
-        raise RuntimeError("case 4 proof not produced: %s" % _canon(proof)[:300])
-    cases.append({"case": 4,
-                  "claim": "This agent holds this authority.",
-                  "object": {"authority_proof": proof},
-                  "sources": {"proof": SITE + "/x/continuity/proof?evaluation=" + ev["evaluation"],
-                              "public_key": SITE + "/x/continuity/pubkey",
-                              "derivation_rules": SITE + "/x/continuity/spec",
-                              "grant_lineage": SITE + "/x/continuity/trace?grant=" + g4}})
-    key.append({"case": 4, "verdict": "NOT PROVEN",
-                "what_it_proves": "Authority stood, and the ALLOW re-derives from the lineage, at "
-                                  "%s." % ev.get("evaluated_at", _iso(now)),
-                "why_not": "A proof of an instant says nothing about now. The grant's window "
-                           "closes at %s; any present-tense claim needs a live standing check."
-                           % gr4.get("not_after"),
-                "evidence": [SITE + "/x/continuity/trace?grant=" + g4]})
-
-    # 5 - the real test, the narrower finding
-    tst = _call("standing", "evidence", {"run": TST_RUN}, ctx)
-    cases.append({"case": 5,
-                  "claim": "sebbi.pro passed the Temporal Standing Test.",
-                  "object": {"evidence_package": tst},
-                  "sources": {"evidence": SITE + "/x/standing/evidence?run=" + TST_RUN,
-                              "freeze_sealed_in": _block_url(2387),
-                              "run_sealed_in": _block_url(2398),
-                              "test_definition": TST_REVIEW}})
-    key.append({"case": 5, "verdict": "NOT PROVEN",
-                "what_it_proves": "A pre-registered run, freeze sealed before execution (block "
-                                  "2387 before 2398), both branches recorded as observed.",
-                "why_not": "The independent reviewer's finding is narrower than the package's "
-                           "own 'PASS': revocation-aware authorisation and execution binding "
-                           "ESTABLISHED; temporal standing on external facts (a still-valid "
-                           "grant defeated by a change in an authoritative external fact) NOT "
-                           "YET ESTABLISHED. The object is authentic; its summary overstates "
-                           "what it supports.",
-                "evidence": [SITE + "/x/standing/evidence?run=" + TST_RUN, TST_REVIEW]})
-
-    # 6 - the archive with no custodians
-    man = _call("archive", "manifest", {}, ctx)
-    files = man.get("files") if isinstance(man, dict) else None
-    latest = files[0] if isinstance(files, list) and files else man
-    cus = _call("custody", "status", {}, ctx)
-    cases.append({"case": 6,
-                  "claim": "sebbi.pro's record is held independently.",
-                  "object": {"archive_file": latest, "custody": cus},
-                  "sources": {"archive_manifest": SITE + "/x/archive/manifest",
-                              "archive_file": (latest or {}).get("file") if isinstance(latest, dict) else None,
-                              "sealed_in": (latest or {}).get("check_block") if isinstance(latest, dict) else None,
-                              "custody_count": SITE + "/x/custody/status"}})
-    key.append({"case": 6, "verdict": "NOT PROVEN",
-                "what_it_proves": "Integrity: the file is content-addressed, sealed in the chain, "
-                                  "and its embedded verifier passes.",
-                "why_not": "Independence: the sealed custody count of holders other than "
-                           "sebbi.pro is %s." % _custody_count(cus),
-                "evidence": [SITE + "/x/custody/status"]})
-
-    for c in cases:
-        c["object_sha256"] = _sha(c["object"])
-
-    bid = "nx_" + tag
-    captured = _iso(time.time())
-    bundle = {
-        "bundle": bid,
-        "format": "noexec-blind-bundle/1",
-        "issuer": "sebbi.pro",
-        "captured_at": captured,
-        "instructions": "Six objects taken from the live system. Each is presented with the "
-                        "claim being made with it and nothing else. Fetch every source "
-                        "yourself rather than trusting this copy; each object carries the "
-                        "SHA-256 of its canonical JSON (keys sorted, separators ',' ':').",
-        "format_notes": {
-            "passport": "sbp1.<base64url body>.<base64url Ed25519 signature>; the signature "
-                        "is over 'AILEASH-PASSPORT-v1:' || body bytes. Passports carry a "
-                        "5-minute validity window (exp).",
-            "chain_blocks": SITE + "/x/walk/block?index=<n>",
-        },
-        "cases": cases,
-    }
-    bundle_sha = _sha(bundle)
-
-    salt = secrets.token_hex(32)
-    answer = {"bundle": bid, "bundle_sha256": bundle_sha, "salt": salt, "answers": key}
-    commitment = _sha(answer)
-    secret = secrets.token_urlsafe(18)
-    audit_hash, block = _seal(ctx, "noexec_bundle_committed",
-                              {"bundle": bid, "bundle_sha256": bundle_sha,
-                               "answer_key_commitment": commitment,
-                               "detail": "bundle=%s;sha256=%s;key_commitment=%s"
-                                         % (bid, bundle_sha, commitment)})
-    with ctx["lock"]:
-        ctx["conn"].execute("INSERT INTO noexec_bundle VALUES(?,?,?,?,?,?,?,?,?)",
-                            (bid, time.time(), _canon(bundle), bundle_sha, _canon(answer),
-                             commitment, hashlib.sha256(secret.encode()).hexdigest(),
-                             audit_hash, block))
-        ctx["conn"].commit()
-    return {"built": True, "bundle": bid,
-            "send_this_link": SITE + "/x/noexec/bundle?id=" + bid,
-            "bundle_sha256": bundle_sha,
-            "answer_key_commitment": commitment,
-            "sealed_in_chain": audit_hash, "block_index": block,
-            "check_the_seal": _block_url(block),
-            "reveal_later_keep_private": SITE + "/x/noexec/reveal?id=%s&secret=%s" % (bid, secret),
-            "note": "Send only the bundle link. Keep the reveal link to yourself until the "
-                    "reviewer has published results."}, 200
-
-
-def _custody_count(cus):
-    if not isinstance(cus, dict):
-        return "unavailable"
-    for k in ("independent_holders_today", "independent_holders", "holders_today", "count",
-              "independent"):
-        if k in cus:
-            return cus[k]
-    for v in cus.values():
-        if isinstance(v, dict):
-            for k in ("independent_holders", "count", "holders"):
-                if k in v:
-                    return v[k]
-    return "as sealed at " + SITE + "/x/custody/status"
-
-
-def _query(ctx):
-    """Read the query string straight off the live request, whatever the router passed:
-    from the handler in ctx if there is one, otherwise from the request handler found on
-    the call stack (the same way page modules find it)."""
-    from urllib.parse import parse_qs
-    paths = []
-    try:
-        if isinstance(ctx, dict):
-            for k in ("handler", "h", "request_handler", "request"):
-                h = ctx.get(k)
-                if h is not None and getattr(h, "path", None):
-                    paths.append(h.path)
-        f = sys._getframe()
-        while f is not None:
-            o = f.f_locals.get("self")
-            if o is not None and hasattr(o, "wfile") and isinstance(getattr(o, "path", None), str):
-                paths.append(o.path)
-                break
-            f = f.f_back
-    except Exception:
-        pass
-    for path in paths:
-        if "?" in path:
-            return {k: v[0] for k, v in parse_qs(path.split("?", 1)[1]).items()}
-    return {}
-
-
-def _q(data, k):
-    v = data.get(k, "")
-    if isinstance(v, (list, tuple)):
-        v = v[0] if v else ""
-    return str(v).strip()
-
-
-def _get(ctx, bid):
-    with ctx["lock"]:
-        return ctx["conn"].execute(
-            "SELECT id,created,bundle,bundle_sha256,answer_key,key_commitment,secret_digest,"
-            "audit_hash,block_index FROM noexec_bundle WHERE id=?", (bid,)).fetchone()
-
-
-def _bundle(ctx, data):
-    row = _get(ctx, _q(data, "id"))
-    if not row:
-        return {"error": "bundle_not_found"}, 404
-    return {"bundle": json.loads(row[2]), "bundle_sha256": row[3],
-            "answer_key_commitment": row[5],
-            "commitment_sealed_in_chain": row[7], "commitment_block": _block_url(row[8]),
-            "commitment_rule": "SHA-256 of the canonical JSON of the answer key, which includes "
-                               "this bundle's SHA-256 and a random salt. It was sealed before "
-                               "this bundle was sent and will be revealed after review."}, 200
-
-
-def _reveal(ctx, data):
-    import hmac
-    bid = _q(data, "id")
-    row = _get(ctx, bid)
-    if not row:
-        return {"error": "bundle_not_found"}, 404
-    with ctx["lock"]:
-        pub = ctx["conn"].execute("SELECT at,how,audit_hash,block_index FROM noexec_revealed "
-                                  "WHERE id=?", (bid,)).fetchone()
-    secret = _q(data, "secret")
-    admin = _q(data, "admin")
-    pw = os.environ.get("ADMIN_PASSWORD", "")
-    by_secret = bool(secret) and hashlib.sha256(secret.encode()).hexdigest() == row[6]
-    by_admin = bool(admin) and bool(pw) and hmac.compare_digest(admin, pw)
-    if not (pub or by_secret or by_admin):
-        return {"error": "not_yet_revealed"}, 403
-    if not pub:
-        how = "reveal link" if by_secret else "operator unlock (reveal link lost)"
-        audit_hash, block = _seal(ctx, "noexec_key_revealed",
-                                  {"bundle": bid, "answer_key_commitment": row[5],
-                                   "how": how,
-                                   "detail": "bundle=%s;revealed_by=%s" % (bid, how)})
-        with ctx["lock"]:
-            ctx["conn"].execute("INSERT OR IGNORE INTO noexec_revealed VALUES(?,?,?,?,?)",
-                                (bid, time.time(), how, audit_hash, block))
-            ctx["conn"].commit()
-        pub = (time.time(), how, audit_hash, block)
-    answer = json.loads(row[4])
-    return {"answer_key": answer, "recomputed_commitment": _sha(answer),
-            "sealed_commitment": row[5], "matches": _sha(answer) == row[5],
-            "commitment_sealed_in": _block_url(row[8]),
-            "revealed": {"at": _iso(pub[0]), "how": pub[1], "sealed_in": _block_url(pub[3])},
-            "share_this_link": SITE + "/x/noexec/reveal?id=" + bid,
-            "check_it_yourself": "SHA-256 of the canonical JSON of answer_key (keys sorted, "
-                                 "separators ',' ':', UTF-8) must equal sealed_commitment, "
-                                 "which was sealed before the bundle was sent."}, 200
-
-
-def handle(method, action, data, api_key, ctx):
-    _setup(ctx)
-    action = (action or "").strip("/")
-    data = dict(data or {})
-    if "?" in action:
-        from urllib.parse import parse_qs
-        action, qs = action.split("?", 1)
-        for k, v in parse_qs(qs).items():
-            data.setdefault(k, v[0])
-    for k, v in _query(ctx).items():
-        if not _q(data, k):
-            data[k] = v
-    action = action.strip("/")
-    parts = action.split("/")
-    if len(parts) > 1:
-        action = parts[0]
-        if not _q(data, "id"):
-            data["id"] = parts[1]
-        if len(parts) > 2 and not _q(data, "secret"):
-            data["secret"] = parts[2]
-    action = action.lower()
-    if action in ("status", "spec", ""):
-        with ctx["lock"]:
-            n = ctx["conn"].execute("SELECT COUNT(*) FROM noexec_bundle").fetchone()[0]
-            last = ctx["conn"].execute("SELECT id,block_index FROM noexec_bundle ORDER BY created "
-                                       "DESC LIMIT 3").fetchall()
-        return {"module": "noexec", "version": VERSION, "armed": True, "bundles_built": n,
-                "latest": [{"bundle": r[0], "link": SITE + "/x/noexec/bundle?id=" + r[0],
-                            "sealed_block": r[1]} for r in last],
-                "build": SITE + "/x/noexec/build"}, 200
-    if action == "build":
-        try:
-            return _build(ctx)
-        except Exception as e:
-            _last[0] = 0.0
-            return {"built": False, "error": str(e)[:500]}, 500
-    if action == "bundle":
-        return _bundle(ctx, data)
-    if action == "reveal":
-        return _reveal(ctx, data)
-    return {"error": "unknown_action", "GET": ["status", "build", "bundle", "reveal"]}, 404
 
 ```

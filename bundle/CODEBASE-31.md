@@ -1,1682 +1,1416 @@
-# Codebase — part 31 of 50
+# Codebase — part 31 of 51
 
 Contains:
-- `modules/tokensaver.py`
+- `modules/studio.py`
 
 
-## `modules/tokensaver.py`
+## `modules/studio.py`
 
-1670 lines, 64529 bytes
+1404 lines, 73250 bytes
 
 ```python
-#!/usr/bin/env python3
 """
-modules/tokensaver.py  v2.0.0
-sebbi.pro - the token saver
+modules/studio.py  v4.0.5
+Monop Studio. Creators upload a video at /create and get back:
 
-Reached at /x/tokensaver/<action>.
+  * a teaser video saved to their phone, ready for TikTok, Instagram,
+    Facebook and YouTube - the first few seconds play clear, then the picture
+    blurs behind an end card with the video's link and a QR code burned into
+    the pixels, so it survives any upload anywhere;
+  * a short link, https://sebbi.pro/v/<id>, that opens straight onto that
+    video in the 10p Wing (modules/cinema.py);
+  * a channel link for their bio, https://sebbi.pro/cinema/@<name>.
 
-WHAT IT IS
-----------
-A deterministic gate that sits in front of a model and decides, in
-arithmetic alone, whether a request is answered from store, sent to the
-model, sent to a cheaper one, held for a person, or refused.
+Viewers watch the teaser free, then pay 10p to watch the rest. A viewer with
+no credit taps Google Pay or Apple Pay once (Stripe Checkout), GBP 1 or GBP 5
+lands on their phone as credit, 10p comes off and the video plays. No account.
+Stripe's card fee (1.5% + 20p) is added on top of the credit and shown before
+paying, so the full credit is spent on videos: GBP 1 credit costs GBP 1.22.
 
-It also tells the caller, on every single request, exactly what in that
-request is costing money that it does not need to cost.
+The creator gets 70% of every paid view, less 50p a month per video which is
+only ever taken from that video's own earnings - a video that earns nothing
+costs nothing. Balances and payouts run on modules/credits.py (/earn), and
+every paid view, payment and upload is sealed into the chain.
 
-Every decision seals into the platform chain. The saving is a receipt,
-not a claim.
+Routes (all served by a runtime do_GET / do_POST patch, like credits.py):
+  GET  /create                       the creator page
+  GET  /v/<id>                       one tap -> the video in the 10p Wing
+  GET  /v/<id>/teaser                the free teaser video
+  GET  /v/<id>/poster.jpg            the still
+  GET  /v/<id>/full?viewer=&t=       the full video, for viewers who paid
+  POST /v/api/join | signin | new | chunk | finish | mine | delete
+  GET  /v/api/state?id=&viewer=      unlocked? balance? price?
+  POST /v/api/unlock | pay | paid | report
+  GET  /v/api/admin?key=&do=list|remove&id=     (CREDITS_ADMIN_KEY)
+  GET  /x/studio/status              arms the routes after a deploy
 
-HOW IT IS BUILT
----------------
-Three layers, in this order, because a cost gate that depends entirely
-on tuned weights is a cost gate nobody can defend in a meeting.
-
-  Layer 1  HARD RULES
-           Absolute, arithmetic, untunable. A budget that is spent is
-           spent. A request repeating identically eight times is a
-           runaway. These do not consult the score at all.
-
-  Layer 2  THE SCORE
-           Nine weighted signals summing to exactly 1.00, split into
-           the ones that measure what this request will SPEND and the
-           ones that measure whether that spend is WASTE.
-
-  Layer 3  FINDINGS
-           Named, itemised waste inside the request, each with a token
-           figure attached and each marked exact or estimated. This is
-           the part that saves the most money, because it changes what
-           the caller sends next time.
-
-THREE TIERS OF CERTAINTY, NEVER MIXED
--------------------------------------
-  tokens_not_bought          EXACT. Provider-reported counts on a
-                             request that was served from store.
-                             This is the only number that goes in a
-                             savings total.
-
-  worst_case_tokens_avoided  A CEILING, not a saving. When a request
-                             is refused, max_tokens tells you the most
-                             it could have cost. Reported separately
-                             and never added to the exact figure.
-
-  findings tokens            ESTIMATED where marked. Character counts
-                             divided by four. Never enters any total.
-
-Nothing on this page is ever expressed as a percentage saved.
-
-WHAT IT DOES NOT DO
--------------------
-- It never calls a model to reach a decision. Every signal is
-  arithmetic on the request itself.
-- It only serves a stored answer for an IDENTICAL request. Matching
-  similar prompts needs an embedding, which is a model call, which
-  would defeat the entire point.
-- It does not judge whether a stored answer is still correct.
-- It does not store answers to requests that asked for varied output,
-  unless the caller overrides that deliberately.
-
-MODULE CONTRACT
----------------
-handle(method, action, data, api_key, ctx) -> (dict, status)
-PUBLIC is a set of (METHOD, action) tuples.
-ctx exposes conn, lock and seal.
+Railway variables (all optional):
+  STUDIO_DIR          where videos are kept (default: the folder DB_PATH is in)
+  STUDIO_MAX_MB       biggest upload in MB (default 20000 - about three hours of phone video)
+  STUDIO_PACKS        credit packs in pence (default 100,500)
+  STUDIO_MONTHLY_FEE  pence per video per month, from its earnings (default 50)
+  STUDIO_CARD_FEE_PCT / STUDIO_CARD_FEE_PENCE   the card fee added on top (1.5 / 20)
+Stripe uses the key server.py already has (STRIPE_SECRET). Apple Pay and
+Google Pay show on the Stripe payment page when they are switched on in the
+Stripe dashboard (Settings > Payment methods).
 """
 
+import base64
+import gzip
 import hashlib
-import inspect
+import hmac
+import importlib
 import json
 import math
-import sqlite3
+import os
+import re
+import secrets
+import shutil
+import sys
 import threading
 import time
+import urllib.parse
+from collections import defaultdict, deque
 
-VERSION = "2.2.0"
+VERSION = "4.0.5"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
 
-PUBLIC = {
-    ("GET", "spec"),
-    ("GET", "stats"),
-    ("GET", "verify"),
-}
+SITE = (os.environ.get("HOST") or "https://sebbi.pro").strip().rstrip("/")
 
-# ============================================================ layer 1
-# Hard rules. Absolute. Not weights, not tunable by score band.
 
-LOOP_WINDOW = 120          # seconds a repeat still counts as a repeat
-LOOP_HARD = 8              # identical repeats in the window = runaway
-LOOP_HARD_UNATTENDED = 4   # lower bar when no human is watching
-BURST_HARD = 120           # requests in 60s from one key = runaway
+def _int_env(name, default, lo, hi):
+    try:
+        return max(lo, min(hi, int(os.environ.get(name, default))))
+    except (TypeError, ValueError):
+        return default
 
-# ============================================================ layer 2
-# Nine signals. Base weights MUST sum to exactly 1.00.
-#
-# What this request will SPEND ......................... 0.62
-W_EXPOSURE = 0.18   # worst case spend against remaining budget
-W_SIZE = 0.14       # prompt characters
-W_ASK = 0.14        # max_tokens ceiling the caller authorised
-W_DEPTH = 0.10      # conversation turns, re-sent on every call
-W_TOOLS = 0.06      # tool definitions, re-sent on every call
-#
-# Whether that spend is WASTE .......................... 0.38
-W_LOOP = 0.16       # the same request going round again
-W_BURST = 0.09      # requests in the last 60 seconds
-W_GRIND = 0.07      # requests in the last hour
-W_NOVELTY = 0.06    # first time this shape has been seen
 
-BASE_SUM = (W_EXPOSURE + W_SIZE + W_ASK + W_DEPTH + W_TOOLS
-            + W_LOOP + W_BURST + W_GRIND + W_NOVELTY)
+MAX_BYTES = _int_env("STUDIO_MAX_MB", 20000, 20, 100000) * 1024 * 1024
+TEASER_MAX = 120 * 1024 * 1024
+POSTER_MAX = 4 * 1024 * 1024
+CHUNK_MAX = 9 * 1024 * 1024
+MONTHLY_FEE = _int_env("STUDIO_MONTHLY_FEE", 50, 0, 1000)
+FEE_PERIOD = 30 * 86400
+SHARE = 0.70
+PRICES = (10, 20, 50, 100)
+KEEP_FREE = 1024 * 1024 * 1024
 
-# Sits outside the base sum, deliberately.
-W_UNATTENDED = 0.10
 
-BAND_CHALLENGE = 0.55
-BAND_BLOCK = 0.80
+def _packs():
+    out = []
+    for p in (os.environ.get("STUDIO_PACKS") or "100,500").split(","):
+        try:
+            v = int(p.strip())
+        except ValueError:
+            continue
+        if 50 <= v <= 10000 and v not in out:
+            out.append(v)
+    return sorted(out) or [100, 500]
 
-SAT_LOOP = 5
-SAT_BURST = 20
-SAT_GRIND = 200
-SAT_SIZE = 100_000
-SAT_ASK = 8_000
-SAT_DEPTH = 40
-SAT_TOOLS = 24
 
-# A request only earns the cheap model by being genuinely small.
-# Suspicion never routes a request to a weaker model.
-CHEAP_MAX_CHARS = 4_000
-CHEAP_MAX_TURNS = 6
-CHEAP_MAX_ASK = 1_000
-CHEAP_MAX_SCORE = 0.30
+PACKS = _packs()
 
-W60 = 60
-W1H = 3600
 
-# ============================================================ layer 3
-CTX_KEEP_TURNS = 8          # turns beyond this are flagged as carried
-CTX_FLAG_TURNS = 12         # only flag once the conversation is this deep
-SYSTEM_FLAG_CHARS = 2_000
-CHARS_PER_TOKEN = 4.0       # the estimate, used only in findings
+def _fee_env(name, default):
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return float(default)
 
-DEFAULT_TTL = 30 * 24 * 3600
-MAX_STORED_BYTES = 512 * 1024
-MAX_PROMPT_CHARS = 2_000_000
 
-KEYED_FIELDS = (
-    "model", "messages", "system", "prompt", "input",
-    "temperature", "top_p", "top_k",
-    "max_tokens", "max_completion_tokens",
-    "stop", "stop_sequences",
-    "tools", "tool_choice", "response_format", "seed",
+CARD_FEE_PCT = _fee_env("STUDIO_CARD_FEE_PCT", 1.5)
+CARD_FEE_PENCE = _fee_env("STUDIO_CARD_FEE_PENCE", 20)
+
+
+def _charge(credit):
+    """What the viewer pays so that, after Stripe's card fee, the full credit is left."""
+    return int(math.ceil((credit + CARD_FEE_PENCE) / (1 - CARD_FEE_PCT / 100.0)))
+
+ID_RE = re.compile(r"^[a-z0-9]{8}$")
+VIEWER_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+OWNER_RE = re.compile(r"^owner:cr_[a-f0-9]{20}$")
+SESSION_RE = re.compile(r"^cs_[A-Za-z0-9_]{8,200}$")
+PI_RE = re.compile(r"^pi_[A-Za-z0-9_]{8,200}$")
+TITLE_CLEAN = re.compile(r"[<>\"\\\x00-\x1f]")
+ALPHA = "abcdefghijkmnpqrstuvwxyz23456789"
+
+KINDS = {"full": ("full", MAX_BYTES), "teaser": ("teaser", TEASER_MAX), "poster": ("jpg", POSTER_MAX)}
+
+_ctx = {}
+_cr = None
+_ready = False
+_patched = False
+_dir_cache = None
+_ulocks = defaultdict(threading.Lock)
+_wins = defaultdict(deque)
+_wins_lock = threading.Lock()
+
+_CREATE_GZ = (
+    "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"
+    "ArsKMKkC0wAA"
 )
 
-VOCABULARY = {
-    "SERVE": "answered from an identical earlier request; nothing was bought",
-    "ALLOW": "send it to the model as asked",
-    "DOWNGRADE": "small and simple enough for the cheap model",
-    "CHALLENGE": "hold it for a person before spending",
-    "BLOCK": "refused; it never reaches the model, so no completion is paid for",
-}
 
-LIMITS = [
-    "Matching is exact. A reworded prompt is a different request and goes "
-    "to the model.",
-    "Savings totals use only token counts the provider itself reported. "
-    "Nothing in a total is estimated.",
-    "A refused request has a worst case cost, not a known cost. It is "
-    "reported separately and never added to the savings total.",
-    "Token figures inside findings are estimated from character counts and "
-    "are marked as estimates. They never enter a total.",
-    "A stored answer is returned unchanged. This module does not judge "
-    "whether it is still correct.",
-    "No model is called to reach any decision here.",
-]
+def _page(b):
+    return gzip.decompress(base64.b64decode("".join(b.split())))
 
 
-# --------------------------------------------------------------- helpers
-
-def _canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True).encode("utf-8")
+CREATE_HTML = _page(_CREATE_GZ)
 
 
-def _sha(data):
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
+# ------------------------------------------------------------------ plumbing
+
+def _credits():
+    """The credits module holds balances, creator accounts and Stripe."""
+    global _cr
+    if _cr is not None:
+        return _cr
+    m = sys.modules.get("modules.credits") or importlib.import_module("modules.credits")
+    if "conn" in _ctx:
+        m._ctx.update(_ctx)
+        m._setup()
+    _cr = m
+    return m
 
 
-def _fingerprint(req):
-    keyed = {k: req[k] for k in KEYED_FIELDS if k in req}
-    return _sha(b"SEBBI-TOKENSAVER-v2\n" + _canonical(keyed))
-
-
-def _content_chars(v):
-    if v is None:
-        return 0
-    if isinstance(v, str):
-        return len(v)
-    return len(_canonical(v))
-
-
-def _prompt_chars(req):
-    total = 0
-    for key in ("prompt", "input", "system"):
-        total += _content_chars(req.get(key))
-    msgs = req.get("messages")
-    if isinstance(msgs, list):
-        for m in msgs:
-            total += _content_chars(m.get("content") if isinstance(m, dict) else m)
-    tools = req.get("tools")
-    if tools is not None:
-        total += _content_chars(tools)
-    return total
-
-
-def _est_tokens(chars):
-    """Estimate only. Marked as such everywhere it appears."""
-    return int(chars / CHARS_PER_TOKEN)
-
-
-def _ask_ceiling(req):
-    """The caller's own authorised output ceiling. Exact, not estimated."""
-    v = req.get("max_tokens")
-    if v is None:
-        v = req.get("max_completion_tokens")
-    try:
-        return int(v) if v is not None else 0
-    except (TypeError, ValueError):
-        return 0
-
-
-def _shape(req):
-    n = len(req.get("messages") or [])
-    t = len(req.get("tools") or [])
-    band = int(math.log10(max(_prompt_chars(req), 1)) * 2)
-    return _sha("%s|%d|%d|%d" % (req.get("model") or "", n, t, band))
-
-
-def _measure(req):
-    """Everything the decision needs, taken from a full request."""
-    return {
-        "fp": _fingerprint(req),
-        "shape": _shape(req),
-        "chars": _prompt_chars(req),
-        "ask": _ask_ceiling(req),
-        "depth": len(req.get("messages") or []),
-        "tools": len(req.get("tools") or []),
-        "deterministic": _deterministic(req),
-        "from_digest": False,
-    }
-
-
-def _measure_from_digest(d):
-    """
-    The same measurements, supplied by a client that kept its content at
-    home. The client is measuring its own spend against its own budget,
-    so there is nothing to gain by misreporting.
-    """
-    if not isinstance(d, dict):
-        return None, "digest must be an object"
-    fp = d.get("fingerprint")
-    if not isinstance(fp, str) or len(fp) != 64:
-        return None, "digest needs a 64 character fingerprint"
-    try:
-        int(fp, 16)
-    except ValueError:
-        return None, "fingerprint must be hexadecimal"
-
-    def _n(key, cap):
-        v = d.get(key, 0)
+def _storage():
+    """(folder, survives_redeploys)"""
+    global _dir_cache
+    if _dir_cache:
+        return _dir_cache
+    cands = []
+    if os.environ.get("STUDIO_DIR", "").strip():
+        cands.append((os.environ["STUDIO_DIR"].strip(), True))
+    db = os.environ.get("DB_PATH", "").strip()
+    if db and os.path.dirname(db):
+        cands.append((os.path.join(os.path.dirname(db), "studio"), True))
+    if os.path.isdir("/data"):
+        cands.append(("/data/studio", True))
+    cands.append((os.path.abspath("studio_media"), False))
+    for d, persistent in cands:
         try:
-            v = int(v)
-        except (TypeError, ValueError):
-            return 0
-        return max(0, min(v, cap))
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                _dir_cache = (d, persistent)
+                return _dir_cache
+        except Exception:
+            continue
+    _dir_cache = (os.path.abspath("."), False)
+    return _dir_cache
 
-    m = {
-        "fp": fp,
-        "chars": _n("prompt_characters", MAX_PROMPT_CHARS),
-        "ask": _n("max_tokens", 10_000_000),
-        "depth": _n("conversation_turns", 100_000),
-        "tools": _n("tool_definitions", 100_000),
-        "deterministic": bool(d.get("deterministic", True)),
-        "from_digest": True,
+
+def _path(vid, kind, part=False):
+    return os.path.join(_storage()[0], "%s.%s%s" % (vid, KINDS[kind][0], ".part" if part else ""))
+
+
+def _setup():
+    global _ready
+    if _ready or "conn" not in _ctx:
+        return
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS studio_video(id TEXT PRIMARY KEY,account TEXT,creator TEXT,"
+                  "title TEXT,price INTEGER,free_seconds INTEGER,created REAL,status TEXT,"
+                  "full_size INTEGER,full_mime TEXT,teaser_size INTEGER,teaser_mime TEXT,"
+                  "plays INTEGER DEFAULT 0,unlocks INTEGER DEFAULT 0,earned INTEGER DEFAULT 0,"
+                  "fees INTEGER DEFAULT 0,fee_period INTEGER DEFAULT -1,fee_taken INTEGER DEFAULT 0,"
+                  "likes INTEGER DEFAULT 0,comments INTEGER DEFAULT 0,sha256 TEXT,"
+                  "audit_hash TEXT,block_index INTEGER,live_at REAL)")
+        try:
+            c.execute("ALTER TABLE studio_video ADD COLUMN tags TEXT DEFAULT ''")
+        except Exception:
+            pass
+        c.execute("CREATE INDEX IF NOT EXISTS studio_video_account ON studio_video(account)")
+        c.execute("CREATE INDEX IF NOT EXISTS studio_video_status ON studio_video(status)")
+        c.execute("CREATE TABLE IF NOT EXISTS studio_meta(k TEXT PRIMARY KEY,v TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS studio_report(id INTEGER PRIMARY KEY AUTOINCREMENT,video TEXT,"
+                  "reason TEXT,at REAL,who TEXT)")
+        row = c.execute("SELECT v FROM studio_meta WHERE k='secret'").fetchone()
+        if not row:
+            c.execute("INSERT INTO studio_meta(k,v) VALUES('secret',?)", (secrets.token_hex(32),))
+        c.commit()
+    _credits()
+    _ready = True
+
+
+def _secret():
+    with _ctx["lock"]:
+        return _ctx["conn"].execute("SELECT v FROM studio_meta WHERE k='secret'").fetchone()[0]
+
+
+def _token(vid, viewer):
+    return hmac.new(_secret().encode(), ("%s|%s" % (vid, viewer)).encode(), hashlib.sha256).hexdigest()[:40]
+
+
+def _seal(kind, detail, extra):
+    ex = {"studio_version": VERSION}
+    ex.update(extra or {})
+    try:
+        return _credits()._seal(kind, detail, ex)
+    except Exception:
+        return None, None
+
+
+def _limit(who, group, per_min, per_hour):
+    t = time.time()
+    k = group + "|" + who
+    with _wins_lock:
+        w = _wins[k]
+        while w and w[0] < t - 3600:
+            w.popleft()
+        if len(w) >= per_hour or sum(1 for x in w if x > t - 60) >= per_min:
+            return False
+        w.append(t)
+        if len(_wins) > 20000:
+            for key in [x for x, v in _wins.items() if not v or v[-1] < t - 3600][:5000]:
+                del _wins[key]
+    return True
+
+
+def _ip(h):
+    try:
+        xff = h.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()[:64]
+        return str(h.client_address[0])[:64]
+    except Exception:
+        return "unknown"
+
+
+def _slug(name):
+    return urllib.parse.quote(str(name or "").replace(" ", "_"))
+
+
+def _size(n):
+    return "%.1f GB" % (n / 1073741824.0) if n >= 1073741824 else "%d MB" % max(1, n // 1048576)
+
+
+def _gbp(p):
+    return "£%d.%02d" % (p // 100, p % 100) if p >= 100 else "%dp" % p
+
+
+COLS = ("id,account,creator,title,price,free_seconds,created,status,full_size,full_mime,teaser_size,"
+        "teaser_mime,plays,unlocks,earned,fees,fee_period,fee_taken,likes,comments,sha256,audit_hash,"
+        "block_index,live_at,tags")
+
+
+def _video(vid):
+    if not ID_RE.match(vid or ""):
+        return None
+    with _ctx["lock"]:
+        r = _ctx["conn"].execute("SELECT " + COLS + " FROM studio_video WHERE id=?", (vid,)).fetchone()
+    return dict(zip(COLS.split(","), r)) if r else None
+
+
+def _public(v):
+    return {"id": v["id"], "title": v["title"], "creator": v["creator"], "price": v["price"],
+            "price_label": _gbp(v["price"]), "free_seconds": v["free_seconds"],
+            "plays": v["plays"], "paid_views": v["unlocks"], "likes": v["likes"],
+            "comments": v["comments"], "link": SITE + "/v/" + v["id"],
+            "teaser": "/v/%s/teaser" % v["id"], "poster": "/v/%s/poster.jpg" % v["id"],
+            "channel": SITE + "/cinema/@" + _slug(v["creator"]),
+            "live_at": v["live_at"], "block_index": v["block_index"],
+            "tags": [t for t in (v.get("tags") or "").split(" ") if t]}
+
+
+def _acct(q, b):
+    key = str(b.get("key") or q.get("key") or "").strip()
+    return _credits()._account(key)
+
+
+def _ensure_viewer(viewer):
+    with _ctx["lock"]:
+        _ctx["conn"].execute("INSERT OR IGNORE INTO credit_viewer(id,balance,spent,created) VALUES(?,0,0,?)",
+                             (viewer, time.time()))
+        _ctx["conn"].commit()
+        r = _ctx["conn"].execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()
+    return r[0] if r else 0
+
+
+def _unlocked(vid, viewer):
+    with _ctx["lock"]:
+        r = _ctx["conn"].execute("SELECT block_index FROM credit_unlock WHERE viewer=? AND video=?",
+                                 (viewer, "st:" + vid)).fetchone()
+    return (True, r[0]) if r else (False, None)
+
+
+# ------------------------------------------------------------------ creators
+
+def a_join(q, b, h):
+    if not _limit(_ip(h), "join", 3, 10):
+        return {"error": "slow_down", "message": "Too many tries. Wait a minute."}, 429
+    return _credits().c_creator_join(q, b)
+
+
+def a_signin(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key", "message": "That key wasn't recognised."}, 403
+    return {"name": acct["name"], "creator_id": acct["id"],
+            "channel": SITE + "/cinema/@" + _slug(acct["name"])}, 200
+
+
+def a_new(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key", "message": "Sign in again, your key wasn't recognised."}, 403
+    if not _limit(acct["id"], "new", 6, 40):
+        return {"error": "slow_down", "message": "That's a lot of uploads. Try again in a few minutes."}, 429
+    title = TITLE_CLEAN.sub("", str(b.get("title") or "")).strip()[:80]
+    if len(title) < 2:
+        return {"error": "title", "message": "Give your video a name so people can find it."}, 400
+    if not b.get("rights"):
+        return {"error": "rights", "message": "Tick the box to confirm the video is yours to sell."}, 400
+    try:
+        price = int(b.get("price") or 10)
+    except (TypeError, ValueError):
+        price = 10
+    if price not in PRICES:
+        price = 10
+    tags = []
+    for t in re.split(r"[\s,]+", str(b.get("tags") or "")):
+        t = re.sub(r"[^A-Za-z0-9_]", "", t.lstrip("#"))[:24].lower()
+        if t and "#" + t not in tags:
+            tags.append("#" + t)
+    tags = " ".join(tags[:8])
+    try:
+        free = max(3, min(30, int(b.get("free_seconds") or 8)))
+    except (TypeError, ValueError):
+        free = 8
+    try:
+        size = int(b.get("full_size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        return {"error": "no_video", "message": "Pick a video first."}, 400
+    if size > MAX_BYTES:
+        return {"error": "too_big", "message": "That video is %d MB. The limit is %d MB - trim it and try again."
+                % (size // 1048576, MAX_BYTES // 1048576)}, 413
+    mime = str(b.get("full_mime") or "video/mp4")[:60]
+    if not mime.startswith("video/"):
+        mime = "video/mp4"
+    try:
+        free_disk = shutil.disk_usage(_storage()[0]).free
+    except Exception:
+        free_disk = 0
+    if free_disk < size + TEASER_MAX + KEEP_FREE:
+        print("STUDIO: upload of %d MB refused, %d MB free on the video volume" % (size // 1048576, free_disk // 1048576), flush=True)
+        return {"error": "full", "message": "That video is %s. There isn't room for it right now - try a shorter clip, "
+                "or try again later." % _size(size)}, 507
+    _sweep()
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        for _ in range(20):
+            vid = "".join(secrets.choice(ALPHA) for _ in range(8))
+            if not c.execute("SELECT 1 FROM studio_video WHERE id=?", (vid,)).fetchone():
+                break
+        c.execute("INSERT INTO studio_video(id,account,creator,title,price,free_seconds,created,status,"
+                  "full_size,full_mime,tags) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (vid, acct["id"], acct["name"], title, price, free, time.time(), "uploading", size, mime, tags))
+        c.commit()
+    return {"id": vid, "link": SITE + "/v/" + vid, "short": SITE.split("//")[-1] + "/v/" + vid,
+            "title": title, "price": price, "free_seconds": free, "creator": acct["name"],
+            "channel": SITE + "/cinema/@" + _slug(acct["name"]), "chunk": 4 * 1024 * 1024}, 200
+
+
+def _sweep():
+    """Clear uploads that were started and never finished (older than a day)."""
+    cutoff = time.time() - 86400
+    with _ctx["lock"]:
+        old = [r[0] for r in _ctx["conn"].execute(
+            "SELECT id FROM studio_video WHERE status='uploading' AND created<? LIMIT 50", (cutoff,)).fetchall()]
+    for vid in old:
+        for kind in KINDS:
+            try:
+                os.remove(_path(vid, kind, True))
+            except OSError:
+                pass
+        with _ctx["lock"]:
+            _ctx["conn"].execute("UPDATE studio_video SET status='abandoned' WHERE id=?", (vid,))
+            _ctx["conn"].commit()
+
+
+def _magic_ok(kind, head):
+    if kind == "poster":
+        return head[:3] == b"\xff\xd8\xff"
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return True
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return True
+    return False
+
+
+def chunk(h, q):
+    """Raw bytes, appended at an offset. Retries and resumes are safe."""
+    vid = str(q.get("id") or "")
+    kind = str(q.get("kind") or "")
+    try:
+        offset = int(q.get("offset") or 0)
+        n = int(h.headers.get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        return {"error": "bad_request"}, 400
+    if kind not in KINDS or n < 0 or n > CHUNK_MAX:
+        return {"error": "bad_request", "message": "Bad upload piece."}, 400
+    data = _read(h, n)
+    if data is None:
+        return {"error": "cut_off", "message": "Connection dropped. Retrying."}, 400
+    acct = _credits()._account(h.headers.get("X-Creator-Key", ""))
+    if not acct:
+        return {"error": "bad_key", "message": "Sign in again."}, 403
+    v = _video(vid)
+    if not v or v["account"] != acct["id"]:
+        return {"error": "not_found"}, 404
+    if v["status"] != "uploading":
+        return {"error": "finished", "message": "That video is already live."}, 409
+    cap = KINDS[kind][1] if kind != "full" else v["full_size"]
+    p = _path(vid, kind, True)
+    with _ulocks[vid + kind]:
+        got = os.path.getsize(p) if os.path.exists(p) else 0
+        if offset > got:
+            return {"error": "gap", "got": got}, 409
+        if offset + len(data) > cap:
+            return {"error": "too_big", "message": "That file is bigger than it said it was."}, 413
+        if offset == 0 and not _magic_ok(kind, data[:16]):
+            return {"error": "not_video", "message": "That doesn't look like a video file we can play."}, 415
+        if offset + len(data) <= got and offset < got:
+            return {"got": got}, 200
+        with open(p, "r+b" if os.path.exists(p) else "wb") as f:
+            f.seek(offset)
+            f.write(data)
+            f.truncate(offset + len(data))
+        got = offset + len(data)
+    return {"got": got}, 200
+
+
+def _read(h, n):
+    out = bytearray()
+    while len(out) < n:
+        try:
+            part = h.rfile.read(min(65536, n - len(out)))
+        except Exception:
+            return None
+        if not part:
+            return None
+        out += part
+    return bytes(out)
+
+
+def _sha_file(p):
+    s = hashlib.sha256()
+    with open(p, "rb") as f:
+        for blk in iter(lambda: f.read(1048576), b""):
+            s.update(blk)
+    return s.hexdigest()
+
+
+def a_finish(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key", "message": "Sign in again."}, 403
+    v = _video(str(b.get("id") or ""))
+    if not v or v["account"] != acct["id"]:
+        return {"error": "not_found"}, 404
+    if v["status"] == "live":
+        return {"live": True, "video": _public(v)}, 200
+    if v["status"] != "uploading":
+        return {"error": "gone"}, 410
+    fp, tp, pp = _path(v["id"], "full", True), _path(v["id"], "teaser", True), _path(v["id"], "poster", True)
+    fs = os.path.getsize(fp) if os.path.exists(fp) else 0
+    ts = os.path.getsize(tp) if os.path.exists(tp) else 0
+    if fs != v["full_size"]:
+        return {"error": "incomplete", "message": "The video didn't finish uploading.", "got": fs}, 409
+    if ts <= 0:
+        return {"error": "incomplete", "message": "The teaser didn't finish uploading."}, 409
+    tmime = str(b.get("teaser_mime") or "video/mp4")
+    tmime = "video/webm" if "webm" in tmime else "video/mp4"
+    os.replace(fp, _path(v["id"], "full"))
+    os.replace(tp, _path(v["id"], "teaser"))
+    if os.path.exists(pp):
+        os.replace(pp, _path(v["id"], "poster"))
+    with _ctx["lock"]:
+        _ctx["conn"].execute("UPDATE studio_video SET status='live',teaser_size=?,teaser_mime=?,live_at=? WHERE id=?",
+                             (ts, tmime, time.time(), v["id"]))
+        _ctx["conn"].commit()
+    threading.Thread(target=_fingerprint, args=(v["id"], v["creator"], v["price"], fs), daemon=True).start()
+    return {"live": True, "video": _public(_video(v["id"]))}, 200
+
+
+def _fingerprint(vid, creator, price, size):
+    """Hash the full video and seal it. Runs after the video is live, so a long video never holds the upload up."""
+    try:
+        digest = _sha_file(_path(vid, "full"))
+        ah, blk = _seal("studio_video_live", "video=%s;creator=%s;price=%d;sha256=%s" % (vid, creator, price, digest),
+                        {"video": vid, "creator": creator, "price_pence": price, "video_sha256": digest, "bytes": size})
+        with _ctx["lock"]:
+            _ctx["conn"].execute("UPDATE studio_video SET sha256=?,audit_hash=?,block_index=? WHERE id=?",
+                                 (digest, ah, blk, vid))
+            _ctx["conn"].commit()
+    except Exception as e:
+        print("STUDIO: fingerprint of %s failed: %s" % (vid, e), flush=True)
+
+
+def a_mine(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key", "message": "Sign in again, your key wasn't recognised."}, 403
+    with _ctx["lock"]:
+        rows = _ctx["conn"].execute("SELECT " + COLS + " FROM studio_video WHERE account=? AND status='live' "
+                                    "ORDER BY created DESC LIMIT 200", (acct["id"],)).fetchall()
+    vids = []
+    owner = "owner:" + acct["id"]
+    for r in rows:
+        v = dict(zip(COLS.split(","), r))
+        p = _public(v)
+        p.update({"earned": v["earned"], "fees": v["fees"],
+                  "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], owner, _token(v["id"], owner))})
+        vids.append(p)
+    balance, views = _credits()._creator_totals(acct["name"])
+    return {"name": acct["name"], "balance_pence": balance, "balance_label": _gbp(balance) if balance else "0p",
+            "paid_views": views, "videos": vids, "earn": SITE + "/earn",
+            "channel": SITE + "/cinema/@" + _slug(acct["name"])}, 200
+
+
+def a_delete(q, b, h):
+    acct = _acct(q, b)
+    if not acct:
+        return {"error": "bad_key"}, 403
+    v = _video(str(b.get("id") or ""))
+    if not v or v["account"] != acct["id"]:
+        return {"error": "not_found"}, 404
+    _remove(v, "creator")
+    return {"removed": True}, 200
+
+
+def _remove(v, by):
+    for kind in KINDS:
+        for part in (False, True):
+            try:
+                os.remove(_path(v["id"], kind, part))
+            except OSError:
+                pass
+    with _ctx["lock"]:
+        _ctx["conn"].execute("UPDATE studio_video SET status='removed' WHERE id=?", (v["id"],))
+        _ctx["conn"].commit()
+    _seal("studio_video_removed", "video=%s;by=%s" % (v["id"], by), {"video": v["id"], "by": by})
+
+
+# ------------------------------------------------------------------ viewers
+
+def _viewer_from(q, b):
+    viewer = str(b.get("viewer") or q.get("viewer") or "").strip()
+    return viewer if VIEWER_RE.match(viewer) else None
+
+
+def a_state(q, b, h):
+    v = _video(str(q.get("id") or b.get("id") or ""))
+    if not v or v["status"] != "live":
+        return {"error": "not_found", "message": "That video isn't here any more."}, 404
+    viewer = _viewer_from(q, b)
+    packs = [p for p in PACKS if p >= v["price"]] or [v["price"]]
+    out = {"video": _public(v),
+           "packs": [{"pence": p, "label": _gbp(p), "views": p // max(1, v["price"]),
+                      "charge": _charge(p), "charge_label": _gbp(_charge(p)),
+                      "fee": _charge(p) - p, "fee_label": _gbp(_charge(p) - p)} for p in packs],
+           "pay_ready": bool(_credits()._stripe_key()),
+           "wallet_publishable": _pub_key()}
+    if viewer:
+        out["balance_pence"] = _ensure_viewer(viewer)
+        done, blk = _unlocked(v["id"], viewer)
+        out["unlocked"] = done
+        if done:
+            out["block_index"] = blk
+            out["full"] = "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer))
+    return out, 200
+
+
+def _period_fee(v, share, now):
+    period = int((now - (v["live_at"] or v["created"])) // FEE_PERIOD)
+    taken = v["fee_taken"] if v["fee_period"] == period else 0
+    fee = min(share, max(0, MONTHLY_FEE - taken))
+    return period, taken + fee, fee
+
+
+def _unlock(v, viewer):
+    """Spend the viewer's credit on one video. Returns (payload, code)."""
+    done, blk = _unlocked(v["id"], viewer)
+    if done:
+        return {"unlocked": True, "already": True, "block_index": blk,
+                "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer)),
+                "balance_pence": _ensure_viewer(viewer)}, 200
+    _ensure_viewer(viewer)
+    price = v["price"]
+    now = time.time()
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        cur = c.execute("UPDATE credit_viewer SET balance=balance-?,spent=spent+? WHERE id=? AND balance>=?",
+                        (price, price, viewer, price))
+        if cur.rowcount != 1:
+            bal = c.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()[0]
+            c.commit()
+            return {"unlocked": False, "reason": "not_enough_credit", "price_pence": price,
+                    "balance_pence": bal}, 402
+        ins = c.execute("INSERT OR IGNORE INTO credit_unlock(viewer,video,creator,price,at) VALUES(?,?,?,?,?)",
+                        (viewer, "st:" + v["id"], v["creator"], price, now))
+        if ins.rowcount != 1:
+            c.execute("UPDATE credit_viewer SET balance=balance+?,spent=spent-? WHERE id=?", (price, price, viewer))
+            c.commit()
+            return _unlock(v, viewer)
+        fresh = dict(zip(COLS.split(","), c.execute("SELECT " + COLS + " FROM studio_video WHERE id=?",
+                                                     (v["id"],)).fetchone()))
+        share = int(round(price * SHARE))
+        period, taken, fee = _period_fee(fresh, share, now)
+        net = share - fee
+        c.execute("INSERT OR IGNORE INTO credit_creator(name,balance,views) VALUES(?,0,0)", (v["creator"],))
+        c.execute("UPDATE credit_creator SET balance=balance+?,views=views+1 WHERE name=?", (net, v["creator"]))
+        c.execute("UPDATE studio_video SET unlocks=unlocks+1,earned=earned+?,fees=fees+?,fee_period=?,fee_taken=? "
+                  "WHERE id=?", (share, fee, period, taken, v["id"]))
+        bal = c.execute("SELECT balance FROM credit_viewer WHERE id=?", (viewer,)).fetchone()[0]
+        c.commit()
+    ah, blk = _seal("paid_view", "video=st:%s;creator=%s;price=%d;creator_share=%d;monthly_fee=%d"
+                    % (v["id"], v["creator"], price, net, fee),
+                    {"video": "st:" + v["id"], "creator": v["creator"], "price_pence": price,
+                     "creator_share_pence": share, "monthly_fee_pence": fee, "creator_pence": net,
+                     "platform_pence": price - net})
+    with _ctx["lock"]:
+        _ctx["conn"].execute("UPDATE credit_unlock SET audit_hash=?,block_index=? WHERE viewer=? AND video=?",
+                             (ah, blk, viewer, "st:" + v["id"]))
+        _ctx["conn"].commit()
+    return {"unlocked": True, "price_pence": price, "creator_pence": net, "balance_pence": bal,
+            "sealed_in_chain": ah, "block_index": blk,
+            "verify": SITE + "/x/walk/block?index=%s" % blk,
+            "full": "/v/%s/full?viewer=%s&t=%s" % (v["id"], viewer, _token(v["id"], viewer))}, 200
+
+
+def a_unlock(q, b, h):
+    v = _video(str(b.get("id") or ""))
+    viewer = _viewer_from(q, b)
+    if not v or v["status"] != "live" or not viewer:
+        return {"error": "not_found"}, 404
+    if not _limit(viewer, "unlock", 20, 300):
+        return {"error": "slow_down", "message": "Slow down a moment."}, 429
+    return _unlock(v, viewer)
+
+
+def _pub_key():
+    return (os.environ.get("STRIPE_PUBLISHABLE_KEY", "").strip()
+            or os.environ.get("STRIPE_PUBLISHABLE", "").strip())
+
+
+def a_intent(q, b, h):
+    """Create a PaymentIntent so the wallet (Apple/Google Pay) can be tapped
+    on this page, with no redirect and no email box. Card still works too."""
+    v = _video(str(b.get("id") or ""))
+    viewer = _viewer_from(q, b)
+    if not v or v["status"] != "live" or not viewer:
+        return {"error": "not_found"}, 404
+    if not _limit(_ip(h), "pay", 6, 40):
+        return {"error": "slow_down", "message": "Wait a moment and tap again."}, 429
+    cr = _credits()
+    if not cr._stripe_key():
+        return {"error": "pay_off", "message": "Payments are being switched on. Try again shortly."}, 503
+    try:
+        pence = int(b.get("pence") or PACKS[0])
+    except (TypeError, ValueError):
+        pence = PACKS[0]
+    if pence not in PACKS:
+        pence = PACKS[0]
+    pence = max(pence, v["price"])
+    charge = _charge(pence)
+    _ensure_viewer(viewer)
+    params = {
+        "amount": str(charge),
+        "currency": "gbp",
+        "payment_method_types[0]": "card",
+        "description": "10p Wing credit (sebbi.pro)",
+        "metadata[studio_video]": v["id"],
+        "metadata[viewer]": viewer,
+        "metadata[credit_pence]": str(pence),
     }
-    band = int(math.log10(max(m["chars"], 1)) * 2)
-    m["shape"] = _sha("%s|%d|%d|%d" % (d.get("model") or "", m["depth"],
-                                       m["tools"], band))
-    return m, None
+    data, err = cr._stripe("POST", "payment_intents", params,
+                           idem="pi-%s-%s-%d-%d" % (v["id"], viewer, charge, int(time.time() // 30)))
+    if err or not data or not data.get("client_secret"):
+        return {"error": "stripe", "message": "Couldn't start the payment: %s" % (err or "no intent")}, 502
+    return {"client_secret": data["client_secret"], "pi": data.get("id"),
+            "pence": pence, "charge": charge, "charge_label": _gbp(charge),
+            "publishable": _pub_key(), "currency": "gbp"}, 200
 
 
-def _log_scale(value, saturation):
-    if value <= 0:
-        return 0.0
-    if value >= saturation:
-        return 1.0
-    return math.log1p(value) / math.log1p(saturation)
+def a_intent_done(q, b, h):
+    """Confirm a wallet/card PaymentIntent succeeded, then credit and unlock."""
+    v = _video(str(b.get("id") or ""))
+    viewer = _viewer_from(q, b)
+    pi = str(b.get("payment_intent") or "").strip()
+    if not v or not viewer or not PI_RE.match(pi):
+        return {"error": "bad_request"}, 400
+    cr = _credits()
+    d, err = cr._stripe("GET", "payment_intents/" + pi)
+    if err or not d:
+        return {"error": "stripe", "message": "Couldn't confirm the payment yet. Tap unlock again in a moment."}, 502
+    if d.get("status") != "succeeded":
+        return {"error": "not_paid", "message": "The payment hasn't gone through."}, 402
+    meta = d.get("metadata") or {}
+    if str(meta.get("viewer") or "") != viewer:
+        return {"error": "other_phone", "message": "That payment was made on another phone."}, 403
+    try:
+        paid = int(d.get("amount_received") or d.get("amount") or 0)
+        pence = int(meta.get("credit_pence") or 0)
+    except (TypeError, ValueError):
+        paid, pence = 0, 0
+    if pence <= 0 or paid < pence or str(d.get("currency") or "gbp").lower() != "gbp":
+        return {"error": "bad_amount"}, 400
+    credit = cr._credit_payment(pi, viewer, pence, "studio_wallet")
+    out, code = _unlock(v, viewer) if v["status"] == "live" else ({"unlocked": False}, 404)
+    out["payment"] = {"credit_pence": pence, "paid_pence": paid, "duplicate": credit.get("duplicate", False)}
+    return out, code
 
 
-def _linear(value, saturation):
-    if value <= 0:
-        return 0.0
-    return min(1.0, float(value) / float(saturation))
+def a_pay(q, b, h):
+    v = _video(str(b.get("id") or ""))
+    viewer = _viewer_from(q, b)
+    if not v or v["status"] != "live" or not viewer:
+        return {"error": "not_found"}, 404
+    if not _limit(_ip(h), "pay", 6, 40):
+        return {"error": "slow_down", "message": "Wait a moment and tap again."}, 429
+    cr = _credits()
+    if not cr._stripe_key():
+        return {"error": "pay_off", "message": "Payments are being switched on. Try again shortly."}, 503
+    try:
+        pence = int(b.get("pence") or PACKS[0])
+    except (TypeError, ValueError):
+        pence = PACKS[0]
+    if pence not in PACKS:
+        pence = PACKS[0]
+    pence = max(pence, v["price"])
+    charge = _charge(pence)
+    _ensure_viewer(viewer)
+    back = SITE + "/cinema/v/" + v["id"]
+    params = {
+        "mode": "payment",
+        "submit_type": "pay",
+        "success_url": back + "?paid={CHECKOUT_SESSION_ID}",
+        "cancel_url": back,
+        "line_items[0][quantity]": "1",
+        "line_items[0][price_data][currency]": "gbp",
+        "line_items[0][price_data][unit_amount]": str(charge),
+        "line_items[0][price_data][product_data][name]": "10p Wing credit %s + %s card fee" % (_gbp(pence), _gbp(charge - pence)),
+        "line_items[0][price_data][product_data][description]":
+            "%s credit unlocks \"%s\" now, the rest stays on this phone. The %s card fee is Stripe's charge "
+            "for taking the payment." % (_gbp(pence), v["title"][:50], _gbp(charge - pence)),
+        "metadata[studio_video]": v["id"],
+        "metadata[viewer]": viewer,
+        "metadata[credit_pence]": str(pence),
+        "payment_intent_data[description]": "10p Wing credit (sebbi.pro)",
+        "payment_intent_data[metadata][studio_video]": v["id"],
+    }
+    data, err = cr._stripe("POST", "checkout/sessions", params,
+                           idem="st-%s-%s-%d-%d" % (v["id"], viewer, charge, int(time.time() // 30)))
+    if err or not data or not data.get("url"):
+        return {"error": "stripe", "message": "Couldn't open the payment page: %s" % (err or "no link")}, 502
+    return {"checkout": data["url"], "pence": pence, "charge": charge}, 200
 
 
-def _deterministic(req):
-    t = req.get("temperature")
-    if t is None:
+def a_paid(q, b, h):
+    v = _video(str(b.get("id") or ""))
+    viewer = _viewer_from(q, b)
+    session = str(b.get("session") or "").strip()
+    if not v or not viewer or not SESSION_RE.match(session):
+        return {"error": "bad_request"}, 400
+    cr = _credits()
+    s, err = cr._stripe("GET", "checkout/sessions/" + session)
+    if err or not s:
+        return {"error": "stripe", "message": "Couldn't confirm the payment yet. Tap unlock again in a moment."}, 502
+    if s.get("payment_status") != "paid":
+        return {"error": "not_paid", "message": "The payment hasn't gone through."}, 402
+    meta = s.get("metadata") or {}
+    if str(meta.get("viewer") or s.get("client_reference_id") or "") != viewer:
+        return {"error": "other_phone", "message": "That payment was made on another phone."}, 403
+    try:
+        paid = int(s.get("amount_total") or 0)
+        pence = int(meta.get("credit_pence") or paid)
+    except (TypeError, ValueError):
+        paid, pence = 0, 0
+    if pence <= 0 or paid < pence or str(s.get("currency") or "gbp").lower() != "gbp":
+        return {"error": "bad_amount"}, 400
+    credit = cr._credit_payment(session, viewer, pence, "studio")
+    out, code = _unlock(v, viewer) if v["status"] == "live" else ({"unlocked": False}, 404)
+    out["payment"] = {"credit_pence": pence, "paid_pence": paid, "duplicate": credit.get("duplicate", False)}
+    return out, code
+
+
+def a_report(q, b, h):
+    v = _video(str(b.get("id") or ""))
+    if not v:
+        return {"error": "not_found"}, 404
+    if not _limit(_ip(h), "report", 3, 20):
+        return {"received": True}, 200
+    reason = TITLE_CLEAN.sub("", str(b.get("reason") or ""))[:300]
+    who = hashlib.sha256(_ip(h).encode()).hexdigest()[:16]
+    with _ctx["lock"]:
+        _ctx["conn"].execute("INSERT INTO studio_report(video,reason,at,who) VALUES(?,?,?,?)",
+                             (v["id"], reason, time.time(), who))
+        _ctx["conn"].commit()
+    _seal("studio_report", "video=%s" % v["id"], {"video": v["id"]})
+    return {"received": True, "message": "Thanks. It will be looked at."}, 200
+
+
+def a_admin(q, b, h):
+    key = os.environ.get("CREDITS_ADMIN_KEY", "").strip()
+    given = str(q.get("key") or b.get("key") or "")
+    if not key or not hmac.compare_digest(key, given):
+        return {"error": "not_allowed"}, 403
+    do = str(q.get("do") or b.get("do") or "list")
+    if do == "remove":
+        v = _video(str(q.get("id") or b.get("id") or ""))
+        if not v:
+            return {"error": "not_found"}, 404
+        _remove(v, "admin")
+        return {"removed": v["id"]}, 200
+    with _ctx["lock"]:
+        c = _ctx["conn"]
+        reps = c.execute("SELECT video,reason,at FROM studio_report ORDER BY id DESC LIMIT 100").fetchall()
+        vids = c.execute("SELECT id,creator,title,status,unlocks,earned,created FROM studio_video "
+                         "ORDER BY created DESC LIMIT 100").fetchall()
+    return {"reports": [{"video": r[0], "link": SITE + "/v/" + r[0], "reason": r[1],
+                         "at": time.strftime("%Y-%m-%d %H:%M", time.gmtime(r[2]))} for r in reps],
+            "videos": [{"id": r[0], "creator": r[1], "title": r[2], "status": r[3], "paid_views": r[4],
+                        "earned": r[5], "link": SITE + "/v/" + r[0],
+                        "remove": SITE + "/v/api/admin?key=KEY&do=remove&id=" + r[0]} for r in vids]}, 200
+
+
+API = {"join": a_join, "signin": a_signin, "new": a_new, "finish": a_finish, "mine": a_mine,
+       "delete": a_delete, "state": a_state, "unlock": a_unlock, "pay": a_pay, "paid": a_paid,
+       "intent": a_intent, "intent_done": a_intent_done,
+       "report": a_report, "admin": a_admin}
+
+
+# ------------------------------------------------------------------ transport
+
+def _send(h, obj, code=200):
+    body = json.dumps(obj).encode("utf-8")
+    h.send_response(code)
+    h.send_header("Content-Type", "application/json; charset=utf-8")
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", "no-store")
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def _send_bytes(h, body, ctype, code=200, cache="no-cache", extra=None):
+    h.send_response(code)
+    h.send_header("Content-Type", ctype)
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Cache-Control", cache)
+    for k, val in (extra or {}).items():
+        h.send_header(k, val)
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def _send_file(h, path, ctype, cache="public, max-age=86400"):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        _send(h, {"error": "not_found"}, 404)
+        return
+    start, end, code = 0, size - 1, 200
+    m = re.match(r"^bytes=(\d*)-(\d*)$", (h.headers.get("Range") or "").strip())
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+        else:
+            start = max(0, size - int(m.group(2)))
+        if start > end or start >= size:
+            h.send_response(416)
+            h.send_header("Content-Range", "bytes */%d" % size)
+            h.send_header("Content-Length", "0")
+            h.end_headers()
+            return
+        code = 206
+    h.send_response(code)
+    h.send_header("Content-Type", ctype)
+    h.send_header("Accept-Ranges", "bytes")
+    h.send_header("Content-Length", str(end - start + 1))
+    h.send_header("Cache-Control", cache)
+    if code == 206:
+        h.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+    h.end_headers()
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                blk = f.read(min(262144, left))
+                if not blk:
+                    break
+                h.wfile.write(blk)
+                left -= len(blk)
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        pass
+
+
+def _playable(mime):
+    return "video/mp4" if mime in ("video/quicktime", "video/x-m4v", "") else mime
+
+
+def _get(h, path, q):
+    if path in ("/create", "/create/"):
+        _send_bytes(h, CREATE_HTML, "text/html; charset=utf-8")
+        return True
+    if path.startswith("/v/api/"):
+        name = path[7:].strip("/")
+        if name in ("state", "admin"):
+            _api(h, name, q, {})
+            return True
+        _send(h, {"error": "use_post"}, 405)
+        return True
+    parts = [x for x in path.split("/") if x]
+    if len(parts) < 2 or parts[0] != "v":
+        return False
+    vid = parts[1].lower()
+    v = _video(vid)
+    if not v or v["status"] != "live":
+        if len(parts) == 2:
+            h.send_response(302)
+            h.send_header("Location", "/cinema?wing=ten")
+            h.send_header("Content-Length", "0")
+            h.end_headers()
+            return True
+        _send(h, {"error": "not_found"}, 404)
+        return True
+    if len(parts) == 2:
+        h.send_response(302)
+        h.send_header("Location", "/cinema/v/" + vid)
+        h.send_header("Cache-Control", "no-store")
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+        return True
+    what = parts[2]
+    if what == "teaser":
+        if not h.headers.get("Range") or h.headers.get("Range", "").startswith("bytes=0-"):
+            with _ctx["lock"]:
+                _ctx["conn"].execute("UPDATE studio_video SET plays=plays+1 WHERE id=?", (vid,))
+                _ctx["conn"].commit()
+        _send_file(h, _path(vid, "teaser"), v["teaser_mime"] or "video/mp4")
+        return True
+    if what in ("poster.jpg", "poster"):
+        p = _path(vid, "poster")
+        if os.path.exists(p):
+            _send_file(h, p, "image/jpeg")
+        else:
+            _send_bytes(h, b"", "image/jpeg", 404)
+        return True
+    if what == "full":
+        viewer = str(q.get("viewer") or "")
+        t = str(q.get("t") or "")
+        good = (VIEWER_RE.match(viewer) or OWNER_RE.match(viewer)) and hmac.compare_digest(t, _token(vid, viewer))
+        if good and OWNER_RE.match(viewer):
+            good = viewer == "owner:" + v["account"]
+        elif good:
+            good = _unlocked(vid, viewer)[0]
+        if not good:
+            _send(h, {"error": "locked", "message": "Unlock this video to watch it."}, 403)
+            return True
+        _send_file(h, _path(vid, "full"), _playable(v["full_mime"] or ""), cache="private, max-age=3600")
+        return True
+    _send(h, {"error": "not_found"}, 404)
+    return True
+
+
+def _api(h, name, q, body):
+    if "conn" not in _ctx:
+        _send(h, {"error": "not_armed", "message": "Open /x/studio/status once."}, 503)
+        return
+    _setup()
+    fn = API.get(name)
+    if not fn:
+        _send(h, {"error": "not_found"}, 404)
+        return
+    try:
+        out, code = fn(q, body, h)
+    except Exception as e:
+        print("STUDIO ERR %s: %s" % (name, e), flush=True)
+        out, code = {"error": "failed", "message": "Something went wrong. Try again."}, 500
+    _send(h, out, code)
+
+
+def _post(h, path, q):
+    name = path[7:].strip("/")
+    if "conn" not in _ctx:
+        _send(h, {"error": "not_armed"}, 503)
+        return True
+    _setup()
+    if name == "chunk":
+        try:
+            out, code = chunk(h, q)
+        except Exception as e:
+            print("STUDIO CHUNK ERR: %s" % e, flush=True)
+            out, code = {"error": "failed", "message": "Upload piece failed. Retrying."}, 500
+        _send(h, out, code)
         return True
     try:
-        return float(t) == 0.0
-    except (TypeError, ValueError):
+        n = min(int(h.headers.get("Content-Length") or 0), 20000)
+        raw = _read(h, n) if n else b""
+        body = json.loads((raw or b"{}").decode("utf-8") or "{}")
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+    _api(h, name, q, body)
+    return True
+
+
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        s = f.f_locals.get("self")
+        if s is not None and hasattr(type(s), "do_GET") and hasattr(s, "wfile"):
+            return type(s)
+        f = f.f_back
+    return None
+
+
+def _split(h):
+    u = urllib.parse.urlparse(h.path)
+    return u.path, {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+
+
+def _install(ctx):
+    global _patched
+    if isinstance(ctx, dict) and "conn" in ctx:
+        _ctx.update(ctx)
+        _setup()
+    if _patched:
+        return True
+    cls = _find_handler_class(ctx)
+    if cls is None:
         return False
-
-
-def _usage(resp):
-    if not isinstance(resp, dict):
-        return (None, None)
-    u = resp.get("usage")
-    if not isinstance(u, dict):
-        return (None, None)
-    i = u.get("input_tokens", u.get("prompt_tokens"))
-    o = u.get("output_tokens", u.get("completion_tokens"))
-    try:
-        return (int(i) if i is not None else None,
-                int(o) if o is not None else None)
-    except (TypeError, ValueError):
-        return (None, None)
-
-
-def _money(tokens_in, tokens_out, price_in, price_out):
-    if price_in is None and price_out is None:
-        return None
-    m = 0.0
-    if price_in:
-        m += (tokens_in or 0) / 1_000_000.0 * price_in
-    if price_out:
-        m += (tokens_out or 0) / 1_000_000.0 * price_out
-    return round(m, 4)
-
-
-# --------------------------------------------------------------- storage
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS ts_store (
-    api_key       TEXT NOT NULL,
-    fp            TEXT NOT NULL,
-    model         TEXT,
-    response      TEXT NOT NULL,
-    input_tokens  INTEGER,
-    output_tokens INTEGER,
-    stored_at     REAL NOT NULL,
-    expires_at    REAL,
-    hits          INTEGER NOT NULL DEFAULT 0,
-    last_hit      REAL,
-    PRIMARY KEY (api_key, fp)
-);
-
-CREATE TABLE IF NOT EXISTS ts_seen (
-    api_key  TEXT NOT NULL,
-    fp       TEXT NOT NULL,
-    ts       REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ts_shape (
-    api_key  TEXT NOT NULL,
-    shape    TEXT NOT NULL,
-    first_ts REAL NOT NULL,
-    PRIMARY KEY (api_key, shape)
-);
-
-CREATE TABLE IF NOT EXISTS ts_decision (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    api_key     TEXT NOT NULL,
-    ts          REAL NOT NULL,
-    fp          TEXT NOT NULL,
-    verdict     TEXT NOT NULL,
-    rule        TEXT,
-    score       REAL NOT NULL,
-    signals     TEXT NOT NULL,
-    exact_in    INTEGER,
-    exact_out   INTEGER,
-    ceiling_in  INTEGER,
-    ceiling_out INTEGER,
-    audit_hash  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS ts_account (
-    api_key    TEXT PRIMARY KEY,
-    ceiling    INTEGER NOT NULL DEFAULT 0,
-    spent      INTEGER NOT NULL DEFAULT 0,
-    price_in   REAL,
-    price_out  REAL,
-    currency   TEXT,
-    updated    REAL NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS ts_seen_key ON ts_seen(api_key, ts);
-CREATE INDEX IF NOT EXISTS ts_seen_fp ON ts_seen(api_key, fp, ts);
-CREATE INDEX IF NOT EXISTS ts_dec_key ON ts_decision(api_key, id);
-CREATE INDEX IF NOT EXISTS ts_dec_hash ON ts_decision(audit_hash);
-CREATE INDEX IF NOT EXISTS ts_store_exp ON ts_store(expires_at);
-"""
-
-_ready = {}
-
-
-def _init(ctx):
-    # Keyed by id, but the connection itself is kept as the value so the
-    # id cannot be recycled while we still believe in it.
-    k = id(ctx.conn)
-    if _ready.get(k) is ctx.conn:
-        return
-    with ctx.lock:
-        ctx.conn.executescript(_SCHEMA)
-        ctx.conn.commit()
-    _ready[k] = ctx.conn
-
-
-def _account(ctx, api_key):
-    row = ctx.conn.execute(
-        "SELECT ceiling, spent, price_in, price_out, currency "
-        "FROM ts_account WHERE api_key=?", (api_key,)
-    ).fetchone()
-    if not row:
-        return {"ceiling": 0, "spent": 0, "price_in": None,
-                "price_out": None, "currency": None}
-    return {"ceiling": row[0], "spent": row[1], "price_in": row[2],
-            "price_out": row[3], "currency": row[4]}
-
-
-def _prune(ctx, api_key, now):
-    ctx.conn.execute("DELETE FROM ts_seen WHERE api_key=? AND ts < ?",
-                     (api_key, now - W1H))
-
-
-# ================================================================ layer 3
-
-def _findings(req, loop_n, has_stored, acct):
-    """
-    Named waste inside this request. Every item carries a token figure
-    and says whether that figure is exact or estimated. This never
-    feeds a total.
-    """
-    out = []
-    msgs = req.get("messages") or []
-    depth = len(msgs)
-    tools = req.get("tools") or []
-    ask = _ask_ceiling(req)
-
-    # The biggest one in agent systems: the same request going round
-    # and nobody recording the answer.
-    if loop_n >= 2 and not has_stored:
-        out.append({
-            "code": "repeating_without_recording",
-            "severity": "high",
-            "detail": "This exact request has gone out %d times in the last "
-                      "%d seconds and no answer has been recorded. Post the "
-                      "response back to record and every repeat after that "
-                      "costs nothing."
-                      % (loop_n, LOOP_WINDOW),
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if not _deterministic(req):
-        out.append({
-            "code": "varied_output_blocks_reuse",
-            "severity": "medium",
-            "detail": "temperature is above zero, so this answer cannot be "
-                      "safely reused. If this request does not genuinely need "
-                      "varied output, setting temperature to zero makes every "
-                      "repeat free.",
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if depth > CTX_FLAG_TURNS:
-        carried = msgs[:-CTX_KEEP_TURNS] if CTX_KEEP_TURNS < depth else []
-        chars = sum(_content_chars(m.get("content") if isinstance(m, dict)
-                                   else m) for m in carried)
-        out.append({
-            "code": "carrying_old_turns",
-            "severity": "high" if chars > 20_000 else "medium",
-            "detail": "%d turns are being re-sent on every call. The oldest "
-                      "%d of them account for roughly the tokens below, paid "
-                      "again each time this conversation continues."
-                      % (depth, len(carried)),
-            "tokens": _est_tokens(chars),
-            "certainty": "estimated from character count",
-        })
-
-    if tools:
-        used = False
-        for m in msgs:
-            if not isinstance(m, dict):
-                continue
-            c = m.get("content")
-            blob = c if isinstance(c, str) else _canonical(c).decode("utf-8", "ignore")
-            if "tool_use" in blob or "tool_call" in blob:
-                used = True
-                break
-        if not used:
-            chars = _content_chars(tools)
-            out.append({
-                "code": "unused_tool_definitions",
-                "severity": "high" if chars > 8_000 else "medium",
-                "detail": "%d tool definitions are attached and nothing in "
-                          "this conversation has called one. They are sent in "
-                          "full on every request."
-                          % len(tools),
-                "tokens": _est_tokens(chars),
-                "certainty": "estimated from character count",
-            })
-
-    sys_chars = _content_chars(req.get("system"))
-    if sys_chars > SYSTEM_FLAG_CHARS and depth > 4:
-        out.append({
-            "code": "large_system_prompt_resent",
-            "severity": "low",
-            "detail": "The system prompt is re-sent on every call in this "
-                      "conversation. If your provider offers prompt caching, "
-                      "this is the block to cache.",
-            "tokens": _est_tokens(sys_chars),
-            "certainty": "estimated from character count",
-        })
-
-    if ask:
-        out.append({
-            "code": "output_ceiling_authorised",
-            "severity": "low",
-            "detail": "max_tokens is set to %d, so this single call is "
-                      "authorised to buy up to that many output tokens." % ask,
-            "tokens": ask,
-            "certainty": "exact ceiling set by the caller",
-        })
-
-    seen = {}
-    for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        k = _sha(_canonical(m.get("content")))
-        seen[k] = seen.get(k, 0) + 1
-    dupes = sum(n - 1 for n in seen.values() if n > 1)
-    if dupes >= 2:
-        out.append({
-            "code": "duplicate_turns_in_context",
-            "severity": "medium",
-            "detail": "%d turns inside this conversation are byte-identical "
-                      "to an earlier turn. They are being paid for twice."
-                      % dupes,
-            "tokens": None,
-            "certainty": "not counted",
-        })
-
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
-        out.append({
-            "code": "budget_nearly_gone",
-            "severity": "high",
-            "detail": "This key has used %d of its %d token ceiling."
-                      % (acct["spent"], acct["ceiling"]),
-            "tokens": None,
-            "certainty": "exact, from provider-reported usage",
-        })
-
-    return out
-
-
-# ================================================================ layers 1+2
-
-def _decide(ctx, api_key, m, now, unattended, count_it):
-    """
-    Takes a measurement bundle from _measure or _measure_from_digest, so
-    the same decision runs whether the caller sent the request or kept it
-    at home and sent only its shape.
-
-    rule is set only when a hard rule fired, in which case the score is
-    still computed and reported but did not decide anything.
-    """
-    fp = m["fp"]
-    shape = m["shape"]
-    acct = _account(ctx, api_key)
-
-    loop_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND fp=? AND ts > ?",
-        (api_key, fp, now - LOOP_WINDOW)).fetchone()[0]
-    burst_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
-        (api_key, now - W60)).fetchone()[0]
-    grind_n = ctx.conn.execute(
-        "SELECT COUNT(*) FROM ts_seen WHERE api_key=? AND ts > ?",
-        (api_key, now - W1H)).fetchone()[0]
-    seen_shape = ctx.conn.execute(
-        "SELECT 1 FROM ts_shape WHERE api_key=? AND shape=?",
-        (api_key, shape)).fetchone()
-    has_stored = ctx.conn.execute(
-        "SELECT 1 FROM ts_store WHERE api_key=? AND fp=?",
-        (api_key, fp)).fetchone() is not None
-
-    chars = m["chars"]
-    ask = m["ask"]
-    depth = m["depth"]
-    tools = m["tools"]
-
-    # Worst case this one call could cost: an exact ceiling on output,
-    # an estimate on input. Kept apart accordingly.
-    ceiling_out = ask
-    est_in = _est_tokens(chars)
-    remaining = max(0, acct["ceiling"] - acct["spent"]) if acct["ceiling"] else 0
-    if remaining:
-        exposure = _linear(est_in + ceiling_out, remaining)
-    else:
-        exposure = 0.0
-
-    s = {
-        "exposure": round(exposure, 4),
-        "size": round(_log_scale(chars, SAT_SIZE), 4),
-        "ask": round(_log_scale(ask, SAT_ASK), 4),
-        "depth": round(_linear(depth, SAT_DEPTH), 4),
-        "tools": round(_linear(tools, SAT_TOOLS), 4),
-        "loop": round(_linear(loop_n, SAT_LOOP), 4),
-        "burst": round(_linear(burst_n, SAT_BURST), 4),
-        "grind": round(_linear(grind_n, SAT_GRIND), 4),
-        "novelty": 0.0 if seen_shape else 1.0,
-    }
-
-    score = (W_EXPOSURE * s["exposure"] + W_SIZE * s["size"]
-             + W_ASK * s["ask"] + W_DEPTH * s["depth"]
-             + W_TOOLS * s["tools"] + W_LOOP * s["loop"]
-             + W_BURST * s["burst"] + W_GRIND * s["grind"]
-             + W_NOVELTY * s["novelty"])
-
-    s["unattended"] = bool(unattended)
-    if unattended:
-        score += W_UNATTENDED
-    score = round(min(1.0, score), 4)
-
-    measured = {
-        "prompt_characters": chars,
-        "estimated_input_tokens": est_in,
-        "estimated_input_tokens_note": "estimated from characters, never "
-                                       "counted in a savings total",
-        "authorised_output_tokens": ceiling_out,
-        "conversation_turns": depth,
-        "tool_definitions": tools,
-        "same_request_in_last_%ds" % LOOP_WINDOW: loop_n,
-        "requests_in_last_60s": burst_n,
-        "requests_in_last_hour": grind_n,
-        "budget_ceiling_tokens": acct["ceiling"],
-        "budget_spent_tokens": acct["spent"],
-    }
-
-    # ---- layer 1: hard rules, in order, no appeal to the score --------
-    rule = None
-    verdict = None
-
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"]:
-        rule, verdict = "budget_exhausted", "BLOCK"
-    elif acct["ceiling"] and (est_in + ceiling_out) > remaining:
-        # An overdraft. Catching this after the fact is too late: the
-        # money is already gone. A person may raise the ceiling, so an
-        # attended call is held rather than refused.
-        rule = "exceeds_remaining_budget"
-        verdict = "BLOCK" if unattended else "CHALLENGE"
-    elif loop_n >= LOOP_HARD:
-        rule, verdict = "runaway_loop", "BLOCK"
-    elif unattended and loop_n >= LOOP_HARD_UNATTENDED:
-        rule, verdict = "runaway_loop_unattended", "BLOCK"
-    elif burst_n >= BURST_HARD:
-        rule, verdict = "runaway_burst", "BLOCK"
-
-    # ---- layer 2: the score -------------------------------------------
-    if verdict is None:
-        if score >= BAND_BLOCK:
-            verdict = "BLOCK"
-        elif score >= BAND_CHALLENGE:
-            verdict = "CHALLENGE"
-        elif (score < CHEAP_MAX_SCORE and chars <= CHEAP_MAX_CHARS
-              and depth <= CHEAP_MAX_TURNS and ask <= CHEAP_MAX_ASK
-              and tools == 0):
-            verdict = "DOWNGRADE"
-        else:
-            verdict = "ALLOW"
-
-    if count_it:
-        ctx.conn.execute("INSERT INTO ts_seen (api_key, fp, ts) VALUES (?,?,?)",
-                         (api_key, fp, now))
-        ctx.conn.execute(
-            "INSERT OR IGNORE INTO ts_shape (api_key, shape, first_ts) "
-            "VALUES (?,?,?)", (api_key, shape, now))
-        _prune(ctx, api_key, now)
-
-    measured["measured_from"] = ("a digest supplied by the client; the "
-                                "content stayed on their side"
-                                if m.get("from_digest") else
-                                "the request body")
-    return (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-            est_in, ceiling_out, acct)
-
-
-def _record_decision(ctx, api_key, fp, verdict, rule, score, signals,
-                     ex_in, ex_out, ce_in, ce_out, seal_hash, now):
-    """Writes the row and returns its id, so the receipt can be stamped on
-    afterwards once the lock has been released."""
-    cur = ctx.conn.execute(
-        "INSERT INTO ts_decision (api_key, ts, fp, verdict, rule, score, "
-        "signals, exact_in, exact_out, ceiling_in, ceiling_out, audit_hash) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (api_key, now, fp, verdict, rule, score,
-         json.dumps(signals, sort_keys=True), ex_in, ex_out, ce_in, ce_out,
-         seal_hash))
-    return cur.lastrowid
-
-
-def _seal_and_stamp(ctx, event, detail, api_key, decision_id):
-    """
-    Seal with the lock released, then write the receipt back onto the row
-    in a second short lock. Splitting it this way is what keeps the
-    platform's non-reentrant lock from deadlocking the request.
-    """
-    seal = ctx.seal(event, detail, api_key)
-    h = seal.get("hash") if isinstance(seal, dict) else None
-    if h and decision_id:
-        try:
-            with ctx.lock:
-                ctx.conn.execute(
-                    "UPDATE ts_decision SET audit_hash=? WHERE id=?",
-                    (h, decision_id))
-                ctx.conn.commit()
-        except Exception:                        # noqa: BLE001
-            pass
-    return seal
-
-
-# --------------------------------------------------------------- actions
-
-def _a_spec():
-    return {
-        "module": "tokensaver",
-        "version": VERSION,
-        "what_it_is": "A deterministic gate in front of a model. It decides "
-                      "whether a request is answered from store, sent to the "
-                      "model, sent to a cheaper model, held for a person, or "
-                      "refused. It also names the waste inside every request "
-                      "it sees.",
-        "model_calls_made_to_reach_a_decision": 0,
-        "layers": {
-            "1_hard_rules": {
-                "why": "A cost gate that depends only on tuned weights is a "
-                       "cost gate nobody can defend. These are absolute.",
-                "rules": {
-                    "budget_exhausted": "spend has reached the key's ceiling",
-                    "exceeds_remaining_budget":
-                        "this one call could cost more than the budget left. "
-                        "Output uses the exact ceiling you set; input is "
-                        "estimated from characters, so this rule is "
-                        "deliberately cautious. Held for a person when a "
-                        "human is declared, refused when one is not.",
-                    "runaway_loop": "the same request %d times in %d seconds"
-                                    % (LOOP_HARD, LOOP_WINDOW),
-                    "runaway_loop_unattended": "the same request %d times in "
-                                               "%d seconds with no human "
-                                               "declared"
-                                               % (LOOP_HARD_UNATTENDED,
-                                                  LOOP_WINDOW),
-                    "runaway_burst": "%d requests from one key in 60 seconds"
-                                     % BURST_HARD,
-                },
-            },
-            "2_the_score": {
-                "spend_signals": {
-                    "exposure": {"weight": W_EXPOSURE,
-                                 "measures": "worst case cost of this call "
-                                             "against the budget left"},
-                    "size": {"weight": W_SIZE, "saturates_at": SAT_SIZE,
-                             "measures": "prompt characters, log scaled"},
-                    "ask": {"weight": W_ASK, "saturates_at": SAT_ASK,
-                            "measures": "the max_tokens ceiling the caller set"},
-                    "depth": {"weight": W_DEPTH, "saturates_at": SAT_DEPTH,
-                              "measures": "turns re-sent on every call"},
-                    "tools": {"weight": W_TOOLS, "saturates_at": SAT_TOOLS,
-                              "measures": "tool definitions re-sent on every call"},
-                },
-                "waste_signals": {
-                    "loop": {"weight": W_LOOP, "saturates_at": SAT_LOOP},
-                    "burst": {"weight": W_BURST, "saturates_at": SAT_BURST},
-                    "grind": {"weight": W_GRIND, "saturates_at": SAT_GRIND},
-                    "novelty": {"weight": W_NOVELTY},
-                },
-                "spend_weight_total": round(W_EXPOSURE + W_SIZE + W_ASK
-                                            + W_DEPTH + W_TOOLS, 4),
-                "waste_weight_total": round(W_LOOP + W_BURST + W_GRIND
-                                            + W_NOVELTY, 4),
-                "base_weights_sum_to": round(BASE_SUM, 4),
-                "outside_the_base_sum": {"unattended": W_UNATTENDED},
-                "bands": {"CHALLENGE": ">= %.2f" % BAND_CHALLENGE,
-                          "BLOCK": ">= %.2f" % BAND_BLOCK},
-                "downgrade_is_earned_not_suspected": {
-                    "max_score": CHEAP_MAX_SCORE,
-                    "max_prompt_characters": CHEAP_MAX_CHARS,
-                    "max_turns": CHEAP_MAX_TURNS,
-                    "max_output_tokens": CHEAP_MAX_ASK,
-                    "tools_allowed": 0,
-                    "why": "a suspicious request is never sent to a weaker "
-                           "model. Only a genuinely small one is.",
-                },
-            },
-            "3_findings": {
-                "why": "The verdict saves money on this call. The findings "
-                       "change what the caller sends next time, which saves "
-                       "far more.",
-                "codes": ["repeating_without_recording",
-                          "varied_output_blocks_reuse",
-                          "carrying_old_turns",
-                          "unused_tool_definitions",
-                          "large_system_prompt_resent",
-                          "output_ceiling_authorised",
-                          "duplicate_turns_in_context",
-                          "budget_nearly_gone"],
-            },
-        },
-        "verdict_vocabulary": VOCABULARY,
-        "certainty_tiers": {
-            "tokens_not_bought": "exact, provider reported, the only figure "
-                                 "that enters a savings total",
-            "worst_case_tokens_avoided": "a ceiling on what a refused request "
-                                         "could have cost, reported separately",
-            "findings_tokens": "estimated from characters where marked, never "
-                               "entering any total",
-        },
-        "two_ways_to_call_it": {
-            "request": "send the provider request body. This platform sees "
-                       "your prompt.",
-            "digest": "send only a fingerprint and counts. Your prompts and "
-                      "answers never leave your building, the decision is "
-                      "identical, and the receipt is the same. The downloaded "
-                      "client uses this path by default.",
-        },
-        "honest_limits": LIMITS,
-        "routes": {
-            "public": ["spec", "stats", "verify"],
-            "keyed": ["estimate", "gate", "record", "ledger", "budget",
-                      "prices", "forget"],
-        },
-    }
-
-
-def _bundle(data):
-    """
-    A caller may send the whole request, or only a digest of it. The
-    digest path exists so a customer's prompts and answers never leave
-    their own building. Returns (measurements, request_or_None, error, code).
-    """
-    req = data.get("request")
-    if isinstance(req, dict):
-        if _prompt_chars(req) > MAX_PROMPT_CHARS:
-            return None, None, {"error": "request_too_large"}, 413
-        return _measure(req), req, None, None
-
-    dig = data.get("digest")
-    if dig is not None:
-        m, err = _measure_from_digest(dig)
-        if err:
-            return None, None, {"error": "bad_digest", "detail": err}, 400
-        return m, None, None, None
-
-    return None, None, {
-        "error": "request_or_digest_required",
-        "detail": "send the provider request body under 'request', or a "
-                  "content-free digest under 'digest' with fingerprint, "
-                  "prompt_characters, max_tokens, conversation_turns, "
-                  "tool_definitions and deterministic",
-    }, 400
-
-
-def _digest_findings(m, loop_n, has_stored, acct):
-    """
-    What can honestly be said when the content stayed at home. Anything
-    needing the actual messages is left to the client, which has them.
-    """
-    out = []
-    if loop_n >= 2 and not has_stored:
-        out.append({
-            "code": "repeating_without_recording",
-            "severity": "high",
-            "detail": "This exact request has gone out %d times in the last "
-                      "%d seconds and no answer has been recorded. Post the "
-                      "response back to record and every repeat after that "
-                      "costs nothing." % (loop_n, LOOP_WINDOW),
-            "tokens": None,
-            "certainty": "not counted",
-        })
-    if not m["deterministic"]:
-        out.append({
-            "code": "varied_output_blocks_reuse",
-            "severity": "medium",
-            "detail": "temperature is above zero, so this answer cannot be "
-                      "safely reused.",
-            "tokens": None,
-            "certainty": "not counted",
-        })
-    if m["depth"] > CTX_FLAG_TURNS:
-        out.append({
-            "code": "carrying_old_turns",
-            "severity": "medium",
-            "detail": "%d turns are being re-sent on every call. Your client "
-                      "holds the content and can size this exactly."
-                      % m["depth"],
-            "tokens": None,
-            "certainty": "not counted here; the client can measure it",
-        })
-    if m["ask"]:
-        out.append({
-            "code": "output_ceiling_authorised",
-            "severity": "low",
-            "detail": "max_tokens is set to %d, so this call is authorised "
-                      "to buy up to that many output tokens." % m["ask"],
-            "tokens": m["ask"],
-            "certainty": "exact ceiling set by the caller",
-        })
-    if acct["ceiling"] and acct["spent"] >= acct["ceiling"] * 0.8:
-        out.append({
-            "code": "budget_nearly_gone",
-            "severity": "high",
-            "detail": "This key has used %d of its %d token ceiling."
-                      % (acct["spent"], acct["ceiling"]),
-            "tokens": None,
-            "certainty": "exact, from provider-reported usage",
-        })
-    return out
-
-
-def _a_estimate(ctx, api_key, data, now):
-    """Cost a request and name its waste. Changes nothing, seals nothing."""
-    m, req, err, code = _bundle(data)
-    if err:
-        return err, code
-
-    with ctx.lock:
-        (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-         est_in, ceil_out, acct) = _decide(
-            ctx, api_key, m, now, bool(data.get("unattended")), False)
-        findings = (_findings(req, loop_n, has_stored, acct) if req
-                    else _digest_findings(m, loop_n, has_stored, acct))
-        stored = has_stored
-
-    money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
-    out = {
-        "would_be": verdict,
-        "rule": rule,
-        "score": score,
-        "signals": s,
-        "measured": measured,
-        "findings": findings,
-        "fingerprint": fp,
-        "stored_answer_available": stored,
-        "worst_case_cost": {
-            "estimated_input_tokens": est_in,
-            "authorised_output_tokens": ceil_out,
-            "certainty": "input estimated from characters; output is the "
-                         "exact ceiling you set",
-        },
-        "note": "estimate changes nothing, counts towards no velocity window "
-                "and seals nothing. Use gate for the real decision.",
-    }
-    if money is not None:
-        out["worst_case_cost"]["money_at_your_prices"] = money
-        out["worst_case_cost"]["currency"] = acct["currency"]
-    return out, 200
-
-
-def _a_gate(ctx, api_key, data, now):
-    m, req, err, code = _bundle(data)
-    if err:
-        return err, code
-
-    unattended = bool(data.get("unattended"))
-    fp = m["fp"]
-
-    # ---- everything that touches the database, under the lock ----------
-    with ctx.lock:
-        row = ctx.conn.execute(
-            "SELECT response, model, input_tokens, output_tokens, hits, "
-            "expires_at FROM ts_store WHERE api_key=? AND fp=?",
-            (api_key, fp)).fetchone()
-
-        expired = False
-        if row and row[5] is not None and row[5] < now:
-            ctx.conn.execute("DELETE FROM ts_store WHERE api_key=? AND fp=?",
-                             (api_key, fp))
-            expired = True
-            row = None
-
-        acct = _account(ctx, api_key)
-        budget_gone = bool(acct["ceiling"]) and acct["spent"] >= acct["ceiling"]
-
-        client_held = False
-        if row:
+    if getattr(cls, "_studio4_patched", False):
+        _patched = True
+        return True
+    og = cls.do_GET
+    op = getattr(cls, "do_POST", None)
+
+    def do_GET(self):
+        path, q = _split(self)
+        if path in ("/create", "/create/") or path.startswith("/v/"):
             try:
-                client_held = (json.loads(row[0]).get("held_by") == "client")
-            except (ValueError, AttributeError):
-                client_held = False
-
-        served = bool(row) and not budget_gone
-        if served:
-            ctx.conn.execute(
-                "UPDATE ts_store SET hits=hits+1, last_hit=? "
-                "WHERE api_key=? AND fp=?", (now, api_key, fp))
-            did = _record_decision(
-                ctx, api_key, fp, "SERVE",
-                "stored_by_client" if client_held else "stored_answer",
-                0.0, {"repeat": 1.0}, row[2], row[3], None, None, None, now)
-        else:
-            (verdict, rule, score, s, measured, fp, shape, loop_n, has_stored,
-             est_in, ceil_out, acct) = _decide(ctx, api_key, m, now,
-                                               unattended, True)
-            findings = (_findings(req, loop_n, has_stored, acct) if req
-                        else _digest_findings(m, loop_n, has_stored, acct))
-            ce_in = est_in if verdict == "BLOCK" else None
-            ce_out = ceil_out if verdict == "BLOCK" else None
-            did = _record_decision(ctx, api_key, fp, verdict, rule, score, s,
-                                   None, None, ce_in, ce_out, None, now)
-        ctx.conn.commit()
-
-    # ---- sealing happens with the lock RELEASED -------------------------
-    # The platform's seal takes the same lock, and it is not reentrant.
-    # Calling it from inside the block above deadlocks the request.
-    if expired:
-        ctx.seal("tokensaver_expired",
-                 {"module": "tokensaver", "fingerprint": fp}, api_key)
-
-    if served:
-        detail = {
-            "module": "tokensaver", "verdict": "SERVE", "fingerprint": fp,
-            "model": row[1],
-            "tokens_not_bought": {"input": row[2], "output": row[3]},
-            "usage_reported_by_provider": (row[2] is not None
-                                           or row[3] is not None),
-            "hit_number": row[4] + 1,
-        }
-        if client_held:
-            detail["content_held_by"] = "client"
-        seal = _seal_and_stamp(ctx, "tokensaver_serve", detail, api_key, did)
-
-        known = (row[2] is not None or row[3] is not None)
-        out = {
-            "verdict": "SERVE",
-            "meaning": VOCABULARY["SERVE"],
-            "call_the_model": False,
-            "fingerprint": fp,
-            "tokens_not_bought": {
-                "input": row[2], "output": row[3],
-                "total": ((row[2] or 0) + (row[3] or 0)) if known else None,
-                "certainty": "exact, as reported by the provider on the "
-                             "original call" if known else
-                             "the provider reported no usage on the original "
-                             "call, so this saving is real but its size is "
-                             "unknown",
-            },
-            "hit_number": row[4] + 1,
-            "receipt": seal,
-        }
-        if client_held:
-            out["content_held_by"] = "client"
-            out["serve_from_your_own_store"] = True
-        else:
-            out["response"] = json.loads(row[0])
-        money = _money(row[2], row[3], acct["price_in"], acct["price_out"])
-        if money is not None:
-            out["money_not_spent_at_your_prices"] = money
-            out["currency"] = acct["currency"]
-        return out, 200
-
-    detail = {
-        "module": "tokensaver", "verdict": verdict, "rule": rule,
-        "score": score, "fingerprint": fp, "signals": s,
-        "measured": measured, "findings": [f["code"] for f in findings],
-    }
-    seal = _seal_and_stamp(ctx, "tokensaver_decision", detail, api_key, did)
-
-    out = {
-        "verdict": verdict,
-        "meaning": VOCABULARY[verdict],
-        "decided_by": ("hard rule: " + rule) if rule else "score",
-        "rule": rule,
-        "score": score,
-        "signals": s,
-        "measured": measured,
-        "findings": findings,
-        "fingerprint": fp,
-        "call_the_model": verdict in ("ALLOW", "DOWNGRADE"),
-        "use_cheap_model": verdict == "DOWNGRADE",
-        "receipt": seal,
-    }
-    if verdict == "BLOCK":
-        money = _money(est_in, ceil_out, acct["price_in"], acct["price_out"])
-        out["worst_case_avoided"] = {
-            "estimated_input_tokens": est_in,
-            "authorised_output_tokens": ceil_out,
-            "certainty": "a ceiling, not a saving. Nobody knows what this "
-                         "call would actually have cost, so it is reported "
-                         "separately and never added to tokens not bought.",
-        }
-        if money is not None:
-            out["worst_case_avoided"]["money_at_your_prices"] = money
-    if verdict in ("ALLOW", "DOWNGRADE"):
-        out["next"] = ("call the model, then POST the response to "
-                       "/x/tokensaver/record so the next identical request "
-                       "costs nothing")
-    return out, 200
-
-
-def _a_record(ctx, api_key, data, now):
-    req = data.get("request")
-    resp = data.get("response")
-    dig = data.get("digest")
-
-    # Content-free path: the client stored the answer at home and is only
-    # reporting what it cost, so the budget and the totals stay true.
-    if not isinstance(req, dict) and isinstance(dig, dict):
-        m, err = _measure_from_digest(dig)
-        if err:
-            return {"error": "bad_digest", "detail": err}, 400
-        u = data.get("usage") or {}
-        try:
-            t_in = (int(u["input_tokens"])
-                    if u.get("input_tokens") is not None else None)
-            t_out = (int(u["output_tokens"])
-                     if u.get("output_tokens") is not None else None)
-        except (TypeError, ValueError):
-            return {"error": "usage_must_be_whole_numbers"}, 400
-        with ctx.lock:
-            if t_in is not None or t_out is not None:
-                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-            ctx.conn.execute(
-                "INSERT OR REPLACE INTO ts_store (api_key, fp, model, "
-                "response, input_tokens, output_tokens, stored_at, "
-                "expires_at, hits, last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
-                (api_key, m["fp"], dig.get("model"),
-                 json.dumps({"held_by": "client",
-                             "note": "the answer is stored on the customer's "
-                                     "own machine and never came here"}),
-                 t_in, t_out, now, now + DEFAULT_TTL))
-            ctx.conn.commit()
-        seal = ctx.seal("tokensaver_store", {
-            "module": "tokensaver", "fingerprint": m["fp"],
-            "model": dig.get("model"), "content_held_by": "client",
-            "usage_reported_by_provider": (t_in is not None
-                                           or t_out is not None),
-            "input_tokens": t_in, "output_tokens": t_out}, api_key)
-        return {"stored": True, "fingerprint": m["fp"],
-                "content_held_by": "client", "input_tokens": t_in,
-                "output_tokens": t_out, "receipt": seal,
-                "note": "the cost is on the record here; the answer itself "
-                        "stayed on your machine"}, 200
-
-    if not isinstance(req, dict) or not isinstance(resp, dict):
-        return {"error": "request_and_response_required",
-                "detail": "send request and response, or a digest with usage"}, 400
-
-    body = json.dumps(resp)
-    if len(body.encode("utf-8")) > MAX_STORED_BYTES:
-        return {"error": "response_too_large",
-                "limit_bytes": MAX_STORED_BYTES}, 413
-
-    fp = _fingerprint(req)
-    t_in, t_out = _usage(resp)
-
-    if not _deterministic(req) and not data.get("store_varied"):
-        with ctx.lock:
-            if t_in is not None or t_out is not None:
-                _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-            ctx.conn.commit()
-        ctx.seal("tokensaver_refused_to_store", {
-            "module": "tokensaver", "fingerprint": fp,
-            "reason": "temperature above zero; serving a stored answer "
-                      "would change how the system behaves"}, api_key)
-        return {
-            "stored": False,
-            "spend_recorded": (t_in is not None or t_out is not None),
-            "reason": "temperature is above zero. Serving a stored answer to "
-                      "a request that asked for varied output would change "
-                      "how your system behaves. Send store_varied true to "
-                      "override deliberately.",
-        }, 200
-
-    ttl = data.get("ttl_seconds", DEFAULT_TTL)
-    try:
-        ttl = float(ttl)
-    except (TypeError, ValueError):
-        ttl = DEFAULT_TTL
-    expires = now + ttl if ttl > 0 else None
-
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT OR REPLACE INTO ts_store (api_key, fp, model, response, "
-            "input_tokens, output_tokens, stored_at, expires_at, hits, "
-            "last_hit) VALUES (?,?,?,?,?,?,?,?,0,NULL)",
-            (api_key, fp, req.get("model"), body, t_in, t_out, now, expires))
-        if t_in is not None or t_out is not None:
-            _spend(ctx, api_key, (t_in or 0) + (t_out or 0), now)
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_store", {
-        "module": "tokensaver", "fingerprint": fp, "model": req.get("model"),
-        "usage_reported_by_provider": (t_in is not None or t_out is not None),
-        "input_tokens": t_in, "output_tokens": t_out}, api_key)
-
-    return {
-        "stored": True,
-        "fingerprint": fp,
-        "usage_reported_by_provider": (t_in is not None or t_out is not None),
-        "input_tokens": t_in,
-        "output_tokens": t_out,
-        "receipt": seal,
-        "note": "the next identical request will be served from store and "
-                "will buy nothing"
-                if (t_in is not None or t_out is not None) else
-                "stored, but the provider reported no usage, so future "
-                "savings on this request will be real without a known size",
-    }, 200
-
-
-def _spend(ctx, api_key, tokens, now):
-    ctx.conn.execute(
-        "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
-        "VALUES (?,0,?,?) ON CONFLICT(api_key) DO UPDATE SET "
-        "spent = spent + ?, updated = ?",
-        (api_key, tokens, now, tokens, now))
-
-
-def _totals(ctx, api_key=None):
-    where = "WHERE api_key=?" if api_key else ""
-    args = (api_key,) if api_key else ()
-
-    rows = ctx.conn.execute(
-        "SELECT hits, input_tokens, output_tokens FROM ts_store " + where,
-        args).fetchall()
-    exact_in = exact_out = unknown = 0
-    for h, i, o in rows:
-        if i is None and o is None:
-            unknown += h
-            continue
-        exact_in += (i or 0) * h
-        exact_out += (o or 0) * h
-
-    counts = {}
-    for v, c in ctx.conn.execute(
-            "SELECT verdict, COUNT(*) FROM ts_decision " + where
-            + " GROUP BY verdict", args).fetchall():
-        counts[v] = c
-
-    crow = ctx.conn.execute(
-        "SELECT COALESCE(SUM(ceiling_in),0), COALESCE(SUM(ceiling_out),0) "
-        "FROM ts_decision " + (where + " AND " if where else "WHERE ")
-        + "verdict='BLOCK'", args).fetchone()
-
-    rules = {}
-    for r, c in ctx.conn.execute(
-            "SELECT rule, COUNT(*) FROM ts_decision "
-            + (where + " AND " if where else "WHERE ")
-            + "rule IS NOT NULL GROUP BY rule", args).fetchall():
-        rules[r] = c
-
-    total = sum(counts.values())
-    served = counts.get("SERVE", 0)
-
-    return {
-        "decisions": total,
-        "verdicts": counts,
-        "hard_rules_fired": rules,
-        "serve_rate_percent": round(100.0 * served / total, 2) if total else 0.0,
-        "tokens_not_bought": {
-            "input": exact_in,
-            "output": exact_out,
-            "total": exact_in + exact_out,
-            "certainty": "exact. Provider-reported counts on requests served "
-                         "from store.",
-        },
-        "worst_case_tokens_avoided": {
-            "estimated_input": crow[0],
-            "authorised_output": crow[1],
-            "certainty": "a ceiling on refused requests, not a saving. Never "
-                         "added to tokens not bought.",
-        },
-        "serves_with_no_usage_reported": unknown,
-        "stored_answers": len(rows),
-    }
-
-
-def _a_stats(ctx):
-    with ctx.lock:
-        t = _totals(ctx)
-    t["version"] = VERSION
-    t["model_calls_made_to_reach_a_decision"] = 0
-    t["note"] = ("No figure here is a percentage saved. Exact savings and "
-                 "worst case ceilings are reported apart and never summed.")
-    return t, 200
-
-
-def _a_ledger(ctx, api_key, data, now):
-    try:
-        limit = min(200, max(1, int(data.get("limit", 50))))
-    except (TypeError, ValueError):
-        limit = 50
-    with ctx.lock:
-        rows = ctx.conn.execute(
-            "SELECT ts, fp, verdict, rule, score, exact_in, exact_out, "
-            "ceiling_in, ceiling_out, audit_hash FROM ts_decision "
-            "WHERE api_key=? ORDER BY id DESC LIMIT ?",
-            (api_key, limit)).fetchall()
-        totals = _totals(ctx, api_key)
-        acct = _account(ctx, api_key)
-
-    out = {
-        "totals": totals,
-        "budget": {
-            "ceiling_tokens": acct["ceiling"],
-            "spent_tokens": acct["spent"],
-            "remaining_tokens": max(0, acct["ceiling"] - acct["spent"])
-                                if acct["ceiling"] else None,
-            "note": "no ceiling set; set one with budget"
-                    if not acct["ceiling"] else None,
-        },
-        "recent": [{
-            "ts": r[0], "fingerprint": r[1], "verdict": r[2], "rule": r[3],
-            "score": r[4],
-            "tokens_not_bought": ((r[5] or 0) + (r[6] or 0))
-                                 if r[2] == "SERVE" else 0,
-            "worst_case_avoided": ((r[7] or 0) + (r[8] or 0))
-                                  if r[2] == "BLOCK" else 0,
-            "receipt": r[9],
-        } for r in rows],
-    }
-    m = _money(totals["tokens_not_bought"]["input"],
-               totals["tokens_not_bought"]["output"],
-               acct["price_in"], acct["price_out"])
-    if m is not None:
-        out["money_not_spent_at_your_prices"] = m
-        out["currency"] = acct["currency"]
-        out["money_note"] = ("calculated only from provider-reported counts "
-                             "on requests served from store, at the prices "
-                             "you supplied")
-    return out, 200
-
-
-def _a_budget(ctx, api_key, data, now):
-    if "ceiling_tokens" not in data:
-        return {"error": "ceiling_tokens_required",
-                "detail": "the number of tokens this key may spend before "
-                          "every request is refused"}, 400
-    try:
-        ceiling = int(data["ceiling_tokens"])
-    except (TypeError, ValueError):
-        return {"error": "ceiling_tokens_must_be_a_whole_number"}, 400
-    if ceiling < 0:
-        return {"error": "ceiling_tokens_must_not_be_negative"}, 400
-
-    reset = bool(data.get("reset_spent"))
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT INTO ts_account (api_key, ceiling, spent, updated) "
-            "VALUES (?,?,0,?) ON CONFLICT(api_key) DO UPDATE SET "
-            "ceiling=?, updated=?", (api_key, ceiling, now, ceiling, now))
-        if reset:
-            ctx.conn.execute("UPDATE ts_account SET spent=0 WHERE api_key=?",
-                             (api_key,))
-        acct = _account(ctx, api_key)
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_budget", {
-        "module": "tokensaver", "ceiling_tokens": ceiling,
-        "spent_reset": reset}, api_key)
-
-    return {"ceiling_tokens": acct["ceiling"], "spent_tokens": acct["spent"],
-            "receipt": seal,
-            "note": "when spent reaches the ceiling, every request is refused "
-                    "before it reaches the model"}, 200
-
-
-def _a_prices(ctx, api_key, data, now):
-    """Prices come from the customer's own contract. Never assumed."""
-    pi = data.get("price_per_million_input")
-    po = data.get("price_per_million_output")
-    if pi is None and po is None:
-        return {"error": "prices_required",
-                "detail": "send price_per_million_input and/or "
-                          "price_per_million_output from your own provider "
-                          "contract. Nothing is assumed on your behalf."}, 400
-    try:
-        pi = float(pi) if pi is not None else None
-        po = float(po) if po is not None else None
-    except (TypeError, ValueError):
-        return {"error": "prices_must_be_numbers"}, 400
-    if (pi is not None and pi < 0) or (po is not None and po < 0):
-        return {"error": "prices_must_not_be_negative"}, 400
-
-    cur = (data.get("currency") or "").strip()[:8] or None
-    with ctx.lock:
-        ctx.conn.execute(
-            "INSERT INTO ts_account (api_key, ceiling, spent, price_in, "
-            "price_out, currency, updated) VALUES (?,0,0,?,?,?,?) "
-            "ON CONFLICT(api_key) DO UPDATE SET price_in=?, price_out=?, "
-            "currency=?, updated=?",
-            (api_key, pi, po, cur, now, pi, po, cur, now))
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_prices", {
-        "module": "tokensaver", "price_per_million_input": pi,
-        "price_per_million_output": po, "currency": cur}, api_key)
-
-    return {"price_per_million_input": pi, "price_per_million_output": po,
-            "currency": cur, "receipt": seal,
-            "note": "money figures now appear alongside token figures. They "
-                    "are your prices applied to provider-reported counts, "
-                    "never an assumption about what you pay."}, 200
-
-
-def _a_forget(ctx, api_key, data, now):
-    fp = data.get("fingerprint")
-    req = data.get("request")
-    if not fp and isinstance(req, dict):
-        fp = _fingerprint(req)
-    if not fp:
-        return {"error": "fingerprint_or_request_required"}, 400
-
-    with ctx.lock:
-        cur = ctx.conn.execute(
-            "DELETE FROM ts_store WHERE api_key=? AND fp=?", (api_key, fp))
-        removed = cur.rowcount
-        ctx.conn.commit()
-
-    seal = ctx.seal("tokensaver_forget", {
-        "module": "tokensaver", "fingerprint": fp, "removed": removed},
-        api_key)
-
-    return {"removed": removed, "fingerprint": fp, "receipt": seal,
-            "note": "the stored answer is gone. Decisions already sealed "
-                    "stay sealed."}, 200
-
-
-def _a_verify(ctx, data):
-    h = data.get("receipt") or data.get("hash")
-    if not h:
-        return {"error": "receipt_required",
-                "detail": "pass ?receipt=<chain hash from a decision>"}, 400
-    with ctx.lock:
-        row = ctx.conn.execute(
-            "SELECT ts, verdict, rule, score, exact_in, exact_out, "
-            "ceiling_in, ceiling_out, fp FROM ts_decision WHERE audit_hash=?",
-            (h,)).fetchone()
-    if not row:
-        return {"found": False, "receipt": h,
-                "note": "no decision on this platform carries that receipt"}, 404
-    return {
-        "found": True,
-        "receipt": h,
-        "ts": row[0],
-        "verdict": row[1],
-        "meaning": VOCABULARY.get(row[1], row[1]),
-        "decided_by": ("hard rule: " + row[2]) if row[2] else "score",
-        "score": row[3],
-        "tokens_not_bought": ((row[4] or 0) + (row[5] or 0))
-                             if row[1] == "SERVE" else 0,
-        "worst_case_avoided": ((row[6] or 0) + (row[7] or 0))
-                              if row[1] == "BLOCK" else 0,
-        "fingerprint": row[8],
-        "what_this_proves": "that this decision was sealed into the chain "
-                            "with these values at this position.",
-        "what_this_does_not_prove": "that a stored answer is still correct, "
-                                    "or what a refused request would actually "
-                                    "have cost.",
-    }, 200
-
-
-# ---------------------------------------------------------------- handler
-# ---------------------------------------------------------------- the ctx
-
-def _fallback_conn():
-    global _FALLBACK_CONN
-    with _FALLBACK_LOCK:
-        if _FALLBACK_CONN is None:
-            _FALLBACK_CONN = sqlite3.connect("tokensaver.db",
-                                             check_same_thread=False)
-            _FALLBACK_CONN.execute("PRAGMA journal_mode=WAL")
-        return _FALLBACK_CONN
-
-
-class _Bridge:
-    """
-    A router may hand a module a context object, or a plain dict. Rather
-    than assume which, find what is actually needed: something that can
-    run SQL, something that can be held, and something that can seal.
-
-    Anything missing is reported honestly in the response instead of
-    being faked.
-    """
-
-    def __init__(self, raw):
-        self.raw = raw
-        self.conn = self._find(
-            lambda v: hasattr(v, "execute") and hasattr(v, "commit"),
-            ("conn", "db", "_conn", "_db", "database", "sql", "sqlite"))
-        self.lock = self._find(
-            lambda v: hasattr(v, "acquire") and hasattr(v, "release"),
-            ("lock", "db_lock", "_db_lock", "_lock", "mutex"))
-        # A sqlite3 Connection is itself callable, so "anything callable"
-        # is not a safe test for a seal function - it would quietly pick the
-        # database. Require an actual function or method.
-        self._seal = self._find(
-            lambda v: (inspect.isroutine(v)
-                       and v is not self.conn and v is not self.lock),
-            ("seal", "seal_fn", "seal_block", "add_block", "chain_seal",
-             "append_block"))
-        self.notes = []
-
-        if self.conn is None:
-            # Last resort so the module still answers rather than 500s.
-            self.conn = _fallback_conn()
-            self.notes.append("no database was found in the router context, so "
-                              "this module opened its own file")
-        if self.lock is None:
-            self.lock = _FALLBACK_LOCK
-            self.notes.append("no lock was found in the router context, so "
-                              "this module used its own")
-        if self._seal is None:
-            self.notes.append("no seal function was found in the router "
-                              "context, so decisions are recorded but not "
-                              "sealed into the platform chain")
-
-    def _find(self, test, names):
-        raw = self.raw
-        if isinstance(raw, dict):
-            for n in names:                      # preferred names first
-                if n in raw and raw[n] is not None:
-                    try:
-                        if test(raw[n]):
-                            return raw[n]
-                    except Exception:            # noqa: BLE001
-                        pass
-            for v in raw.values():               # then anything that fits
+                if _get(self, path, q):
+                    return
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as e:
+                print("STUDIO GET ERR: %s" % e, flush=True)
                 try:
-                    if v is not None and test(v):
-                        return v
-                except Exception:                # noqa: BLE001
+                    _send(self, {"error": "failed"}, 500)
+                except Exception:
                     pass
-            return None
-        for n in names:
-            v = getattr(raw, n, None)
-            if v is not None:
-                try:
-                    if test(v):
-                        return v
-                except Exception:                # noqa: BLE001
-                    pass
-        return None
+                return
+        return og(self)
 
-    def seal(self, event, detail, api_key=None):
-        """
-        MUST NOT be called while holding self.lock. The platform's own seal
-        takes that same lock, and it is a plain Lock rather than a reentrant
-        one, so calling it from inside a held lock deadlocks the request.
-        """
-        if self._seal is None:
-            return {"sealed": False,
-                    "reason": "the platform chain was not reachable from this "
-                              "module"}
+    def do_POST(self):
+        path, q = _split(self)
+        if path.startswith("/v/api/"):
+            _post(self, path, q)
+            return
+        return op(self) if op else None
 
-        ev = {"user_id": "tokensaver", "action": str(event), "amount": 0,
-              "country": "UK", "device_id": "module", "anomaly": 0,
-              "device_risk": 0}
-        now = time.time()
-
-        attempts = (
-            lambda: self._seal(ev, detail, now, api_key),
-            lambda: self._seal(ev, detail, now),
-            lambda: self._seal(event, detail),
-            lambda: self._seal({"event": event, "detail": detail}),
-        )
-        r = None
-        last = None
-        for call in attempts:
-            try:
-                r = call()
-                break
-            except TypeError as e:
-                last = e
-                continue
-            except Exception as e:               # noqa: BLE001
-                return {"sealed": False, "reason": str(e)}
-        if r is None:
-            return {"sealed": False,
-                    "reason": "could not match the chain's seal signature: "
-                              + str(last)}
-
-        if isinstance(r, dict):
-            return r
-        if isinstance(r, str):
-            return {"hash": r}
-        if isinstance(r, (list, tuple)) and r:
-            out = {"hash": str(r[0])}
-            if len(r) > 1 and r[1] is not None:
-                out["block_index"] = r[1]
-            if len(r) > 2 and r[2] is not None:
-                out["key_seq"] = r[2]
-            return out
-        return {"sealed": True}
-
-
-_FALLBACK_LOCK = threading.RLock()
-_FALLBACK_CONN = None
-
-
-def _bridge(raw):
-    """
-    Built fresh every call on purpose. Caching it by id() is unsafe:
-    Python recycles ids once an object is collected, so a cached bridge
-    can end up serving a different request's context.
-    """
-    if isinstance(raw, _Bridge):
-        return raw
-    return _Bridge(raw)
+    cls.do_GET = do_GET
+    if op:
+        cls.do_POST = do_POST
+    cls._studio4_patched = True
+    _patched = True
+    return True
 
 
 def handle(method, action, data, api_key, ctx):
-    ctx = _bridge(ctx)
-    _init(ctx)
-    data = data or {}
-    now = time.time()
-
-    if method == "GET" and action == "spec":
-        sp = _a_spec()
-        if ctx.notes:
-            sp["wiring_notes"] = ctx.notes
-        return sp, 200
-    if method == "GET" and action == "stats":
-        return _a_stats(ctx)
-    if method == "GET" and action == "verify":
-        return _a_verify(ctx, data)
-
-    if not api_key:
-        return {"error": "key_required"}, 401
-
-    if method == "POST" and action == "estimate":
-        return _a_estimate(ctx, api_key, data, now)
-    if method == "POST" and action == "gate":
-        return _a_gate(ctx, api_key, data, now)
-    if method == "POST" and action == "record":
-        return _a_record(ctx, api_key, data, now)
-    if method == "GET" and action == "ledger":
-        return _a_ledger(ctx, api_key, data, now)
-    if method == "POST" and action == "budget":
-        return _a_budget(ctx, api_key, data, now)
-    if method == "POST" and action == "prices":
-        return _a_prices(ctx, api_key, data, now)
-    if method == "POST" and action == "forget":
-        return _a_forget(ctx, api_key, data, now)
-
-    return {"error": "unknown_action",
-            "actions": ["spec", "stats", "verify", "estimate", "gate",
-                        "record", "ledger", "budget", "prices", "forget"]}, 404
+    armed = _install(ctx)
+    d, persistent = _storage()
+    counts = {}
+    if "conn" in _ctx:
+        with _ctx["lock"]:
+            c = _ctx["conn"]
+            counts = {"live_videos": c.execute("SELECT COUNT(*) FROM studio_video WHERE status='live'").fetchone()[0],
+                      "paid_views": c.execute("SELECT COALESCE(SUM(unlocks),0) FROM studio_video").fetchone()[0],
+                      "creator_earnings_pence": c.execute("SELECT COALESCE(SUM(earned),0) FROM studio_video").fetchone()[0],
+                      "reports": c.execute("SELECT COUNT(*) FROM studio_report").fetchone()[0]}
+    try:
+        free_gb = round(shutil.disk_usage(d).free / 1073741824, 1)
+    except Exception:
+        free_gb = None
+    stripe = False
+    try:
+        stripe = bool(_credits()._stripe_key())
+    except Exception:
+        pass
+    return {"module": "studio", "version": VERSION, "armed": armed,
+            "serves": ["/create", "/v/<id>", "/v/api/*"],
+            "storage": {"folder": d, "survives_redeploys": persistent, "free_gb": free_gb},
+            "payments_ready": stripe, "packs_pence": PACKS,
+            "viewer_pays": {str(p): _charge(p) for p in PACKS}, "prices_pence": list(PRICES),
+            "max_upload_mb": MAX_BYTES // 1048576, "monthly_fee_pence": MONTHLY_FEE,
+            "creator_share": SHARE, "counts": counts,
+            "create": SITE + "/create", "wing": SITE + "/cinema?wing=ten"}, 200
 
 ```
