@@ -1,67 +1,59 @@
-# Codebase — part 17 of 49
+# Codebase — part 17 of 50
 
 Contains:
-- `modules/notary.py`
+- `modules/mcp.py`
+- `modules/meter.py`
+- `modules/mutual.py`
+- `modules/network.py`
+- `modules/noexec.py`
 
 
-## `modules/notary.py`
+## `modules/mcp.py`
 
-1663 lines, 101903 bytes
+594 lines, 35400 bytes
 
 ```python
 """
-modules/notary.py  v1.0.0  -  Bitcoin Notary, Forever Proofs, Human Keys in Bitcoin
+modules/mcp.py  v1.0.0  -  sebbi.pro as a connector for Claude, ChatGPT, Cursor and any AI
 
-    Arm:       https://sebbi.pro/x/arm/status
-    Notary:    https://sebbi.pro/bitcoin   (/notary is the existing profile notary, left alone)
-    Receipt:   https://sebbi.pro/n/<code>
-    Forever:   https://sebbi.pro/forever
-    Verifier:  https://sebbi.pro/forever-verify.py
+    Connector URL:  https://sebbi.pro/mcp
+    Arm:            https://sebbi.pro/x/arm/status
 
-THREE THINGS, ONE ENGINE
-------------------------
-1. THE BITCOIN NOTARY. Anyone - a person, a company, another AI governance
-   tool, an auditor - sends a SHA-256 fingerprint and gets back a receipt.
-   Fingerprints are gathered into a Merkle tree every few minutes and the
-   tree's root is committed to Bitcoin through the public OpenTimestamps
-   calendars. Thousands of fingerprints share one Bitcoin commitment, so it
-   costs nothing to run and is free to use. Files are fingerprinted in the
-   visitor's browser; only the 64-character fingerprint is ever sent.
+WHAT IT IS
+----------
+A Model Context Protocol (MCP) server. Someone adds https://sebbi.pro/mcp to
+their AI assistant once, and from then on the assistant can do everything on
+sebbi.pro for them, in conversation:
 
-2. FOREVER PROOFS. Every block on the sebbi.pro chain is included in an
-   hourly checkpoint: the RFC 6962 Merkle root over every chain hash in
-   order (the same root /x/consistency/root serves), committed to Bitcoin.
-   A Forever Proof is a small JSON file - fingerprint, Merkle path, root and
-   the OpenTimestamps proof - that anyone can check against the Bitcoin
-   blockchain with no help from sebbi.pro, in their browser at /forever or
-   with the one-file verifier /forever-verify.py. If sebbi.pro disappeared
-   the proofs would still check.
+  read what sebbi.pro offers and what it costs
+  open an account - after showing the customer the terms and getting a yes,
+      which is sealed into the chain as a receipt nobody can argue with
+  advise on the right setup for their stack and device, with working code
+  fire a test decision and show the sealed block
+  write, check and publish Signal Packs
+  pull a machine-proof report for any decision
+  check a Human Keys proof
+  set up billing with a Stripe link
 
-3. HUMAN KEYS IN BITCOIN. Every Human Keys proof (code, text fingerprint,
-   verdict, time) joins the next Bitcoin batch automatically, and its check
-   page shows the Bitcoin block once confirmed.
+Their AI does the thinking on their account. sebbi.pro only answers the
+requests, through the same routes the website uses: /signup, /api/govern,
+/x/packs/*, /x/dossier/*, /x/humankeys/*, /create-checkout. Nothing here
+bypasses any of them, and no existing file is changed.
 
-THE CHAIN IS NEVER WRITTEN TO
------------------------------
-This module only READS audit_log. It never calls seal(), never inserts,
-updates or deletes a chain row, and never touches anchor.py, ots.py or their
-files. Its own records live in three tables of its own (notary_leaf,
-notary_batch, notary_usage) and its Bitcoin proofs are stored inside
-notary_batch, not in the anchor folder.
+THE AGREEMENT
+-------------
+create_account refuses unless the assistant passes the exact terms_version
+it showed the customer and confirms the customer said yes. The agreement is
+then sealed: terms version, a fingerprint of the email, the company, which
+AI arranged it, and when. The email itself is not written into the chain.
 
-ROUTES  (/x/notary/<action>)
-------
-  GET  status, spec, receipt?code=, lookup?digest=, bundle?code=|block=,
-       hk?code=, checkpoints, ots?batch=                         public
-  POST stamp {digests:[...]|digest, label}                     public (API key = higher limit)
-  POST verify {bundle}                                          public
-  POST run                                                      API key - run the worker now
+TRANSPORT
+---------
+Streamable HTTP, JSON responses. POST /mcp with JSON-RPC 2.0: initialize,
+tools/list, tools/call, ping. GET /mcp returns a short description.
 """
 
-import base64
 import hashlib
-import hmac
-import inspect
 import json
 import os
 import re
@@ -70,1606 +62,2382 @@ import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
-
-try:
-    import forever_verify as FV
-except Exception:  # pragma: no cover - the file sits next to server.py
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    import forever_verify as FV
 
 VERSION = "1.0.0"
+PROTOCOL = "2025-06-18"
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "terms")}
 
-PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "receipt"), ("GET", "lookup"), ("GET", "bundle"),
-          ("GET", "hk"), ("GET", "checkpoints"), ("GET", "codebase"), ("GET", "ots"), ("POST", "stamp"), ("POST", "verify"),
-          ("GET", "")}
-
-
-def _env_list(name, default):
-    v = os.environ.get(name, "").strip()
-    return [x.strip().rstrip("/") for x in v.split(",") if x.strip()] if v else list(default)
-
-
-SUBMIT_CALENDARS = _env_list("NOTARY_CALENDARS", [
-    "https://a.pool.opentimestamps.org",
-    "https://b.pool.opentimestamps.org",
-    "https://finney.calendar.eternitywall.com",
-])
-UPGRADE_CALENDARS = set(_env_list("NOTARY_UPGRADE_CALENDARS", [
-    "https://alice.btc.calendar.opentimestamps.org",
-    "https://bob.btc.calendar.opentimestamps.org",
-    "https://finney.calendar.eternitywall.com",
-    "https://btc.calendar.catallaxy.com",
-    "https://a.pool.opentimestamps.org",
-    "https://b.pool.opentimestamps.org",
-])) | set(SUBMIT_CALENDARS)
-EXPLORERS = _env_list("NOTARY_EXPLORERS", FV.EXPLORERS)
-
-AUTO = os.environ.get("NOTARY_AUTO", "1") == "1"
-TICK = int(os.environ.get("NOTARY_TICK", "30"))
-BATCH_INTERVAL = int(os.environ.get("NOTARY_BATCH_INTERVAL", "600"))
-CHAIN_INTERVAL = int(os.environ.get("NOTARY_CHAIN_INTERVAL", "3600"))
-UPGRADE_INTERVAL = int(os.environ.get("NOTARY_UPGRADE_INTERVAL", "1800"))
-UPGRADE_MIN_AGE = int(os.environ.get("NOTARY_UPGRADE_MIN_AGE", "3600"))
-CAL_TIMEOUT = 15
-CAL_PAUSE = float(os.environ.get("NOTARY_CAL_PAUSE", "0.4"))
-
-MAX_PER_REQUEST = 1000
-DAILY_PUBLIC = 500
-DAILY_KEYED = 100000
-MAX_BATCH = 100000
-MAX_CHAIN = 2000000
-
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-NT_RE = re.compile(r"^NT-[A-Z2-9]{4}-[A-Z2-9]{4}$")
-HK_RE = re.compile(r"^HK-[A-Z2-9]{4}-[A-Z2-9]{4}$")
-ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-SITE = "https://sebbi.pro"
-
-_state = {"ready": False, "pages": False, "inject": False, "worker": False,
-          "last_batch": None, "last_chain": None, "last_upgrade": None, "next_batch_at": None,
-          "last_error": None, "injected": 0}
+_state = {"installed": False, "calls": 0, "accounts": 0, "last_error": None}
+_sessions = {}
 _lock = threading.Lock()
-_work_lock = threading.Lock()
-_EPHEMERAL = secrets.token_bytes(32)
-_batch_cache = {}
-_chain_cache = {"size": -1, "lh": []}
-_cache_lock = threading.Lock()
+
+TERMS_TEXT = """sebbi.pro (AILeash) by Monop Content - service terms for accounts opened through an AI assistant
+
+1. Free trial. Every product is free for 90 days from the day the account is opened. No card is needed to start.
+2. Price after the trial. 50p per unique device per month, billed monthly through Stripe, counted on the real devices that used the API key. There are no tiers and no minimum term.
+3. Human Keys. 50p a month for unlimited proofs for individuals; included for businesses within the per-device price.
+4. Cancelling. Stop using the key or cancel the Stripe subscription at any time. Nothing further is charged.
+5. Your records. Decisions you send are sealed into a tamper-evident chain that cannot be edited afterwards, by you or by us. Personal details should be sent as pseudonymous identifiers.
+6. Data protection. https://sebbi.pro/data-protection
+7. Full terms of service. https://sebbi.pro/terms - these points summarise them; the full terms apply.
+8. Agreement. Opening an account confirms you have read and accept these terms and the full terms of service. The agreement is sealed into the chain with the date, the version of these terms and the AI assistant that arranged it."""
+
+TERMS_VERSION = hashlib.sha256(TERMS_TEXT.encode("utf-8")).hexdigest()[:16]
+
+PRODUCTS = [
+    {"name": "AILeash", "what": "Scores every AI decision about a person (loans, payments, bans) in under 30ms - ALLOW, CHALLENGE or BLOCK - and seals it into a chain nobody can edit. Built for EU AI Act Articles 9, 12, 13 and 14.", "url": "https://sebbi.pro/#products"},
+    {"name": "Sentinel", "what": "Fraud and anomaly alerts with sealed evidence, emailed the moment something looks wrong.", "url": "https://sebbi.pro/sentinel"},
+    {"name": "Guardian", "what": "Child-safety engine for apps with young users: grooming-pattern flagging and a sealed duty-of-care record for the Online Safety Act.", "url": "https://sebbi.pro/guardian-parent"},
+    {"name": "SonicBoom", "what": "One line of code adds an audit record to every call to OpenAI, Anthropic, AWS, Azure or Google.", "url": "https://sebbi.pro/sonicboom"},
+    {"name": "Sebdog", "what": "The same engine on the customer's own hardware. No data leaves the building.", "url": "https://sebbi.pro/#onprem"},
+    {"name": "Token Saver", "what": "Cuts the AI model bill: never pays twice for the same answer and stops runaway agents.", "url": "https://sebbi.pro/tokensaver"},
+    {"name": "Signal Packs", "what": "Custom rules on top of the engine, written in plain English and published to an open library.", "url": "https://sebbi.pro/build"},
+    {"name": "Human Keys", "what": "Proof a human typed something, live - for review sign-offs and anything that must not be AI-written.", "url": "https://sebbi.pro/keys"},
+    {"name": "Machine-proof report", "what": "Everything about one decision - who, why, where from - proven unchanged, ready for an auditor.", "url": "https://sebbi.pro/dossier"},
+    {"name": "Agent Passport", "what": "Signed, single-use permission for one AI agent action, checkable offline by the site being acted on.", "url": "https://sebbi.pro/passport"},
+]
+
+GOALS = [
+    (("loan", "credit", "insur", "bank", "fintech", "payment", "refund", "approve", "decision", "hiring", "recruit", "ban"), ["AILeash", "Machine-proof report", "Human Keys"]),
+    (("fraud", "scam", "chargeback", "bot", "takeover"), ["Sentinel", "AILeash"]),
+    (("child", "kid", "teen", "school", "game", "chat app", "social"), ["Guardian"]),
+    (("cost", "bill", "token", "spend", "budget", "loop", "agent"), ["Token Saver", "Signal Packs"]),
+    (("hospital", "nhs", "council", "defence", "defense", "on-prem", "on prem", "air-gap", "sovereign"), ["Sebdog"]),
+    (("openai", "anthropic", "claude", "gpt", "aws", "azure", "gemini", "llm"), ["SonicBoom", "AILeash"]),
+    (("review", "sign-off", "sign off", "human", "oversight", "article 14"), ["Human Keys", "AILeash"]),
+    (("audit", "regulator", "evidence", "court", "insurer", "compliance"), ["Machine-proof report", "AILeash"]),
+    (("agent", "autonomous", "mcp"), ["Agent Passport", "Token Saver"]),
+]
+
+EV = {"user_id": "customer-42", "action": "refund", "amount": 120, "country": "UK",
+      "device_id": "web-7f3a", "anomaly": 0.1, "device_risk": 0.05}
 
 
-# ---------------------------------------------------------------------------
-# plumbing
-# ---------------------------------------------------------------------------
+def _snippet(stack, key):
+    k = key or "YOUR_API_KEY"
+    ev = json.dumps(EV)
+    s = (stack or "").lower()
+    if any(w in s for w in ("lovable", "bolt", "replit", "cursor", "v0", "webflow", "framer", "no code app", "website", "site")):
+        return "prompt", ("Before any important action in this app happens (a payment, refund, account change, approval or anything an AI decides), "
+                          "send it to sebbi.pro to be scored and sealed.\n1. Store this secret as SEBBI_API_KEY: %s\n"
+                          "2. Create a server-side function that POSTs JSON to https://sebbi.pro/api/govern with the header "
+                          "\"Authorization: Bearer <SEBBI_API_KEY>\" and the fields user_id, action, amount, country (2-letter), "
+                          "device_id, anomaly (0-1, 0 if unknown), device_risk (0-1, 0 if unknown).\n"
+                          "3. ALLOW: carry on. CHALLENGE: ask the user to confirm or send it to a person. BLOCK: stop and show \"This action needs review\".\n"
+                          "4. Save audit_hash and block_index from the reply next to the record.\n"
+                          "5. Never put the key in browser code." % k)
+    if any(w in s for w in ("zapier", "make.com", "make ", "n8n", "no-code", "nocode", "automation")):
+        return "settings", ("Method: POST\nURL: https://sebbi.pro/api/govern\nHeaders: Authorization = Bearer %s ; Content-Type = application/json\n"
+                            "Body (JSON): %s\nThen add a filter/condition: continue only when decision equals ALLOW." % (k, ev))
+    if any(w in s for w in ("node", "javascript", "typescript", "js", "next", "deno", "bun", "edge")):
+        return "node", ("const res = await fetch(\"https://sebbi.pro/api/govern\", {\n  method: \"POST\",\n"
+                        "  headers: { Authorization: \"Bearer %s\", \"Content-Type\": \"application/json\" },\n"
+                        "  body: JSON.stringify(%s)\n});\nconst verdict = await res.json(); // ALLOW | CHALLENGE | BLOCK\n"
+                        "if (verdict.decision === \"BLOCK\") throw new Error(\"blocked for review\");" % (k, ev))
+    if any(w in s for w in ("curl", "shell", "bash", "any language", "other")):
+        return "curl", ("curl -s https://sebbi.pro/api/govern -H \"Authorization: Bearer %s\" "
+                        "-H \"Content-Type: application/json\" -d '%s'" % (k, ev))
+    return "python", ("import json, urllib.request\n\ndef sebbi(event):\n    req = urllib.request.Request(\"https://sebbi.pro/api/govern\",\n"
+                      "        data=json.dumps(event).encode(),\n        headers={\"Authorization\": \"Bearer %s\", \"Content-Type\": \"application/json\"})\n"
+                      "    return json.load(urllib.request.urlopen(req, timeout=5))\n\nverdict = sebbi(%s)\n"
+                      "if verdict[\"decision\"] == \"BLOCK\":\n    raise PermissionError(\"blocked for review\")" % (k, ev))
+
+
+# ---------------------------------------------------------------------
+# calling the site's own routes
+# ---------------------------------------------------------------------
 
 def _srv():
     m = sys.modules.get("__main__")
-    if not hasattr(m, "get_bearer"):
+    if not hasattr(m, "Handler"):
         m = sys.modules.get("server")
     return m
 
 
-def _secret():
-    s = os.environ.get("LICENCE_SECRET") or ""
-    return s.encode() if s else _EPHEMERAL
-
-
-def _iso(ts):
+def _local(method, path, body=None, key=None, ip=None):
+    port = getattr(_srv(), "PORT", None) or int(os.environ.get("PORT", 8080))
+    headers = {"Content-Type": "application/json", "User-Agent": "sebbi-mcp/" + VERSION}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    if ip:
+        headers["X-Forwarded-For"] = ip
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers=headers, method=method)
     try:
-        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception:
-        return None
-
-
-def _db(sql, args=(), one=False, many=False, write=False):
-    s = _srv()
-    with s._db_lock:
-        if many:
-            s._conn.executemany(sql, args)
-            s._conn.commit()
-            return None
-        cur = s._conn.execute(sql, args)
-        if write:
-            s._conn.commit()
-            return cur.lastrowid
-        return cur.fetchone() if one else cur.fetchall()
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except Exception:
+            return e.code, {"error": "http_%d" % e.code}
+    except Exception as e:
+        return 502, {"error": "unreachable", "detail": str(e)[:160]}
 
 
 def _setup():
     s = _srv()
     with s._db_lock:
-        c = s._conn
-        c.execute("CREATE TABLE IF NOT EXISTS notary_leaf("
-                  "code TEXT PRIMARY KEY, kind TEXT, digest TEXT, leaf TEXT, label TEXT,"
-                  "submitted REAL, who TEXT, batch_id INTEGER, leaf_index INTEGER)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_notary_digest ON notary_leaf(digest)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_notary_batch ON notary_leaf(batch_id, leaf_index)")
-        c.execute("CREATE TABLE IF NOT EXISTS notary_batch("
-                  "id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, created REAL, size INTEGER, root TEXT,"
-                  "chain_size INTEGER, state TEXT, calendars INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0,"
-                  "last_try REAL, ots BLOB, btc_height INTEGER, btc_hash TEXT, btc_time INTEGER,"
-                  "btc_checked TEXT, confirmed_at REAL)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_notary_batch_kind ON notary_batch(kind, chain_size)")
-        c.execute("CREATE TABLE IF NOT EXISTS notary_usage(who TEXT, day TEXT, n INTEGER, PRIMARY KEY(who, day))")
-        c.execute("CREATE TABLE IF NOT EXISTS notary_code(path TEXT, digest TEXT, code TEXT, first_seen REAL,"
-                  "PRIMARY KEY(path, digest))")
-        c.execute("CREATE TABLE IF NOT EXISTS notary_snapshot(id INTEGER PRIMARY KEY AUTOINCREMENT, created REAL,"
-                  "digest TEXT UNIQUE, code TEXT, files INTEGER, manifest TEXT)")
-        c.commit()
-
-
-def _caller_ip():
-    """The router does not hand modules the request, so find it on the stack."""
-    f = inspect.currentframe()
-    try:
-        for _ in range(12):
-            f = f.f_back
-            if f is None:
-                break
-            h = f.f_locals.get("h") or f.f_locals.get("self")
-            if h is not None and hasattr(h, "headers") and hasattr(h, "client_address"):
-                try:
-                    xff = h.headers.get("X-Forwarded-For", "")
-                    if xff:
-                        return xff.split(",")[0].strip()[:64]
-                    return str(h.client_address[0])[:64]
-                except Exception:
-                    return "unknown"
-    finally:
-        del f
-    return "unknown"
-
-
-def _original_body(key):
-    """The router turns {"a": [x, y]} into {"a": x} when the first value is a list.
-    Find the body as it arrived, so a list of fingerprints is never cut to one."""
-    f = inspect.currentframe()
-    try:
-        for _ in range(15):
-            f = f.f_back
-            if f is None:
-                break
-            for name in ("body", "data"):
-                v = f.f_locals.get(name)
-                if isinstance(v, dict) and isinstance(v.get(key), list):
-                    return v
-    finally:
-        del f
-    return None
-
-
-def _who(api_key, ip):
-    if api_key:
-        return "key:" + hashlib.sha256(api_key.encode()).hexdigest()[:20]
-    return "ip:" + hmac.new(_secret(), (ip or "unknown").encode(), hashlib.sha256).hexdigest()[:20]
-
-
-def _new_code(prefix="NT"):
-    raw = secrets.token_bytes(8)
-    chars = "".join(ALPHABET[b % len(ALPHABET)] for b in raw)
-    return "%s-%s-%s" % (prefix, chars[:4], chars[4:8])
-
-
-def _clean_label(v):
-    t = re.sub(r"[\x00-\x1f\x7f<>]", "", str(v or "")).strip()
-    return t[:80] or None
-
-
-# ---------------------------------------------------------------------------
-# taking fingerprints in
-# ---------------------------------------------------------------------------
-
-def stamp(digests, label=None, api_key=None, ip=None):
-    """Accept fingerprints for the next Bitcoin batch. Returns (payload, status)."""
-    if isinstance(digests, str):
-        digests = [digests]
-    if not isinstance(digests, list) or not digests:
-        return {"error": "digests_required",
-                "message": "Send {\"digests\": [\"<64 hex SHA-256>\", ...]} or {\"digest\": \"...\"}."}, 400
-    if len(digests) > MAX_PER_REQUEST:
-        return {"error": "too_many", "limit": MAX_PER_REQUEST}, 413
-    clean = []
-    for d in digests:
-        d = str(d or "").strip().lower()
-        if not HEX64.match(d):
-            return {"error": "bad_digest", "digest": d[:80],
-                    "message": "Each fingerprint must be a SHA-256: 64 hex characters."}, 400
-        clean.append(d)
-    who = _who(api_key, ip)
-    day = time.strftime("%Y-%m-%d", time.gmtime())
-    cap = DAILY_KEYED if api_key else DAILY_PUBLIC
-    row = _db("SELECT n FROM notary_usage WHERE who=? AND day=?", (who, day), one=True)
-    used = row[0] if row else 0
-    if used + len(clean) > cap:
-        return {"error": "daily_limit", "limit_per_day": cap, "used_today": used,
-                "message": "Free daily limit reached. An API key from https://sebbi.pro/connect raises it to %d a day." % DAILY_KEYED}, 429
-    label = _clean_label(label)
-    now = time.time()
-    rows, out = [], []
-    for d in clean:
-        code = _new_code()
-        rows.append((code, "hash", d, FV.notary_leaf(d), label, now, who))
-        out.append({"code": code, "digest": d, "receipt": "%s/n/%s" % (SITE, code)})
-    s = _srv()
-    with s._db_lock:
-        s._conn.executemany("INSERT INTO notary_leaf(code,kind,digest,leaf,label,submitted,who) VALUES(?,?,?,?,?,?,?)", rows)
-        s._conn.execute("INSERT INTO notary_usage(who,day,n) VALUES(?,?,?) ON CONFLICT(who,day) DO UPDATE SET n=n+?",
-                        (who, day, len(clean), len(clean)))
+        s._conn.execute("CREATE TABLE IF NOT EXISTS mcp_agreement(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        "email_fp TEXT, company TEXT, terms_version TEXT, agent TEXT, agreed_at REAL,"
+                        "block_index INTEGER, audit_hash TEXT, key_fp TEXT)")
         s._conn.commit()
-    nb = _state.get("next_batch_at")
-    return {"ok": True, "received": len(out), "receipts": out, "label": label,
-            "next_batch_utc": _iso(nb) if nb else None,
-            "what_happens": "Your fingerprints join the next Bitcoin batch (every %d minutes). The batch root is "
-                            "committed to Bitcoin through OpenTimestamps and confirms in a Bitcoin block, normally "
-                            "within a few hours. Each receipt then gives a Forever Proof anyone can check against "
-                            "Bitcoin without sebbi.pro." % max(1, BATCH_INTERVAL // 60)}, 200
 
 
-def _sweep_humankeys(limit=5000):
-    """Every Human Keys proof joins the Bitcoin batches. Reads humankeys_proof only."""
-    try:
-        rows = _db("SELECT code,text_hash,verdict,sealed_at FROM humankeys_proof "
-                   "WHERE code NOT IN (SELECT code FROM notary_leaf) LIMIT ?", (limit,))
-    except Exception:
-        return 0
-    add = []
-    for code, th, verdict, sealed_at in rows:
-        if not code or not th:
-            continue
-        add.append((code, "humankeys", th, FV.humankeys_leaf(code, th, verdict or "", sealed_at or 0),
-                    None, time.time(), "humankeys"))
-    if add:
-        _db("INSERT OR IGNORE INTO notary_leaf(code,kind,digest,leaf,label,submitted,who) VALUES(?,?,?,?,?,?,?)",
-            add, many=True)
-    return len(add)
+# ---------------------------------------------------------------------
+# tools
+# ---------------------------------------------------------------------
+
+def _str(v, n=200):
+    return str(v or "").strip()[:n]
 
 
-# ---------------------------------------------------------------------------
-# batches
-# ---------------------------------------------------------------------------
-
-def _make_batch():
-    rows = _db("SELECT code, leaf FROM notary_leaf WHERE batch_id IS NULL ORDER BY submitted, rowid LIMIT ?",
-               (MAX_BATCH,))
-    if not rows:
-        return None
-    lh = [FV.leaf_hash(r[1]) for r in rows]
-    root = FV.merkle_root_of(lh).hex()
-    s = _srv()
-    with s._db_lock:
-        cur = s._conn.execute("INSERT INTO notary_batch(kind,created,size,root,state) VALUES('notary',?,?,?,'new')",
-                              (time.time(), len(rows), root))
-        bid = cur.lastrowid
-        s._conn.executemany("UPDATE notary_leaf SET batch_id=?, leaf_index=? WHERE code=? AND batch_id IS NULL",
-                            [(bid, i, r[0]) for i, r in enumerate(rows)])
-        s._conn.commit()
-    _state["last_batch"] = {"batch": bid, "size": len(rows), "root": root, "utc": _iso(time.time())}
-    return bid
-
-
-def _chain_hashes():
-    """Every chain hash in write order, as leaf hashes. Read only."""
-    n = _db("SELECT COUNT(*) FROM audit_log", one=True)[0]
-    with _cache_lock:
-        have = _chain_cache["size"]
-        if have == n:
-            return _chain_cache["lh"]
-    if n > MAX_CHAIN:
-        raise RuntimeError("chain holds %d blocks, above the %d cap" % (n, MAX_CHAIN))
-    if 0 < have < n:
-        # append-only: read just the new blocks
-        rows = _db("SELECT audit_hash FROM audit_log ORDER BY id ASC LIMIT -1 OFFSET ?", (have,))
-        lh = _chain_cache["lh"] + [FV.leaf_hash(str(r[0])) for r in rows]
-    else:
-        rows = _db("SELECT audit_hash FROM audit_log ORDER BY id ASC")
-        lh = [FV.leaf_hash(str(r[0])) for r in rows]
-    with _cache_lock:
-        _chain_cache["size"] = len(lh)
-        _chain_cache["lh"] = lh
-    return lh
-
-
-def _make_chain_checkpoint():
-    lh = _chain_hashes()
-    n = len(lh)
-    if n == 0:
-        return None
-    last = _db("SELECT MAX(chain_size) FROM notary_batch WHERE kind='chain'", one=True)
-    if last and last[0] and last[0] >= n:
-        return None
-    root = FV.merkle_root_of(lh).hex()
-    bid = _db("INSERT INTO notary_batch(kind,created,size,root,chain_size,state) VALUES('chain',?,?,?,?,'new')",
-              (time.time(), n, root, n), write=True)
-    _state["last_chain"] = {"batch": bid, "chain_size": n, "root": root, "utc": _iso(time.time())}
-    return bid
-
-
-def _http(method, url, body=None):
-    req = urllib.request.Request(url, data=body, method=method,
-                                 headers={"Accept": "application/vnd.opentimestamps.v1",
-                                          "User-Agent": "sebbi.pro-notary/" + VERSION})
-    with urllib.request.urlopen(req, timeout=CAL_TIMEOUT) as r:
-        return r.status, r.read(65536)
-
-
-def _submit(bid):
-    row = _db("SELECT root, attempts FROM notary_batch WHERE id=?", (bid,), one=True)
-    if not row:
-        return False
-    root = bytes.fromhex(row[0])
-    ts = FV.Timestamp(root)
-    got = 0
-    for cal in SUBMIT_CALENDARS:
-        try:
-            st, raw = _http("POST", cal + "/digest", root)
-            if st == 200 and raw:
-                ts.merge(FV.Timestamp.from_bytes(raw, root))
-                got += 1
-        except Exception:
-            pass
-        time.sleep(CAL_PAUSE)
-    if got:
-        blob = FV.serialize_detached(root, ts)
-        _db("UPDATE notary_batch SET state='pending', calendars=?, ots=?, last_try=?, attempts=attempts+1 WHERE id=?",
-            (got, blob, time.time(), bid), write=True)
-        return True
-    _db("UPDATE notary_batch SET attempts=attempts+1, last_try=? WHERE id=?", (time.time(), bid), write=True)
-    return False
-
-
-def _explorer_check(height, merkle_root):
-    agreed, when, bhash = [], None, None
-    for base in EXPLORERS:
-        try:
-            b = FV.block_from_explorer(base, height)
-        except Exception:
-            continue
-        if b["merkle_root"] == merkle_root:
-            agreed.append(base)
-            when = b.get("time")
-            bhash = b.get("hash")
-        else:
-            return None, None, None, "explorer %s disagrees" % base
-    return agreed, when, bhash, None
-
-
-def _upgrade(bid):
-    row = _db("SELECT ots, state, btc_checked FROM notary_batch WHERE id=?", (bid,), one=True)
-    if not row or not row[0]:
-        return None
-    _, digest, ts = FV.parse_detached(bytes(row[0]))
-    merged = 0
-    if row[1] != "confirmed":
-        for node in list(ts.nodes()):
-            for tag, payload in list(node.attestations):
-                d = FV.describe_attestation(tag, payload)
-                if d["kind"] != "pending":
-                    continue
-                uri = d["calendar"].rstrip("/")
-                if uri not in UPGRADE_CALENDARS:
-                    continue
-                try:
-                    st, raw = _http("GET", uri + "/timestamp/" + node.msg.hex())
-                    if st == 200 and raw:
-                        node.merge(FV.Timestamp.from_bytes(raw, node.msg))
-                        merged += 1
-                except Exception:
-                    pass  # not ready yet is the normal answer
-                time.sleep(CAL_PAUSE)
-    summ = FV.summarise(ts)
-    blob = FV.serialize_detached(digest, ts) if merged else None
-    if summ["bitcoin"]:
-        b = summ["bitcoin"][0]
-        agreed, when, bhash, why = _explorer_check(b["height"], b["merkle_root"])
-        if why:
-            _state["last_error"] = "batch %d: %s" % (bid, why)
-            if blob:
-                _db("UPDATE notary_batch SET ots=?, last_try=? WHERE id=?", (blob, time.time(), bid), write=True)
-            return "disputed"
-        _db("UPDATE notary_batch SET state='confirmed', ots=COALESCE(?, ots), btc_height=?, btc_hash=?, btc_time=?, "
-            "btc_checked=?, confirmed_at=COALESCE(confirmed_at, ?), last_try=? WHERE id=?",
-            (blob, b["height"], bhash, when, json.dumps(agreed) if agreed else None, time.time(), time.time(), bid),
-            write=True)
-        with _cache_lock:
-            _batch_cache.pop(bid, None)
-        return "confirmed"
-    if blob:
-        _db("UPDATE notary_batch SET ots=?, last_try=? WHERE id=?", (blob, time.time(), bid), write=True)
-    else:
-        _db("UPDATE notary_batch SET last_try=? WHERE id=?", (time.time(), bid), write=True)
-    return "pending"
-
-
-# ---------------------------------------------------------------------------
-# sebbi.pro's own code: every file sealed into Bitcoin
-# ---------------------------------------------------------------------------
-
-CODE_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-CODE_INTERVAL = int(os.environ.get("NOTARY_CODE_INTERVAL", "21600"))
-CODE_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".cache", ".pytest_cache"}
-CODE_SKIP_SUFFIX = (".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3", ".pem", ".key", ".pyc", ".log", ".tmp", ".ots")
-CODE_MAX_BYTES = 25 * 1024 * 1024
-
-
-def _code_files():
-    """Every file of the running codebase, as (relative path, sha256). Secrets and data are never read."""
-    skip_roots = set()
-    for v in (os.environ.get("DB_PATH"), os.environ.get("ANCHOR_DIR")):
-        if v:
-            d = os.path.abspath(v if os.path.isdir(v) else os.path.dirname(v))
-            if d != CODE_ROOT:
-                skip_roots.add(d)
-    out = []
-    for dirpath, dirnames, filenames in os.walk(CODE_ROOT):
-        a = os.path.abspath(dirpath)
-        dirnames[:] = sorted(d for d in dirnames
-                             if d not in CODE_SKIP_DIRS and os.path.join(a, d) not in skip_roots)
-        for fn in sorted(filenames):
-            low = fn.lower()
-            if low.startswith(".env") or low.endswith(CODE_SKIP_SUFFIX):
-                continue
-            full = os.path.join(a, fn)
-            try:
-                if os.path.islink(full) or os.path.getsize(full) > CODE_MAX_BYTES:
-                    continue
-                h = hashlib.sha256()
-                with open(full, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(1 << 20), b""):
-                        h.update(chunk)
-            except Exception:
-                continue
-            out.append((os.path.relpath(full, CODE_ROOT).replace(os.sep, "/"), h.hexdigest()))
-    out.sort()
-    return out
-
-
-def seal_codebase():
-    """Fingerprint every file of sebbi.pro's code and send any new or changed file to the next Bitcoin batch,
-    plus one snapshot of the whole codebase in sha256sum format. Returns a summary."""
-    files = _code_files()
-    if not files:
-        return {"files": 0}
-    known = {(r[0], r[1]) for r in _db("SELECT path, digest FROM notary_code")}
-    now = time.time()
-    leaves, codes = [], []
-    for path, d in files:
-        if (path, d) in known:
-            continue
-        code = _new_code()
-        leaves.append((code, "hash", d, FV.notary_leaf(d), _clean_label("sebbi.pro code: " + path), now, "codebase"))
-        codes.append((path, d, code, now))
-    manifest = "".join("%s  %s\n" % (d, path) for path, d in files)
-    mdig = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
-    snap = None
-    if not _db("SELECT 1 FROM notary_snapshot WHERE digest=?", (mdig,), one=True):
-        snap = _new_code()
-        leaves.append((snap, "hash", mdig, FV.notary_leaf(mdig),
-                       _clean_label("sebbi.pro codebase snapshot: %d files" % len(files)), now, "codebase"))
-    s = _srv()
-    with s._db_lock:
-        if leaves:
-            s._conn.executemany("INSERT INTO notary_leaf(code,kind,digest,leaf,label,submitted,who) VALUES(?,?,?,?,?,?,?)", leaves)
-        if codes:
-            s._conn.executemany("INSERT OR IGNORE INTO notary_code(path,digest,code,first_seen) VALUES(?,?,?,?)", codes)
-        if snap:
-            s._conn.execute("INSERT OR IGNORE INTO notary_snapshot(created,digest,code,files,manifest) VALUES(?,?,?,?,?)",
-                            (now, mdig, snap, len(files), manifest))
-        s._conn.commit()
-    res = {"files": len(files), "new_or_changed": len(codes), "snapshot": snap or "unchanged", "utc": _iso(now)}
-    _state["last_code"] = res
-    return res
-
-
-def codebase(limit=1000):
-    snap = _db("SELECT id,created,digest,code,files FROM notary_snapshot ORDER BY id DESC LIMIT 1", one=True)
-    rows = _db("SELECT c.path, c.digest, c.code, c.first_seen, b.state, b.btc_height FROM notary_code c "
-               "JOIN notary_leaf l ON l.code=c.code LEFT JOIN notary_batch b ON b.id=l.batch_id "
-               "ORDER BY c.path, c.first_seen DESC LIMIT ?", (limit,))
-    seen, files = set(), []
-    for path, d, code, first, st, h in rows:
-        latest = path not in seen
-        seen.add(path)
-        files.append({"path": path, "digest": d, "code": code, "first_sealed_utc": _iso(first), "latest": latest,
-                      "state": {"new": "sending", "pending": "pending", "confirmed": "confirmed"}.get(st, "queued"),
-                      "bitcoin_block": h, "receipt": "%s/n/%s" % (SITE, code)})
-    out = {"what": "Every file of sebbi.pro's own code, fingerprinted and timestamped in Bitcoin. Any change is sealed "
-                   "again, so the history of every file is provable.",
-           "files_sealed": len(seen), "versions_sealed": len(files), "files": files,
-           "check_a_file": SITE + "/bitcoin (Check a file)", "last_run": _state.get("last_code")}
-    if snap:
-        r, _ = receipt(snap[3])
-        out["snapshot"] = {"code": snap[3], "created_utc": _iso(snap[1]), "files": snap[4], "digest": snap[2],
-                           "state": r.get("state"), "bitcoin_block": ((r.get("batch") or {}).get("bitcoin") or {}).get("height"),
-                           "manifest": SITE + "/bitcoin/code/manifest.txt", "receipt": "%s/n/%s" % (SITE, snap[3]),
-                           "recreate": "In a copy of the code: find . -type f ... | sort | xargs sha256sum - the manifest "
-                                       "is one line per file, '<sha256>  <path>', sorted by path."}
-    return out, 200
-
-
-def run_once(force=False):
-    """One pass of the worker: batch, checkpoint, send, upgrade. Never raises."""
-    out = {"batched": None, "checkpoint": None, "sent": 0, "upgraded": {}}
-    if not _work_lock.acquire(blocking=False):
-        return {"busy": True}
-    try:
-        now = time.time()
-        _sweep_humankeys()
-        if force or not _state.get("_next_code") or now >= _state["_next_code"]:
-            try:
-                out["codebase"] = seal_codebase()
-            except Exception as e:
-                _state["last_error"] = "codebase: %s" % str(e)[:200]
-            _state["_next_code"] = now + CODE_INTERVAL
-        if force or not _state.get("next_batch_at") or now >= _state["next_batch_at"]:
-            out["batched"] = _make_batch()
-            _state["next_batch_at"] = now + BATCH_INTERVAL
-        if force or not _state.get("_next_chain") or now >= _state["_next_chain"]:
-            try:
-                out["checkpoint"] = _make_chain_checkpoint()
-            except Exception as e:
-                _state["last_error"] = "checkpoint: %s" % e
-            _state["_next_chain"] = now + CHAIN_INTERVAL
-        for (bid,) in _db("SELECT id FROM notary_batch WHERE state='new' AND (last_try IS NULL OR last_try < ?) "
-                          "ORDER BY id LIMIT 20", (now - (0 if force else 120),)):
-            if _submit(bid):
-                out["sent"] += 1
-        age = 0 if force else UPGRADE_MIN_AGE
-        retry = 0 if force else UPGRADE_INTERVAL
-        for (bid,) in _db("SELECT id FROM notary_batch WHERE ((state='pending' AND created < ?) OR "
-                          "(state='confirmed' AND btc_checked IS NULL)) AND (last_try IS NULL OR last_try < ?) "
-                          "ORDER BY id DESC LIMIT 30", (now - age, now - retry)):
-            out["upgraded"][bid] = _upgrade(bid)
-        _state["last_upgrade"] = {"utc": _iso(time.time()), "result": out["upgraded"]}
-    except Exception as e:
-        _state["last_error"] = "worker: %s" % str(e)[:200]
-        out["error"] = str(e)[:200]
-    finally:
-        _work_lock.release()
-    return out
-
-
-def _worker():
-    time.sleep(min(60, TICK * 2))
-    while True:
-        run_once()
-        time.sleep(TICK)
-
-
-def _start_worker():
-    if _state["worker"] or not AUTO:
-        return
-    _state["worker"] = True
-    if not _state.get("next_batch_at"):
-        _state["next_batch_at"] = time.time() + min(BATCH_INTERVAL, 120)
-    threading.Thread(target=_worker, name="notary", daemon=True).start()
-
-
-# ---------------------------------------------------------------------------
-# proofs
-# ---------------------------------------------------------------------------
-
-def _batch_row(bid):
-    r = _db("SELECT id,kind,created,size,root,chain_size,state,calendars,btc_height,btc_hash,btc_time,btc_checked,ots "
-            "FROM notary_batch WHERE id=?", (bid,), one=True)
-    if not r:
-        return None
-    return {"id": r[0], "kind": r[1], "created": r[2], "size": r[3], "root": r[4], "chain_size": r[5],
-            "state": r[6], "calendars": r[7], "btc_height": r[8], "btc_hash": r[9], "btc_time": r[10],
-            "btc_checked": json.loads(r[11]) if r[11] else None, "ots": bytes(r[12]) if r[12] else None}
-
-
-def _batch_public(b):
-    if not b:
-        return None
-    state = {"new": "sending", "pending": "pending", "confirmed": "confirmed"}.get(b["state"], b["state"])
-    out = {"batch": b["id"], "kind": b["kind"], "created_utc": _iso(b["created"]), "size": b["size"],
-           "root": b["root"], "state": state, "calendars": b["calendars"]}
-    if b["kind"] == "chain":
-        out["chain_size"] = b["chain_size"]
-    if b["btc_height"]:
-        out["bitcoin"] = {"height": b["btc_height"], "block_hash": b["btc_hash"],
-                          "block_time_utc": _iso(b["btc_time"]) if b["btc_time"] else None,
-                          "checked_with": b["btc_checked"],
-                          "explorer": "https://mempool.space/block/%s" % (b["btc_hash"] or b["btc_height"])}
-    return out
-
-
-def _batch_leaves(bid):
-    with _cache_lock:
-        if bid in _batch_cache:
-            return _batch_cache[bid]
-    rows = _db("SELECT leaf FROM notary_leaf WHERE batch_id=? ORDER BY leaf_index", (bid,))
-    lh = [FV.leaf_hash(r[0]) for r in rows]
-    with _cache_lock:
-        if len(_batch_cache) > 32:
-            _batch_cache.clear()
-        _batch_cache[bid] = lh
-    return lh
-
-
-def _bundle(subject, leaf, index, size, path, root, b):
-    summ = FV.summarise(FV.parse_detached(b["ots"])[2]) if b and b["ots"] else None
-    return {
-        "format": "sebbi-forever-proof/1",
-        "what": "Proof that this fingerprint existed before a Bitcoin block was mined. Check it with nothing from "
-                "sebbi.pro: in your browser at https://sebbi.pro/forever or with https://sebbi.pro/forever-verify.py",
-        "issued_utc": _iso(time.time()),
-        "subject": subject,
-        "leaf": leaf,
-        "merkle": {"algorithm": "RFC 6962 SHA-256 (leaf 0x00, node 0x01)", "index": index, "tree_size": size,
-                   "path": [p.hex() for p in path], "root": root},
-        "bitcoin": {"state": (summ or {}).get("state", "sending"),
-                    "heights": [x["height"] for x in (summ or {}).get("bitcoin", [])],
-                    "block_time_utc": _iso(b["btc_time"]) if b and b.get("btc_time") else None,
-                    "calendars": (summ or {}).get("pending", []),
-                    "proof_ots_base64": base64.b64encode(b["ots"]).decode() if b and b["ots"] else None},
-        "batch": _batch_public(b),
-        "verify": {"in_your_browser": SITE + "/forever",
-                   "offline": "python3 forever-verify.py this-file.json",
-                   "verifier": SITE + "/forever-verify.py",
-                   "with_your_own_node": "python3 forever-verify.py this-file.json --node",
-                   "standard_tool": "the proof_ots_base64 field is a standard OpenTimestamps proof of the root"},
-    }
-
-
-def _leaf_record(code):
-    r = _db("SELECT code,kind,digest,leaf,label,submitted,batch_id,leaf_index FROM notary_leaf WHERE code=?",
-            (code,), one=True)
-    if not r:
-        return None
-    return {"code": r[0], "kind": r[1], "digest": r[2], "leaf": r[3], "label": r[4], "submitted": r[5],
-            "batch_id": r[6], "leaf_index": r[7]}
-
-
-def _subject_for(rec):
-    if rec["kind"] == "humankeys":
-        parts = rec["leaf"].split("|")
-        return {"kind": "humankeys", "code": parts[1], "text_hash": parts[2], "verdict": parts[3],
-                "sealed_at": int(parts[4]), "sealed_utc": _iso(int(parts[4])), "check_page": "%s/k/%s" % (SITE, parts[1])}
-    return {"kind": "hash", "code": rec["code"], "digest": rec["digest"], "label": rec["label"],
-            "submitted_utc": _iso(rec["submitted"]), "receipt": "%s/n/%s" % (SITE, rec["code"])}
-
-
-def receipt(code, with_bundle=False):
-    code = str(code or "").strip().upper()
-    if not (NT_RE.match(code) or HK_RE.match(code)):
-        return {"error": "bad_code", "message": "A receipt code looks like NT-7Q2M-X9KD (or HK-... for Human Keys)."}, 400
-    rec = _leaf_record(code)
-    if rec is None and HK_RE.match(code):
-        _sweep_humankeys()
-        rec = _leaf_record(code)
-    if rec is None:
-        return {"error": "not_found", "code": code}, 404
-    subject = _subject_for(rec)
-    out = {"code": code, "subject": subject, "received_utc": _iso(rec["submitted"])}
-    if rec["batch_id"] is None:
-        nb = _state.get("next_batch_at")
-        out.update({"state": "queued", "next_batch_utc": _iso(nb) if nb else None,
-                    "message": "Waiting for the next Bitcoin batch."})
-        return out, 200
-    b = _batch_row(rec["batch_id"])
-    out["batch"] = _batch_public(b)
-    out["state"] = out["batch"]["state"]
-    out["message"] = {"sending": "In a batch, being sent to the Bitcoin calendars.",
-                      "pending": "Committed to the Bitcoin calendars. Waiting for its Bitcoin block - normally a few hours.",
-                      "confirmed": "In Bitcoin. Anyone can check this against the Bitcoin blockchain, with nothing from sebbi.pro."
-                      }.get(out["state"], "")
-    out["forever_proof"] = "%s/x/notary/bundle?code=%s" % (SITE, code)
-    out["verify"] = "%s/forever?code=%s" % (SITE, code)
-    if with_bundle:
-        lh = _batch_leaves(b["id"])
-        path = FV.inclusion_path(lh, rec["leaf_index"])
-        if FV.root_from_path(lh[rec["leaf_index"]], rec["leaf_index"], len(lh), path).hex() != b["root"]:
-            return {"error": "batch_mismatch", "message": "This batch no longer rebuilds to its sealed root."}, 500
-        return _bundle(subject, rec["leaf"], rec["leaf_index"], len(lh), path, b["root"], b), 200
-    return out, 200
-
-
-def chain_proof(block, api_key=None):
-    try:
-        block = int(block)
-    except (TypeError, ValueError):
-        return {"error": "bad_block", "message": "block must be a whole number"}, 400
-    r = _db("SELECT id,audit_hash,api_key,event_json,result_json,prev_hash,ts FROM audit_log WHERE id=?", (block,), one=True)
-    if not r:
-        return {"error": "not_found", "block": block}, 404
-    pos = _db("SELECT COUNT(*) FROM audit_log WHERE id<?", (block,), one=True)[0]
-    rows = _db("SELECT id FROM notary_batch WHERE kind='chain' AND chain_size>? AND state='confirmed' "
-               "ORDER BY chain_size ASC LIMIT 1", (pos,))
-    if not rows:
-        rows = _db("SELECT id FROM notary_batch WHERE kind='chain' AND chain_size>? ORDER BY chain_size ASC LIMIT 1", (pos,))
-    if not rows:
-        nc = _state.get("_next_chain")
-        return {"state": "queued", "block": block, "audit_hash": r[1],
-                "message": "This block joins the next hourly Bitcoin checkpoint.",
-                "next_checkpoint_utc": _iso(nc) if nc else None}, 202
-    b = _batch_row(rows[0][0])
-    lh = _chain_hashes()[:b["chain_size"]]
-    if len(lh) != b["chain_size"] or FV.merkle_root_of(lh).hex() != b["root"]:
-        return {"error": "chain_mismatch",
-                "message": "The chain no longer rebuilds to this checkpoint's root. This should never happen."}, 500
-    path = FV.inclusion_path(lh, pos)
-    subject = {"kind": "chain_block", "block": block, "position": pos, "audit_hash": r[1],
-               "checkpoint_size": b["chain_size"],
-               "meaning": "This chain block - and every block before it - existed before the Bitcoin block below.",
-               "public_check": "%s/x/consistency/root" % SITE}
-    if api_key and r[2] and hmac.compare_digest(str(r[2]), str(api_key)):
-        try:
-            subject["block_content"] = {"prev_hash": r[5], "ts": r[6], "event": json.loads(r[3]), "result": json.loads(r[4])}
-            subject["block_content_note"] = "Yours alone - this key sealed the block. Keep it private. Re-hashing it proves the decision itself."
-        except Exception:
-            pass
-    return _bundle(subject, r[1], pos, len(lh), path, b["root"], b), 200
-
-
-def hk_status(code):
-    code = str(code or "").strip().upper()
-    if not HK_RE.match(code):
-        return {"error": "bad_code"}, 400
-    return receipt(code)
-
-
-def _checkpoints(limit=20):
-    rows = _db("SELECT id FROM notary_batch WHERE kind='chain' ORDER BY id DESC LIMIT ?", (limit,))
-    return [_batch_public(_batch_row(r[0])) for r in rows]
-
-
-def status():
-    def cnt(sql, a=()):
-        try:
-            return _db(sql, a, one=True)[0]
-        except Exception:
-            return None
-    nb = _state.get("next_batch_at")
-    return {"module": "notary", "version": VERSION, "armed": _state["pages"],
-            "pages": {"notary": SITE + "/bitcoin", "forever": SITE + "/forever", "verifier": SITE + "/forever-verify.py"},
-            "fingerprints": cnt("SELECT COUNT(*) FROM notary_leaf WHERE kind='hash'"),
-            "human_keys_anchored": cnt("SELECT COUNT(*) FROM notary_leaf WHERE kind='humankeys' AND batch_id IS NOT NULL"),
-            "waiting_for_next_batch": cnt("SELECT COUNT(*) FROM notary_leaf WHERE batch_id IS NULL"),
-            "batches": cnt("SELECT COUNT(*) FROM notary_batch"),
-            "batches_in_bitcoin": cnt("SELECT COUNT(*) FROM notary_batch WHERE state='confirmed'"),
-            "chain_checkpoints": cnt("SELECT COUNT(*) FROM notary_batch WHERE kind='chain'"),
-            "chain_blocks_in_bitcoin": cnt("SELECT MAX(chain_size) FROM notary_batch WHERE kind='chain' AND state='confirmed'") or 0,
-            "latest_bitcoin_block": cnt("SELECT MAX(btc_height) FROM notary_batch WHERE state='confirmed'"),
-            "next_batch_utc": _iso(nb) if nb else None,
-            "next_batch_in_seconds": max(0, int(nb - time.time())) if nb else None,
-            "batch_every_minutes": BATCH_INTERVAL // 60, "checkpoint_every_minutes": CHAIN_INTERVAL // 60,
-            "code_files_sealed": cnt("SELECT COUNT(DISTINCT path) FROM notary_code"), "code_page": SITE + "/bitcoin/code",
-            "worker": _state["worker"], "ai_connector_tools": bool(_state.get("mcp")), "last_batch": _state["last_batch"], "last_checkpoint": _state["last_chain"],
-            "last_upgrade": _state["last_upgrade"], "price": "Free",
-            "writes_to_chain": False, "last_error": _state["last_error"]}, 200
-
-
-def spec():
-    return {"module": "notary", "version": VERSION,
-            "what": "A free Bitcoin notary for anyone, Forever Proofs for every sebbi.pro chain block, and Human Keys "
-                    "proofs timestamped in Bitcoin.",
-            "fingerprint": "SHA-256 of the file's bytes, 64 lowercase hex. Only the fingerprint is ever sent.",
-            "leaf": {"notary": "sebbi-notary/1|<digest>",
-                     "humankeys": "sebbi-humankeys/1|<code>|<text_hash>|<verdict>|<sealed_at unix>",
-                     "chain_block": "<audit_hash> (the same leaves /x/consistency/root uses)"},
-            "tree": "RFC 6962: leaf = SHA-256(0x00 || leaf), node = SHA-256(0x01 || left || right)",
-            "bitcoin": "Each batch root is submitted to the public OpenTimestamps calendars and upgraded once its "
-                       "Bitcoin transaction confirms. Confirmations are checked against two block explorers.",
-            "forever_proof_format": "sebbi-forever-proof/1 - subject, leaf, merkle {index, tree_size, path, root}, "
-                                    "bitcoin {proof_ots_base64}",
-            "limits": {"per_request": MAX_PER_REQUEST, "per_day_without_key": DAILY_PUBLIC, "per_day_with_key": DAILY_KEYED},
-            "routes": {"stamp": "POST %s/x/notary/stamp {\"digests\": [...], \"label\": \"optional, public\"}" % SITE,
-                       "receipt": "GET %s/x/notary/receipt?code=NT-XXXX-XXXX" % SITE,
-                       "lookup": "GET %s/x/notary/lookup?digest=<sha256>" % SITE,
-                       "bundle": "GET %s/x/notary/bundle?code=NT-XXXX-XXXX | ?block=<chain block>" % SITE,
-                       "human_keys": "GET %s/x/notary/hk?code=HK-XXXX-XXXX" % SITE,
-                       "checkpoints": "GET %s/x/notary/checkpoints" % SITE,
-                       "verify": "POST %s/x/notary/verify {\"bundle\": {...}}" % SITE,
-                       "discovery": "%s/.well-known/sebbi-notary.json" % SITE},
-            "verifier": SITE + "/forever-verify.py",
-            "writes_to_chain": False}, 200
-
-
-def _discovery():
-    return {"name": "sebbi.pro Bitcoin Notary", "version": VERSION,
-            "stamp": SITE + "/x/notary/stamp", "receipt": SITE + "/x/notary/receipt?code={code}",
-            "lookup": SITE + "/x/notary/lookup?digest={sha256}", "bundle": SITE + "/x/notary/bundle?code={code}",
-            "forever_proof_for_chain_block": SITE + "/x/notary/bundle?block={block}",
-            "proof_format": "sebbi-forever-proof/1", "hash": "sha256",
-            "verifier": SITE + "/forever-verify.py", "verify_page": SITE + "/forever",
-            "mcp": SITE + "/mcp", "price": "free", "spec": SITE + "/x/notary/spec"}
-
-
-# ---------------------------------------------------------------------------
-# AI assistants - three tools added to the /mcp connector at runtime.
-# modules/mcp.py itself is not edited; if this module fails to arm, the
-# connector carries on with its own tools exactly as before.
-# ---------------------------------------------------------------------------
-
-MCP_TOOLS = [
-    {"name": "sebbi_notarize",
-     "description": "Timestamp fingerprints (SHA-256, 64 hex) in Bitcoin through sebbi.pro's free notary. Hash the file or "
-                    "text yourself and send only the fingerprint. Returns a receipt code and link for each.",
-     "inputSchema": {"type": "object", "required": ["digests"],
-                     "properties": {"digests": {"type": "array", "items": {"type": "string"}},
-                                    "label": {"type": "string", "description": "Optional public label, up to 80 characters"},
+TOOLS = [
+    {"name": "sebbi_overview",
+     "description": "What sebbi.pro offers: every product, what it does, its page, and the price. Start here.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "sebbi_terms",
+     "description": "The service terms and their version. Show these to the customer in full and get a clear yes before calling sebbi_create_account.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "sebbi_create_account",
+     "description": "Open a sebbi.pro account for the customer and return their API key. Only call after showing sebbi_terms and the customer saying yes. Seals the agreement into the chain.",
+     "inputSchema": {"type": "object", "required": ["email", "terms_version", "customer_agreed"],
+                     "properties": {"name": {"type": "string"}, "email": {"type": "string"},
+                                    "company": {"type": "string"},
+                                    "product": {"type": "string", "enum": ["aileash", "sentinel", "sonicboom", "guardian", "tokensaver"]},
+                                    "devices": {"type": "integer", "description": "Estimated devices; billing uses the real count"},
+                                    "terms_version": {"type": "string", "description": "terms_version from sebbi_terms"},
+                                    "customer_agreed": {"type": "boolean", "description": "true only if the customer read the terms and said yes"}}}},
+    {"name": "sebbi_setup_advice",
+     "description": "Recommend the right sebbi.pro products and give step-by-step setup with working code or a ready prompt, for how the customer builds (Python, Node, Lovable, Zapier, a website builder...) and what they want to achieve.",
+     "inputSchema": {"type": "object", "required": ["stack"],
+                     "properties": {"stack": {"type": "string", "description": "How they build or what they use, e.g. 'Lovable website', 'Python on AWS', 'Zapier'"},
+                                    "goal": {"type": "string", "description": "What they want, e.g. 'prove our loan AI is compliant', 'cut our OpenAI bill'"},
+                                    "device": {"type": "string", "description": "Where they are working from, e.g. 'Android phone', 'Mac'"},
                                     "api_key": {"type": "string"}}}},
-    {"name": "sebbi_notary_receipt",
-     "description": "Where a notary receipt (NT-XXXX-XXXX) or Human Keys code (HK-XXXX-XXXX) stands: queued, sent to "
-                    "Bitcoin, or confirmed in a Bitcoin block - and the link to its Forever Proof.",
+    {"name": "sebbi_test_decision",
+     "description": "Send one real decision through the live engine with the customer's key and show the verdict and the sealed block.",
+     "inputSchema": {"type": "object", "required": ["api_key"],
+                     "properties": {"api_key": {"type": "string"}, "action": {"type": "string"}, "amount": {"type": "number"},
+                                    "country": {"type": "string"}, "user_id": {"type": "string"}}}},
+    {"name": "sebbi_pack_reference",
+     "description": "How Signal Packs are written: the signals, measurements, flags, operators and verdicts. Read before writing a pack.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "sebbi_check_pack",
+     "description": "Check a Signal Pack with the engine's own validator without publishing it.",
+     "inputSchema": {"type": "object", "required": ["pack"], "properties": {"pack": {"type": "object"}}}},
+    {"name": "sebbi_publish_pack",
+     "description": "Publish a Signal Pack to the open library. It is sealed into the chain, dated and credited to its author. Free.",
+     "inputSchema": {"type": "object", "required": ["pack"], "properties": {"pack": {"type": "object"}}}},
+    {"name": "sebbi_list_packs",
+     "description": "Browse the published Signal Pack library.",
+     "inputSchema": {"type": "object", "properties": {"vertical": {"type": "string"}}}},
+    {"name": "sebbi_decision_report",
+     "description": "The machine-proof report for one decision the customer's key sealed: the decision, who sent it, where it came from, and proof it has not changed.",
+     "inputSchema": {"type": "object", "required": ["api_key", "block"],
+                     "properties": {"api_key": {"type": "string"}, "block": {"type": "integer"}}}},
+    {"name": "sebbi_check_human_proof",
+     "description": "Look up a Human Keys code (HK-XXXX-XXXX): whether a human typed the text, live, and when.",
      "inputSchema": {"type": "object", "required": ["code"], "properties": {"code": {"type": "string"}}}},
-    {"name": "sebbi_forever_proof",
-     "description": "A Forever Proof anyone can check against Bitcoin without sebbi.pro: for a notary receipt, a Human "
-                    "Keys code, or any block on the sebbi.pro chain. Give code or block.",
-     "inputSchema": {"type": "object",
-                     "properties": {"code": {"type": "string"}, "block": {"type": "integer"}, "api_key": {"type": "string"}}}},
+    {"name": "sebbi_billing_link",
+     "description": "A secure Stripe link for the customer to add their card and set up the 50p per device subscription.",
+     "inputSchema": {"type": "object", "required": ["email"],
+                     "properties": {"email": {"type": "string"}, "devices": {"type": "integer"},
+                                    "product": {"type": "string"}}}},
+    {"name": "sebbi_verify_chain",
+     "description": "Re-verify sebbi.pro's whole chain and return its height and tip. Anyone can run this.",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
-MCP_NOTE = (" To prove a file, text or decision existed at a point in time, hash it and call sebbi_notarize (free, "
-            "timestamped in Bitcoin); sebbi_forever_proof gives a proof anyone can check against Bitcoin at "
-            "https://sebbi.pro/forever.")
+
+INSTRUCTIONS = ("You are connected to sebbi.pro, which scores and seals AI decisions so they can be proven later. "
+                "To help someone get set up: call sebbi_overview, ask how they build and what they want, then call "
+                "sebbi_setup_advice. Before opening an account, show the full text from sebbi_terms and get a clear yes; "
+                "only then call sebbi_create_account with that terms_version. Give the customer their API key and tell "
+                "them to keep it secret. Offer sebbi_test_decision so they see their first sealed decision, and "
+                "sebbi_billing_link when they want to add a card. Pages you can point them to: https://sebbi.pro/connect, "
+                "https://sebbi.pro/build, https://sebbi.pro/keys, https://sebbi.pro/dossier.")
 
 
-def _install_mcp():
-    if _state.get("mcp"):
-        return True
-    try:
+def _call(name, a, ip, agent):
+    a = a or {}
+    if name == "sebbi_overview":
+        return {"products": PRODUCTS,
+                "price": "Free for 90 days, then 50p per device per month. No tiers, no sales calls.",
+                "start": "Call sebbi_setup_advice with how the customer builds, then sebbi_terms and sebbi_create_account.",
+                "pages": {"connect": "https://sebbi.pro/connect", "build_rules": "https://sebbi.pro/build",
+                          "human_keys": "https://sebbi.pro/keys", "report": "https://sebbi.pro/dossier",
+                          "developers": "https://sebbi.pro/developers"}}, 200
+    if name == "sebbi_terms":
+        return {"terms_version": TERMS_VERSION, "terms": TERMS_TEXT,
+                "how_to_agree": "Show the customer these terms in full. If they say yes, call sebbi_create_account "
+                                "with terms_version '%s' and customer_agreed true." % TERMS_VERSION}, 200
+    if name == "sebbi_create_account":
+        if a.get("customer_agreed") is not True:
+            return {"error": "agreement_needed", "message": "Show the customer sebbi_terms and get a clear yes first."}, 400
+        if _str(a.get("terms_version")) != TERMS_VERSION:
+            return {"error": "terms_changed", "message": "Those are not the current terms. Call sebbi_terms again and show the customer the current version.",
+                    "current_version": TERMS_VERSION}, 409
+        email = _str(a.get("email"), 190).lower()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$", email):
+            return {"error": "invalid_email"}, 400
+        product = _str(a.get("product"), 20).lower() or "aileash"
         try:
-            from modules import mcp as M
-        except Exception:
-            import mcp as M
-    except Exception as e:
-        _state["last_error"] = "mcp: %s" % e
-        return False
-    if getattr(M, "_notary_tools", False):
-        _state["mcp"] = True
-        return True
-    names = {t["name"] for t in M.TOOLS}
-    for t in MCP_TOOLS:
-        if t["name"] not in names:
-            M.TOOLS.append(t)
-    original = M._call
+            devices = max(1, min(1000000, int(a.get("devices") or 1)))
+        except (TypeError, ValueError):
+            devices = 1
+        st, d = _local("POST", "/signup", {"name": _str(a.get("name"), 120), "email": email,
+                                           "org": _str(a.get("company"), 160), "product": product,
+                                           "devices": devices}, ip=ip)
+        if st != 200 or not d.get("api_key"):
+            err = str(d.get("error") or "")
+            if "exists" in err.lower():
+                return {"error": "email_exists",
+                        "message": "An account already exists for this email. The key is in the welcome email sent when it was opened."}, 409
+            return {"error": "signup_failed", "message": err or "The account could not be opened."}, st if st >= 400 else 400
+        key = d["api_key"]
+        s = _srv()
+        ts = time.time()
+        email_fp = hashlib.sha256(email.encode()).hexdigest()
+        key_fp = hashlib.sha256(key.encode()).hexdigest()[:16]
+        receipt = {}
+        try:
+            out = s.seal({"user_id": "agreement", "action": "terms_agreed", "amount": 0, "country": "UK",
+                          "device_id": "mcp", "anomaly": 0, "device_risk": 0},
+                         {"decision": "AGREED", "score": 0, "version": VERSION, "timestamp": ts,
+                          "terms_version": TERMS_VERSION, "email_fingerprint": email_fp,
+                          "company": _str(a.get("company"), 160), "product": product,
+                          "arranged_by": agent or "an AI assistant", "key_fingerprint": key_fp,
+                          "note": "The customer was shown the terms by their AI assistant and agreed."}, ts)
+            receipt = {"block_index": out[1], "audit_hash": out[0],
+                       "check": "https://sebbi.pro/x/walk/block?index=%s" % out[1]}
+            with s._db_lock:
+                s._conn.execute("INSERT INTO mcp_agreement(email_fp,company,terms_version,agent,agreed_at,block_index,audit_hash,key_fp) "
+                                "VALUES(?,?,?,?,?,?,?,?)", (email_fp, _str(a.get("company"), 160), TERMS_VERSION,
+                                                            agent, ts, out[1], out[0], key_fp))
+                s._conn.commit()
+        except Exception as e:
+            _state["last_error"] = "agreement seal: %s" % e
+        _state["accounts"] += 1
+        return {"api_key": key, "product": product, "trial_days": d.get("trial_days", 90),
+                "referral_code": d.get("ref_code"),
+                "agreement": dict(receipt, terms_version=TERMS_VERSION),
+                "tell_the_customer": "Your key is ready and also on its way to your inbox with the install guide. Keep it secret. "
+                                     "Everything is free for 90 days, then 50p per device per month.",
+                "next": "Call sebbi_setup_advice with this api_key for working code, then sebbi_test_decision."}, 200
+    if name == "sebbi_setup_advice":
+        text = " ".join(_str(a.get(k), 300).lower() for k in ("stack", "goal", "device"))
+        picks = []
+        for words, prods in GOALS:
+            if any(w in text for w in words):
+                for p in prods:
+                    if p not in picks:
+                        picks.append(p)
+        if not picks:
+            picks = ["AILeash", "Machine-proof report"]
+        kind, code = _snippet(a.get("stack"), _str(a.get("api_key"), 120) or None)
+        dev = _str(a.get("device"), 80).lower()
+        on_phone = any(w in dev for w in ("phone", "android", "iphone", "ios", "mobile", "tablet"))
+        steps = []
+        if not a.get("api_key"):
+            steps.append("Open an account: show the customer sebbi_terms, get a yes, then call sebbi_create_account.")
+        if kind == "prompt":
+            steps.append("Paste the prompt below into their app builder's chat. It builds a server function that calls sebbi.pro before every important action.")
+        elif kind == "settings":
+            steps.append("Add an HTTP step in their automation tool with the settings below, then a filter so it only continues on ALLOW.")
+        else:
+            steps.append("Add the code below where their app makes a decision about a person, before it acts.")
+        steps.append("Keep the key in a secret or environment variable, never in browser code.")
+        steps.append("Fire sebbi_test_decision to see the first sealed decision.")
+        if "Human Keys" in picks:
+            steps.append("For human sign-offs, reviewers type their reason at https://sebbi.pro/keys and attach the code to the decision.")
+        if "Signal Packs" in picks or "Token Saver" in picks:
+            steps.append("Write custom rules with sebbi_pack_reference and sebbi_publish_pack, or at https://sebbi.pro/build.")
+        if on_phone:
+            steps.append("Everything here works from a phone: the setup page https://sebbi.pro/connect copies each snippet in one tap.")
+        return {"recommended": [p for p in PRODUCTS if p["name"] in picks], "steps": steps,
+                "format": kind, "code_or_prompt": code,
+                "fields": {"user_id": "the person the decision is about (a pseudonymous id)",
+                           "action": "what is happening, e.g. refund, loan_approval, account_ban",
+                           "amount": "money involved, 0 if none", "country": "2-letter country code",
+                           "device_id": "a stable id for the device or session",
+                           "anomaly": "0 to 1, the customer's own anomaly signal, 0 if none",
+                           "device_risk": "0 to 1, the customer's own device risk, 0 if none"},
+                "reply": "decision (ALLOW, CHALLENGE or BLOCK), score, reasons, audit_hash, block_index, receipt_seq"}, 200
+    if name == "sebbi_test_decision":
+        key = _str(a.get("api_key"), 120)
+        if not key:
+            return {"error": "api_key_needed"}, 400
+        ev = dict(EV)
+        ev.update({"action": _str(a.get("action"), 60) or "refund", "user_id": _str(a.get("user_id"), 80) or "customer-42",
+                   "country": (_str(a.get("country"), 2) or "UK").upper(), "device_id": "sebbi-mcp-test"})
+        try:
+            ev["amount"] = float(a.get("amount")) if a.get("amount") is not None else 120
+        except (TypeError, ValueError):
+            pass
+        st, d = _local("POST", "/api/govern", ev, key=key, ip=ip)
+        if st == 200 and d.get("block_index"):
+            d["check_the_block"] = "https://sebbi.pro/x/walk/block?index=%s" % d["block_index"]
+            d["full_report"] = "https://sebbi.pro/dossier?block=%s" % d["block_index"]
+        return d, st
+    if name == "sebbi_pack_reference":
+        st, d = _local("GET", "/x/packs/spec", ip=ip)
+        return {"builder_page": "https://sebbi.pro/build", "example": {
+            "name": "Stop runaway agents", "author": "Your company", "version": "1.0.0", "vertical": "general",
+            "summary": "Catches AI agents stuck in loops before they run up the bill.",
+            "rules": [{"when": "loop_count >= 3 and unattended", "then": "block",
+                       "why": "An unattended agent sending the same request three times is stuck."},
+                      {"when": "burst >= 0.8", "then": "challenge", "why": "A sudden burst looks like a script out of control."}],
+            "default": "allow"}, "spec": d}, 200
+    if name in ("sebbi_check_pack", "sebbi_publish_pack"):
+        if not isinstance(a.get("pack"), dict):
+            return {"error": "pack_needed", "message": "Send the pack as an object. See sebbi_pack_reference."}, 400
+        path = "/x/packs/validate" if name == "sebbi_check_pack" else "/x/packs/publish"
+        st, d = _local("POST", path, {"pack": a["pack"]}, ip=ip)
+        if name == "sebbi_publish_pack" and st == 200:
+            d["library"] = "https://sebbi.pro/packs.html"
+        return d, st
+    if name == "sebbi_list_packs":
+        v = _str(a.get("vertical"), 30)
+        st, d = _local("GET", "/x/packs/list" + ("?vertical=" + v if v else ""), ip=ip)
+        return d, st
+    if name == "sebbi_decision_report":
+        key = _str(a.get("api_key"), 120)
+        try:
+            b = int(a.get("block"))
+        except (TypeError, ValueError):
+            return {"error": "block_number_needed"}, 400
+        st, d = _local("GET", "/x/dossier/report?block=%d" % b, key=key, ip=ip)
+        if st == 200:
+            d["printable"] = "https://sebbi.pro/dossier?block=%d" % b
+        return d, st
+    if name == "sebbi_check_human_proof":
+        code = _str(a.get("code"), 20).upper()
+        st, d = _local("GET", "/x/humankeys/check?code=" + code, ip=ip)
+        return d, st
+    if name == "sebbi_billing_link":
+        email = _str(a.get("email"), 190).lower()
+        try:
+            devices = max(1, int(a.get("devices") or 1))
+        except (TypeError, ValueError):
+            devices = 1
+        st, d = _local("POST", "/create-checkout", {"email": email, "devices": devices,
+                                                    "product": _str(a.get("product"), 20) or "aileash"}, ip=ip)
+        if st == 200:
+            d["tell_the_customer"] = "This secure Stripe page sets up the 50p per device per month subscription. Billing follows the real device count."
+        elif d.get("error") == "stripe_not_configured":
+            d["message"] = "Card payments are not switched on yet; the 90-day free trial carries on as normal."
+        return d, st
+    if name == "sebbi_verify_chain":
+        st, d = _local("GET", "/api/verify-chain", ip=ip)
+        return d, st
+    return {"error": "unknown_tool"}, 404
 
-    def _call(name, a, ip, agent):
-        if name not in ("sebbi_notarize", "sebbi_notary_receipt", "sebbi_forever_proof"):
-            return original(name, a, ip, agent)
-        a = a or {}
-        key = str(a.get("api_key") or "").strip() or None
-        if key and not _srv().get_key(key):
-            key = None
-        if name == "sebbi_notarize":
-            d = a.get("digests") if a.get("digests") is not None else a.get("digest")
-            return stamp(d, a.get("label"), key, ip)
-        if name == "sebbi_notary_receipt":
-            return receipt(a.get("code"))
-        if a.get("block") not in (None, ""):
-            return chain_proof(a.get("block"), key)
-        return receipt(a.get("code"), with_bundle=True)
 
-    M._call = _call
-    if isinstance(getattr(M, "INSTRUCTIONS", None), str) and MCP_NOTE not in M.INSTRUCTIONS:
-        M.INSTRUCTIONS = M.INSTRUCTIONS + MCP_NOTE
-    M._notary_tools = True
-    _state["mcp"] = True
-    return True
+# ---------------------------------------------------------------------
+# JSON-RPC over HTTP
+# ---------------------------------------------------------------------
+
+def _rpc(msg, ip, session):
+    if not isinstance(msg, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+    rid = msg.get("id")
+    method = msg.get("method", "")
+    p = msg.get("params") or {}
+    if method.startswith("notifications/"):
+        return None
+    if method == "initialize":
+        info = p.get("clientInfo") or {}
+        agent = ("%s %s" % (_str(info.get("name"), 60), _str(info.get("version"), 30))).strip() or None
+        with _lock:
+            _sessions[session] = {"agent": agent, "at": time.time()}
+            if len(_sessions) > 5000:
+                for k in sorted(_sessions, key=lambda k: _sessions[k]["at"])[:1000]:
+                    _sessions.pop(k, None)
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": p.get("protocolVersion") or PROTOCOL,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "sebbi.pro", "title": "sebbi.pro - seal every AI decision", "version": VERSION},
+            "instructions": INSTRUCTIONS}}
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": rid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        agent = (_sessions.get(session) or {}).get("agent")
+        try:
+            res, st = _call(p.get("name"), p.get("arguments"), ip, agent)
+        except Exception as e:
+            res, st = {"error": "tool_failed", "detail": str(e)[:200]}, 500
+        _state["calls"] += 1
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "content": [{"type": "text", "text": json.dumps(res, indent=1, default=str)}],
+            "structuredContent": res if isinstance(res, dict) else {"result": res},
+            "isError": st >= 400}}
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found: %s" % method}}
 
 
-# ---------------------------------------------------------------------------
-# pages
-# ---------------------------------------------------------------------------
+def _client_ip(h):
+    xff = h.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()[:64]
+    try:
+        return str(h.client_address[0])
+    except Exception:
+        return None
 
-def _send(h, body, ctype, status=200, extra=None):
-    if isinstance(body, str):
-        body = body.encode("utf-8")
-    h.send_response(status)
-    h.send_header("Content-Type", ctype)
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Cache-Control", "no-store" if ("json" in ctype or "svg" in ctype) else "public, max-age=60")
+
+def _cors(h):
     h.send_header("Access-Control-Allow-Origin", "*")
-    for k, v in (extra or {}).items():
-        h.send_header(k, v)
+    h.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version")
+    h.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
+    h.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+
+
+def _reply(h, status, obj, session=None):
+    body = json.dumps(obj).encode() if obj is not None else b""
+    h.send_response(status)
+    if obj is not None:
+        h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(body)))
+    if session:
+        h.send_header("Mcp-Session-Id", session)
+    _cors(h)
     h.end_headers()
-    if getattr(h, "command", "GET") != "HEAD":
+    if body:
         h.wfile.write(body)
 
 
-def _esc(t):
-    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+INFO = {"name": "sebbi.pro MCP connector", "version": VERSION, "connector_url": "https://sebbi.pro/mcp",
+        "transport": "streamable-http (POST JSON-RPC 2.0)",
+        "add_it": {"Claude": "Settings > Connectors > Add custom connector > paste https://sebbi.pro/mcp",
+                   "Claude Code": "claude mcp add --transport http sebbi https://sebbi.pro/mcp",
+                   "Cursor or VS Code": "one-click from https://sebbi.pro/connect"},
+        "tools": [t["name"] for t in TOOLS]}
 
 
-def _badge(code):
-    rec = _leaf_record(code) if NT_RE.match(code) or HK_RE.match(code) else None
-    b = _batch_row(rec["batch_id"]) if rec and rec["batch_id"] else None
-    if b and b["state"] == "confirmed" and b["btc_height"]:
-        right, colour = "block %d" % b["btc_height"], "#f7931a"
-    elif rec:
-        right, colour = "confirming", "#c9a84c"
-    else:
-        right, colour = "not found", "#9aa0ae"
-    left = "In Bitcoin" if b and b["state"] == "confirmed" else "Bitcoin"
-    w = 250
-    return ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="28" role="img" aria-label="%s %s via sebbi.pro">'
-            '<rect width="%d" height="28" rx="5" fill="#0a0f1e"/><rect x="1" y="1" width="%d" height="26" rx="4" fill="none" stroke="%s" stroke-opacity=".7"/>'
-            '<circle cx="15" cy="14" r="7" fill="%s"/><text x="15" y="18" fill="#0a0f1e" font-family="Verdana,sans-serif" font-size="10" font-weight="bold" text-anchor="middle">B</text>'
-            '<text x="29" y="18" fill="#fff" font-family="Verdana,sans-serif" font-size="11.5" font-weight="bold">%s</text>'
-            '<text x="%d" y="18" fill="%s" font-family="Verdana,sans-serif" font-size="10.5" text-anchor="end">%s · sebbi.pro</text></svg>'
-            % (w, _esc(left), _esc(right), w, w - 2, colour, colour, _esc(left), w - 10, colour, _esc(right)))
-
-
-_HEAD = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,500;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root{--ink:#0a0f1e;--ink2:#10182e;--ink3:#0d1426;--gold:#c9a84c;--gold2:#f0d78a;--btc:#f7931a;--ok:#2fbf71;--ok2:#7fe3b0;--err:#ff8a80;--mut:rgba(255,255,255,.62);--line:rgba(201,168,76,.22);
---sans:'IBM Plex Sans',system-ui,sans-serif;--serif:'Newsreader',Georgia,serif;--mono:'IBM Plex Mono',ui-monospace,monospace}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--ink);color:#fff;font-family:var(--sans);line-height:1.55;-webkit-font-smoothing:antialiased;padding-bottom:env(safe-area-inset-bottom,0)}
-.wrap{max-width:880px;margin:0 auto;padding:0 16px}
-.top{border-bottom:1px solid var(--line);padding:14px 0}.top .wrap{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
-.brand{font-family:var(--mono);font-size:13px;color:#fff;text-decoration:none}.brand b{color:var(--gold);font-weight:500}
-.top nav a{font-family:var(--mono);font-size:12px;color:var(--mut);text-decoration:none;margin-left:14px;white-space:nowrap}@media(max-width:560px){.top nav a:nth-child(n+3){display:none}}.top nav a:hover{color:var(--gold2)}
-.hero{padding:44px 0 10px;position:relative}
-.kick{font-family:var(--mono);font-size:12px;color:var(--btc);letter-spacing:.1em;margin-bottom:12px;display:flex;align-items:center;gap:10px}
-.kick i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--btc);box-shadow:0 0 0 0 rgba(247,147,26,.6);animation:pulse 2s infinite}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(247,147,26,.55)}70%{box-shadow:0 0 0 10px rgba(247,147,26,0)}100%{box-shadow:0 0 0 0 rgba(247,147,26,0)}}
-h1{font-family:var(--serif);font-weight:500;font-size:clamp(36px,7.4vw,64px);line-height:1.02;margin-bottom:14px;letter-spacing:-.01em}h1 em{color:var(--gold);font-style:italic}
-.hero p{color:var(--mut);font-size:17px;max-width:60ch}
-.live{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:26px 0 8px}
-@media(max-width:620px){.live{grid-template-columns:repeat(2,1fr)}}
-.live div{background:var(--ink3);padding:14px 14px 12px}.live b{display:block;font-family:var(--mono);font-size:20px;font-weight:500;color:#fff}.live span{font-size:12px;color:var(--mut)}
-.live b.btc{color:var(--btc)}
-.card{background:var(--ink2);border:1px solid var(--line);border-radius:12px;padding:20px;margin:18px 0}
-.card h2{font-family:var(--serif);font-weight:500;font-size:26px;line-height:1.15;margin-bottom:6px}
-.card p.sub{color:var(--mut);font-size:14.5px;margin-bottom:14px}
-.drop{display:block;border:1.5px dashed rgba(201,168,76,.45);border-radius:12px;padding:30px 16px;text-align:center;cursor:pointer;transition:background .2s,border-color .2s;background:rgba(201,168,76,.03)}
-.drop:hover,.drop.on{background:rgba(201,168,76,.08);border-color:var(--gold)}
-.drop b{display:block;font-family:var(--serif);font-weight:500;font-size:22px;margin-bottom:4px}.drop span{color:var(--mut);font-size:13.5px}
-textarea{width:100%;min-height:110px;background:var(--ink);border:1px solid var(--line);border-radius:8px;color:#fff;padding:12px;font-family:var(--sans);font-size:15.5px;line-height:1.55;resize:vertical;outline:none}
-textarea:focus,input:focus{border-color:var(--gold);outline:none}
-input[type=text],input[type=number]{width:100%;background:var(--ink);border:1px solid var(--line);border-radius:8px;color:#fff;padding:12px;font-family:var(--mono);font-size:14px}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}.row>input{flex:1;min-width:180px}
-.btn{background:var(--gold);color:var(--ink);border:0;border-radius:8px;padding:13px 18px;font-family:var(--mono);font-size:14px;font-weight:500;cursor:pointer;text-decoration:none;display:inline-block;white-space:nowrap}
-.btn.g{background:transparent;color:var(--gold);border:1px solid var(--gold)}.btn.b{background:var(--btc);color:#1a0f00}.btn[disabled]{opacity:.45;cursor:default}
-.tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}.tabs button{background:transparent;border:1px solid var(--line);color:var(--mut);border-radius:20px;padding:7px 14px;font-family:var(--mono);font-size:12.5px;cursor:pointer}
-.tabs button.on{background:var(--gold);color:var(--ink);border-color:var(--gold)}
-.list{margin-top:12px;display:flex;flex-direction:column;gap:6px}
-.it{display:grid;grid-template-columns:1fr auto;gap:4px 10px;background:var(--ink);border:1px solid rgba(255,255,255,.06);border-radius:8px;padding:10px 12px;font-size:13.5px}
-.it .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.it .h{font-family:var(--mono);font-size:11.5px;color:var(--mut);grid-column:1/-1;word-break:break-all}
-.it a{color:var(--gold2);font-family:var(--mono);font-size:12.5px;text-decoration:none}
-.msg{font-family:var(--mono);font-size:13px;margin-top:10px;min-height:1em;color:var(--mut)}.msg.err{color:var(--err)}.msg.ok{color:var(--ok2)}
-.steps{list-style:none;margin-top:14px;border-left:1px solid var(--line);padding-left:18px}
-.steps li{position:relative;padding:8px 0 10px;font-size:14.5px}.steps li:before{content:"";position:absolute;left:-24px;top:13px;width:11px;height:11px;border-radius:50%;background:var(--ink);border:1.5px solid var(--mut)}
-.steps li.ok:before{background:var(--ok);border-color:var(--ok)}.steps li.bad:before{background:var(--err);border-color:var(--err)}.steps li.run:before{border-color:var(--btc);animation:pulse 1.4s infinite}
-.steps li.wait:before{border-color:var(--gold)}
-.steps b{display:block;font-weight:500}.steps span{color:var(--mut);font-size:13px;font-family:var(--mono);word-break:break-all}
-.verdict{margin-top:16px;border-radius:12px;padding:20px;border:1px solid rgba(247,147,26,.55);background:linear-gradient(160deg,rgba(247,147,26,.14),rgba(16,24,46,1) 62%)}
-.verdict.bad{border-color:rgba(255,138,128,.5);background:linear-gradient(160deg,rgba(255,138,128,.10),rgba(16,24,46,1) 60%)}
-.verdict.wait{border-color:rgba(201,168,76,.5);background:linear-gradient(160deg,rgba(201,168,76,.10),rgba(16,24,46,1) 60%)}
-.verdict h3{font-family:var(--serif);font-weight:500;font-size:28px;line-height:1.12;margin-bottom:6px}.verdict p{color:var(--mut);font-size:14.5px}
-.how{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:6px 0 10px}@media(max-width:720px){.how{grid-template-columns:1fr 1fr}}@media(max-width:420px){.how{grid-template-columns:1fr}}
-.how div{border-top:1px solid var(--line);padding-top:10px}.how b{font-family:var(--mono);font-size:12px;color:var(--gold);letter-spacing:.06em}.how p{color:var(--mut);font-size:14px;margin-top:4px}
-pre{background:var(--ink);border:1px solid rgba(255,255,255,.07);border-radius:8px;padding:12px;font-family:var(--mono);font-size:12.5px;color:#e8e8e8;overflow-x:auto;white-space:pre;margin-top:8px}
-.code{font-family:var(--mono);font-size:26px;letter-spacing:.06em;color:var(--gold2)}
-dl{display:grid;grid-template-columns:minmax(110px,170px) 1fr;gap:6px 14px;font-size:14px;margin-top:14px}
-dt{color:var(--mut);font-size:13px}dd{font-family:var(--mono);font-size:13px;word-break:break-all}
-.tl{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:16px}.tl div{border-top:3px solid rgba(255,255,255,.12);padding-top:8px;font-size:12.5px;color:var(--mut)}
-.tl div.on{border-color:var(--btc);color:#fff}.tl div b{display:block;font-family:var(--mono);font-size:11px;letter-spacing:.06em}
-.chain{display:flex;gap:4px;margin:18px 0 0;overflow:hidden;height:34px;mask-image:linear-gradient(90deg,transparent,#000 12%,#000 88%,transparent)}
-.chain span{flex:none;width:34px;height:34px;border:1px solid rgba(247,147,26,.4);border-radius:6px;background:rgba(247,147,26,.06);animation:slide 18s linear infinite}
-@keyframes slide{from{transform:translateX(0)}to{transform:translateX(-380px)}}
-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}td,th{text-align:left;padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.06)}th{color:var(--mut);font-weight:500;font-size:12px}td{font-family:var(--mono);font-size:12.5px}
-a{color:var(--gold2)}
-footer{border-top:1px solid var(--line);margin-top:34px;padding:22px 0 30px;font-size:12.5px;color:var(--mut)}footer a{color:var(--gold);text-decoration:none;margin-right:14px}
-.sr{position:absolute;left:-9999px}
-</style>"""
-
-_TOP = r"""<header class="top"><div class="wrap"><a class="brand" href="/">sebbi<b>.pro</b></a>
-<nav><a href="/bitcoin">Notary</a><a href="/forever">Forever Proof</a><a href="/keys">Human Keys</a><a href="/connect">Connect</a></nav></div></header>"""
-
-_FOOT = r"""<footer><div class="wrap"><a href="/bitcoin">Bitcoin Notary</a><a href="/forever">Forever Proof</a><a href="/forever-verify.py">Verifier</a><a href="/bitcoin/code">Our code in Bitcoin</a><a href="/answers">Answers</a><a href="/standard/forever-proof">Standard</a><a href="/x/notary/spec">Spec</a><a href="/terms">Terms</a>
-<p style="margin-top:12px">&copy; 2026 Monop Content &middot; sebbi.pro</p></div></footer>"""
-
-# The browser verifier. It is the same algorithm as forever_verify.py, written
-# again in JavaScript so a visitor's own browser does the checking.
-_FV_JS = r"""
-const FV=(()=>{
-const MAGIC=unhex('__MAGIC__');
-function hex(b){return Array.from(b,x=>x.toString(16).padStart(2,'0')).join('')}
-function unhex(s){return new Uint8Array((s.match(/../g)||[]).map(h=>parseInt(h,16)))}
-function cat(a,b){const o=new Uint8Array(a.length+b.length);o.set(a);o.set(b,a.length);return o}
-function eq(a,b){return a.length===b.length&&a.every((x,i)=>x===b[i])}
-async function sha(alg,b){return new Uint8Array(await crypto.subtle.digest(alg,b))}
-function R(b){this.b=b;this.i=0}
-R.prototype.take=function(n){if(n<0||this.i+n>this.b.length)throw Error('the proof ends early');const o=this.b.slice(this.i,this.i+n);this.i+=n;return o};
-R.prototype.byte=function(){return this.take(1)[0]};
-R.prototype.vu=function(){let v=0,s=0,b;do{b=this.byte();v+=(b&127)*Math.pow(2,s);s+=7;if(s>56)throw Error('number too long')}while(b&128);return v};
-R.prototype.vb=function(l){const n=this.vu();if(n>l)throw Error('field too long');return this.take(n)};
-const TB='0588960d73d71901',TP='83dfe30d2ef90c8e',OPS=new Set([0x02,0x03,0x08,0x67,0xf0,0xf1,0xf2,0xf3]);
-async function op(t,a,m){
- if(t===0x08)return sha('SHA-256',m);if(t===0x02)return sha('SHA-1',m);
- if(t===0xf0)return cat(m,a);if(t===0xf1)return cat(a,m);if(t===0xf2)return m.slice().reverse();
- if(t===0xf3)return new TextEncoder().encode(hex(m));
- throw Error('this proof uses an operation only the Python verifier checks');}
-async function walk(r,m,out,d,c){
- if(d>256)throw Error('proof nested too deeply');
- const item=async t=>{
-  if(t===0){const tag=hex(r.take(8));const p=new R(r.vb(8192));
-   if(tag===TB)out.push({kind:'bitcoin',height:p.vu(),root:hex(m.slice().reverse())});
-   else if(tag===TP)out.push({kind:'pending',cal:new TextDecoder().decode(p.vb(1000))});
-   else out.push({kind:'other'});return}
-  if(!OPS.has(t))throw Error('unknown tag in proof');
-  const a=(t===0xf0||t===0xf1)?r.vb(4096):null;c.n++;const nm=await op(t,a,m);if(nm.length>4096)throw Error('message grew too long');
-  await walk(r,nm,out,d+1,c)};
- let t=r.byte();while(t===0xff){await item(r.byte());t=r.byte()}await item(t)}
-async function readOts(bytes){const r=new R(bytes);if(!eq(r.take(MAGIC.length),MAGIC))throw Error('not an OpenTimestamps proof');
- if(r.vu()!==1)throw Error('unsupported proof version');const f=r.byte();const n={8:32,2:20,3:20,103:32}[f];if(!n)throw Error('unsupported file hash');
- const dg=r.take(n);const out=[],c={n:0};await walk(r,dg,out,0,c);if(r.i!==bytes.length)throw Error('unexpected bytes after the proof');return{digest:hex(dg),atts:out,ops:c.n}}
-async function leafHash(s){return sha('SHA-256',cat(new Uint8Array([0]),new TextEncoder().encode(s)))}
-async function node(l,r){return sha('SHA-256',cat(cat(new Uint8Array([1]),l),r))}
-async function rootFromPath(leaf,i,size,path){if(i<0||i>=size)return null;let fn=i,sn=size-1,r=leaf;
- for(const ph of path){const p=unhex(ph);if(sn===0)return null;
-  if((fn%2===1)||fn===sn){r=await node(p,r);if(fn%2===0){while(fn%2===0&&fn!==0){fn=Math.floor(fn/2);sn=Math.floor(sn/2)}}}else r=await node(r,p);
-  fn=Math.floor(fn/2);sn=Math.floor(sn/2)}return sn===0?r:null}
-const EXPL=[['mempool.space','https://mempool.space/api'],['blockstream.info','https://blockstream.info/api']];
-async function block(base,h){const id=(await (await fetch(base+'/block-height/'+h)).text()).trim();if(!/^[0-9a-f]{64}$/.test(id))throw Error('no block hash');
- const j=await (await fetch(base+'/block/'+id)).json();return{hash:id,root:String(j.merkle_root||'').toLowerCase(),time:j.timestamp}}
-function norm(s){return s.normalize('NFC').replace(/\r\n?/g,'\n').trim()}
-async function sha256hex(bytes){return hex(await sha('SHA-256',bytes))}
-async function check(b,step,extra){
- extra=extra||{};
- if(!b||b.format!=='sebbi-forever-proof/1'){step('Format',false,'This is not a sebbi.pro Forever Proof.');return{ok:false}}
- const s=b.subject||{},m=b.merkle||{};
- if(s.kind==='hash'&&extra.file){const d=await sha256hex(extra.file);const ok=('sebbi-notary/1|'+d)===b.leaf;step('Your file',ok,'SHA-256 '+d+(ok?' — matches':' — does NOT match'));if(!ok)return{ok:false}}
- if(s.kind==='humankeys'&&extra.text!=null){const th=await sha256hex(new TextEncoder().encode(norm(extra.text)));const ok=th===s.text_hash;step('Your text',ok,'fingerprint '+th+(ok?' — matches':' — does NOT match'));if(!ok)return{ok:false}}
- if(s.kind==='hash'&&b.leaf!=='sebbi-notary/1|'+String(s.digest||'')){step('Fingerprint',false,'The leaf does not match the fingerprint.');return{ok:false}}
- if(s.kind==='humankeys'){const want=['sebbi-humankeys/1',s.code,s.text_hash,s.verdict,Math.floor(s.sealed_at||0)].join('|');if(want!==b.leaf){step('Human Keys record',false,'The leaf does not match the record.');return{ok:false}}
-  step('Human Keys record',true,s.code+' · '+s.verdict)}
- if(s.kind==='chain_block'){if(b.leaf!==s.audit_hash){step('Chain block',false,'The leaf is not the block hash.');return{ok:false}}step('Chain block',true,'block '+s.block+' · '+s.audit_hash)}
- const root=await rootFromPath(await leafHash(b.leaf),+m.index,+m.tree_size,m.path||[]);
- const okRoot=root&&hex(root)===String(m.root).toLowerCase();
- step('Merkle path',okRoot,'fingerprint '+(+m.index+1)+' of '+m.tree_size+' folds up to root '+m.root);if(!okRoot)return{ok:false};
- const raw=Uint8Array.from(atob((b.bitcoin||{}).proof_ots_base64||''),c=>c.charCodeAt(0));
- if(!raw.length){step('Bitcoin',null,'This batch is still being sent to the Bitcoin calendars. Try again in a few minutes.');return{ok:false,pending:true}}
- const o=await readOts(raw);
- const okD=o.digest===String(m.root).toLowerCase();step('OpenTimestamps proof',okD,o.ops+' operations replayed in your browser from that root');if(!okD)return{ok:false};
- const btc=o.atts.filter(a=>a.kind==='bitcoin').sort((x,y)=>x.height-y.height);
- if(!btc.length){step('Bitcoin',null,'Pending: the calendars have promised this to Bitcoin. It normally confirms within a few hours.');return{ok:false,pending:true}}
- for(const a of btc){const got=[];
-  for(const [name,base] of EXPL){try{const bl=await block(base,a.height);if(bl.root!==a.root){step('Bitcoin block '+a.height,false,name+' reports a different Merkle root');return{ok:false}}got.push([name,bl])}catch(e){step(name,null,'did not answer — trying the next')}}
-  if(got.length){step('Bitcoin block '+a.height,true,'Merkle root '+a.root+' confirmed by '+got.map(g=>g[0]).join(' and '));return{ok:true,height:a.height,time:got[0][1].time,hash:got[0][1].hash,sources:got.map(g=>g[0])}}}
- step('Bitcoin',false,'No block explorer could be reached. Use the offline verifier.');return{ok:false}}
-return{check,sha256hex,norm,hex}})();
-"""
-
-
-NOTARY_PAGE = _HEAD + r"""<title>Bitcoin Notary — sebbi.pro</title>
-<meta name="description" content="Prove anything existed. Drop a file, get a receipt, and it is timestamped in Bitcoin — forever, free, and checkable without us.">
-</head><body>""" + _TOP + r"""
-<main class="wrap">
-<section class="hero">
-<div class="kick"><i></i>BITCOIN NOTARY · FREE FOR EVERYONE</div>
-<h1>Prove it existed.<br><em>Forever.</em></h1>
-<p>Drop any file — a contract, a model card, a dataset, a design, an AI decision log. Your device fingerprints it, the fingerprint is written into Bitcoin, and you get a receipt anyone on earth can check against the Bitcoin blockchain. The file never leaves your hands.</p>
-<div class="chain" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
-<div class="live">
-<div><b class="btc" id="lh">—</b><span>Bitcoin block now</span></div>
-<div><b id="lnext">—</b><span>Next Bitcoin batch</span></div>
-<div><b id="lfp">—</b><span>Fingerprints notarised</span></div>
-<div><b id="lcb">—</b><span>sebbi.pro blocks in Bitcoin</span></div>
-</div>
-</section>
-
-<section class="card" id="stamp">
-<div class="tabs"><button class="on" data-t="files">Files</button><button data-t="text">Text</button><button data-t="hash">Fingerprint</button><button data-t="check">Check a file</button></div>
-<div data-p="files">
-<label class="drop" id="drop"><input type="file" id="fi" multiple class="sr"><b>Drop files here, or tap to choose</b><span>Fingerprinted on this device. Nothing is uploaded.</span></label>
-</div>
-<div data-p="text" hidden><textarea id="tx" placeholder="Paste or type anything — an idea, a claim, a prompt, a policy"></textarea></div>
-<div data-p="hash" hidden><input type="text" id="hx" placeholder="SHA-256 fingerprint — 64 hex characters, one per line for several"></div>
-<div data-p="check" hidden><label class="drop" id="drop2"><input type="file" id="fc" class="sr"><b>Drop a file to check</b><span>We look up its fingerprint and show the earliest Bitcoin receipt.</span></label></div>
-<div class="row" id="lrow"><input type="text" id="lb" maxlength="80" placeholder="Label (optional, public)"></div>
-<div class="list" id="ls"></div>
-<div class="row"><button class="btn b" id="go" disabled>Timestamp in Bitcoin</button><span class="msg" id="m"></span></div>
-</section>
-
-<section class="card">
-<h2>How it works</h2>
-<div class="how">
-<div><b>01 · FINGERPRINT</b><p>Your browser computes the file's SHA-256. Only those 64 characters travel.</p></div>
-<div><b>02 · BATCH</b><p>Every few minutes, every fingerprint is folded into one Merkle tree.</p></div>
-<div><b>03 · BITCOIN</b><p>The tree's root goes into Bitcoin through the public OpenTimestamps calendars.</p></div>
-<div><b>04 · FOREVER</b><p>Your Forever Proof checks against Bitcoin itself. No account. No trust in us.</p></div>
-</div>
-</section>
-
-<section class="card">
-<h2>Built for AI companies, governance tools and auditors</h2>
-<p class="sub">Anchor your own logs, model releases or evidence packs in Bitcoin through one call. Free — 500 fingerprints a day without a key, 100,000 with one.</p>
-<pre>curl -X POST https://sebbi.pro/x/notary/stamp \
-  -H "Content-Type: application/json" \
-  -d '{"digests": ["'$(sha256sum report.pdf | cut -c1-64)'"], "label": "Q3 model card"}'</pre>
-<p class="sub" style="margin-top:12px">Or let an AI assistant do it: connect <a href="/connect">https://sebbi.pro/mcp</a> and ask it to notarise a file — agents can also read the discovery file below. Show you are anchored with a live badge:</p>
-<pre>&lt;img src="https://sebbi.pro/n/NT-XXXX-XXXX.svg" alt="Anchored in Bitcoin via sebbi.pro"&gt;</pre>
-<p class="sub" style="margin-top:12px">Machine-readable: <a href="/.well-known/sebbi-notary.json">/.well-known/sebbi-notary.json</a> · <a href="/x/notary/spec">full spec</a></p>
-</section>
-
-<section class="card">
-<h2>Every sebbi.pro decision is already in Bitcoin</h2>
-<p class="sub">Each hour the whole sebbi.pro chain is folded into one root and written into Bitcoin. Any sealed AI decision gets a Forever Proof that outlives us.</p>
-<a class="btn g" href="/forever">Get a Forever Proof</a>
-</section>
-</main>""" + _FOOT + r"""
-<script>""" + _FV_JS + r"""
-const $=s=>document.querySelector(s);let mode='files',items=[];
-document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{mode=b.dataset.t;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
- document.querySelectorAll('[data-p]').forEach(p=>p.hidden=p.dataset.p!==mode);$('#lrow').hidden=mode==='check';$('#go').hidden=mode==='check';items=[];render();refresh()});
-function esc(t){return String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function render(){$('#ls').innerHTML=items.map(i=>'<div class="it"><span class="n">'+esc(i.name)+'</span>'+(i.code?'<a href="/n/'+i.code+'">'+i.code+' →</a>':'<span></span>')+'<span class="h">'+i.digest+'</span></div>').join('')}
-function refresh(){$('#go').disabled=!items.length||items.some(i=>i.code)}
-async function addFiles(fl){$('#m').textContent='Fingerprinting on this device…';$('#m').className='msg';
- for(const f of fl){const d=await FV.sha256hex(new Uint8Array(await f.arrayBuffer()));items.push({name:f.name+' · '+(f.size/1024).toFixed(1)+' KB',digest:d})}
- $('#m').textContent=items.length+' ready';render();refresh()}
-['drop','drop2'].forEach(id=>{const d=$('#'+id);d.addEventListener('dragover',e=>{e.preventDefault();d.classList.add('on')});d.addEventListener('dragleave',()=>d.classList.remove('on'));
- d.addEventListener('drop',e=>{e.preventDefault();d.classList.remove('on');id==='drop'?addFiles(e.dataTransfer.files):checkFile(e.dataTransfer.files[0])})});
-$('#fi').onchange=e=>addFiles(e.target.files);$('#fc').onchange=e=>checkFile(e.target.files[0]);
-$('#tx').oninput=async e=>{const t=e.target.value;items=t.trim()?[{name:'Text · '+t.length+' characters',digest:await FV.sha256hex(new TextEncoder().encode(t))}]:[];render();refresh()};
-$('#hx').oninput=e=>{items=e.target.value.split(/\s+/).map(x=>x.trim().toLowerCase()).filter(x=>/^[0-9a-f]{64}$/.test(x)).map(d=>({name:'Fingerprint',digest:d}));render();refresh()};
-async function checkFile(f){if(!f)return;$('#m').className='msg';$('#m').textContent='Fingerprinting…';const d=await FV.sha256hex(new Uint8Array(await f.arrayBuffer()));
- const r=await (await fetch('/x/notary/lookup?digest='+d)).json();items=[{name:f.name,digest:d,code:(r.receipts&&r.receipts[0]||{}).code}];render();
- if(r.receipts&&r.receipts.length){const x=r.receipts[0];$('#m').className='msg ok';$('#m').textContent='Found. First notarised '+new Date(x.received_utc).toLocaleString('en-GB')+(x.bitcoin_block?' · Bitcoin block '+x.bitcoin_block:'')}
- else{$('#m').className='msg err';$('#m').textContent='Never notarised here. Switch to Files to timestamp it now.'}}
-$('#go').onclick=async()=>{$('#go').disabled=true;$('#m').className='msg';$('#m').textContent='Sending fingerprints…';
- try{const r=await fetch('/x/notary/stamp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:$('#lb').value,digests:items.map(i=>i.digest)})});const j=await r.json();
-  if(!r.ok)throw Error(j.message||j.error);j.receipts.forEach((x,i)=>items[i].code=x.code);render();$('#m').className='msg ok';
-  $('#m').textContent='Received. In the next Bitcoin batch'+(j.next_batch_utc?' at '+new Date(j.next_batch_utc).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}):'')+'. Tap a receipt.';
-  if(items.length===1)setTimeout(()=>location.href='/n/'+items[0].code,900)}
- catch(e){$('#m').className='msg err';$('#m').textContent=e.message;$('#go').disabled=false}};
-let nextAt=null;
-async function stats(){try{const s=await (await fetch('/x/notary/status')).json();$('#lfp').textContent=(s.fingerprints||0).toLocaleString('en-GB');$('#lcb').textContent=(s.chain_blocks_in_bitcoin||0).toLocaleString('en-GB');nextAt=s.next_batch_utc?Date.parse(s.next_batch_utc):null}catch(e){}
- try{const h=await (await fetch('https://mempool.space/api/blocks/tip/height')).text();if(/^\d+$/.test(h.trim()))$('#lh').textContent='#'+(+h).toLocaleString('en-GB')}catch(e){}}
-setInterval(()=>{if(!nextAt)return;let s=Math.max(0,Math.round((nextAt-Date.now())/1000));$('#lnext').textContent=s?Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s':'now'},1000);
-stats();setInterval(stats,60000);
-</script></body></html>"""
-
-
-RECEIPT_PAGE = _HEAD + r"""<title>__CODE__ — Bitcoin receipt — sebbi.pro</title></head><body>""" + _TOP + r"""
-<main class="wrap">
-<section class="hero"><div class="kick"><i></i>BITCOIN RECEIPT</div><h1 id="hd">Receipt</h1><p id="hp">Loading…</p></section>
-<section class="card" id="cert" hidden>
-<div class="code" id="cd">__CODE__</div>
-<div class="tl"><div id="t1"><b>RECEIVED</b><span id="t1s"></span></div><div id="t2"><b>BATCHED</b><span id="t2s"></span></div><div id="t3"><b>SENT TO BITCOIN</b><span id="t3s"></span></div><div id="t4"><b>IN BITCOIN</b><span id="t4s"></span></div></div>
-<dl id="dl"></dl>
-<div class="row"><button class="btn b" id="dlb" disabled>Download Forever Proof</button><a class="btn g" id="vf" href="/forever?code=__CODE__">Verify against Bitcoin</a></div>
-<p class="msg" id="m"></p>
-</section>
-<section class="card" id="cmp" hidden><h2>Is this the same file?</h2><p class="sub">Drop the file here. It is fingerprinted on your device and compared.</p>
-<label class="drop"><input type="file" id="fc" class="sr"><b>Drop the file</b><span>Nothing is uploaded</span></label><p class="msg" id="cm"></p></section>
-<section class="card" id="emb" hidden><h2>Show it</h2><p class="sub">A live badge for your site, README or report. It turns orange when the block lands.</p>
-<p><img id="bimg" alt="Anchored in Bitcoin via sebbi.pro"></p><pre id="bcode"></pre></section>
-</main>""" + _FOOT + r"""
-<script>""" + _FV_JS + r"""
-const $=s=>document.querySelector(s),CODE='__CODE__';
-function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-const fmt=t=>t?new Date(t).toLocaleString('en-GB',{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}):'';
-let rec=null;
-async function load(){
- if(!/^(NT|HK)-[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(CODE)){$('#hd').textContent='Find a receipt';$('#hp').innerHTML='Receipt codes look like NT-7Q2M-X9KD. <a href="/bitcoin">Notarise a file</a>.';return}
- const r=await fetch('/x/notary/receipt?code='+CODE);rec=await r.json();
- if(!r.ok){$('#hd').textContent='Not found';$('#hp').textContent='No receipt with that code.';return}
- const s=rec.subject,b=rec.batch||{},st=rec.state;$('#cert').hidden=false;$('#emb').hidden=false;$('#cmp').hidden=s.kind!=='hash';
- $('#hd').innerHTML=st==='confirmed'?'In Bitcoin <em>block '+b.bitcoin.height.toLocaleString('en-GB')+'</em>':(st==='pending'?'Sent to <em>Bitcoin</em>':'Received');
- $('#hp').textContent=rec.message;
- const on=[true,!!rec.batch,st==='pending'||st==='confirmed',st==='confirmed'];['t1','t2','t3','t4'].forEach((id,i)=>$('#'+id).classList.toggle('on',on[i]));
- $('#t1s').textContent=fmt(rec.received_utc);$('#t2s').textContent=b.created_utc?fmt(b.created_utc):(rec.next_batch_utc?'next at '+new Date(rec.next_batch_utc).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}):'');
- $('#t3s').textContent=b.calendars?b.calendars+' calendar'+(b.calendars>1?'s':''):'';$('#t4s').textContent=b.bitcoin?(b.bitcoin.block_time_utc?fmt(b.bitcoin.block_time_utc):'block '+b.bitcoin.height):'usually a few hours';
- const rows=[];if(s.kind==='hash'){rows.push(['Fingerprint',s.digest]);if(s.label)rows.push(['Label',s.label])}else{rows.push(['Human Keys',s.code+' · '+s.verdict]);rows.push(['Text fingerprint',s.text_hash]);rows.push(['Typed',fmt(s.sealed_utc)])}
- if(b.root)rows.push(['Batch root',b.root]);if(b.size)rows.push(['Batch','#'+b.batch+' · '+b.size.toLocaleString('en-GB')+' fingerprints']);
- if(b.bitcoin){rows.push(['Bitcoin block','<a href="'+b.bitcoin.explorer+'" target="_blank" rel="noopener">'+b.bitcoin.height+'</a>']);if(b.bitcoin.checked_with)rows.push(['Checked with',b.bitcoin.checked_with.map(x=>x.replace('https://','').replace('/api','')).join(', ')])}
- $('#dl').innerHTML=rows.map(r=>'<dt>'+r[0]+'</dt><dd>'+(r[0]==='Bitcoin block'?r[1]:esc(r[1]))+'</dd>').join('');
- $('#dlb').disabled=!rec.batch;const src=location.origin+'/n/'+CODE+'.svg';$('#bimg').src=src+'?'+Date.now();$('#bcode').textContent='<a href="'+location.origin+'/n/'+CODE+'"><img src="'+src+'" alt="Anchored in Bitcoin via sebbi.pro"></a>';
- if(st!=='confirmed')setTimeout(load,60000)}
-$('#dlb').onclick=async()=>{const r=await fetch('/x/notary/bundle?code='+CODE);const j=await r.json();if(!r.ok){$('#m').className='msg err';$('#m').textContent=j.message||j.error;return}
- const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(j,null,1)],{type:'application/json'}));a.download=CODE+'.forever.json';a.click();
- $('#m').className='msg ok';$('#m').textContent=j.bitcoin.state==='confirmed'?'Saved. It checks against Bitcoin with nothing from us.':'Saved. Download again once it is in Bitcoin for the complete proof.'};
-$('#fc').onchange=async e=>{const f=e.target.files[0];if(!f||!rec)return;const d=await FV.sha256hex(new Uint8Array(await f.arrayBuffer()));const ok=d===rec.subject.digest;
- $('#cm').className='msg '+(ok?'ok':'err');$('#cm').textContent=ok?'Same file — exact match.':'Different file. Its fingerprint is '+d};
-load();
-</script></body></html>"""
-
-
-FOREVER_PAGE = _HEAD + r"""<title>Forever Proof — sebbi.pro</title>
-<meta name="description" content="Proof that outlives us. Check any sebbi.pro decision, notary receipt or Human Keys proof against Bitcoin itself, in your own browser.">
-</head><body>""" + _TOP + r"""
-<main class="wrap">
-<section class="hero">
-<div class="kick"><i></i>FOREVER PROOF</div>
-<h1>Proof that <em>outlives us.</em></h1>
-<p>Every AI decision sealed on sebbi.pro, every notary receipt and every Human Keys proof can be checked against the Bitcoin blockchain — in your own browser, right here, or offline with one small file. If sebbi.pro vanished tomorrow, the proof would still stand.</p>
-<div class="live">
-<div><b class="btc" id="lh">—</b><span>Bitcoin block now</span></div>
-<div><b id="lcb">—</b><span>Chain blocks in Bitcoin</span></div>
-<div><b id="lcp">—</b><span>Hourly checkpoints</span></div>
-<div><b id="lbb">—</b><span>Batches confirmed</span></div>
-</div>
-</section>
-
-<section class="card">
-<div class="tabs"><button class="on" data-t="get">Get a proof</button><button data-t="file">Check a proof file</button></div>
-<div data-p="get">
-<p class="sub">A chain block number, a notary receipt (NT-…) or a Human Keys code (HK-…).</p>
-<div class="row"><input type="text" id="q" placeholder="e.g. 1042   or   NT-7Q2M-X9KD   or   HK-4FJ8-2KQP" autocomplete="off"><button class="btn b" id="getb">Verify against Bitcoin</button></div>
-</div>
-<div data-p="file" hidden>
-<label class="drop" id="drop"><input type="file" id="fi" accept=".json,application/json" class="sr"><b>Drop a Forever Proof (.json)</b><span>Checked entirely in this browser</span></label>
-<div class="row"><label class="btn g" style="cursor:pointer">Also compare the original file<input type="file" id="orig" class="sr"></label><span class="msg" id="om"></span></div>
-</div>
-<ol class="steps" id="steps" hidden></ol>
-<div id="vd"></div>
-<div class="row" id="dlr" hidden><button class="btn g" id="dlb">Download this Forever Proof</button></div>
-</section>
-
-<section class="card">
-<h2>Check it with nothing of ours</h2>
-<p class="sub">One Python file, standard library only. It replays every step and asks two independent block explorers — or your own Bitcoin node — for the block.</p>
-<pre>python3 forever-verify.py proof.json
-python3 forever-verify.py proof.json --file contract.pdf
-python3 forever-verify.py proof.json --node</pre>
-<div class="row"><a class="btn" href="/forever-verify.py">Download forever-verify.py</a><a class="btn g" href="/x/notary/spec">Proof format</a></div>
-</section>
-
-<section class="card">
-<h2>Hourly checkpoints</h2>
-<p class="sub">The whole sebbi.pro chain, folded into one Merkle root and written into Bitcoin. The same root anyone can recompute at <a href="/x/consistency/root">/x/consistency/root</a>.</p>
-<table><thead><tr><th>Checkpoint</th><th>Chain blocks</th><th>Bitcoin</th></tr></thead><tbody id="cps"><tr><td colspan="3">Loading…</td></tr></tbody></table>
-</section>
-</main>""" + _FOOT + r"""
-<script>""" + _FV_JS + r"""
-const $=s=>document.querySelector(s);let bundle=null,orig=null;
-document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));document.querySelectorAll('[data-p]').forEach(p=>p.hidden=p.dataset.p!==b.dataset.t)});
-function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function step(name,ok,detail){const li=document.createElement('li');li.className=ok===true?'ok':(ok===false?'bad':'wait');li.innerHTML='<b>'+esc(name)+'</b><span>'+esc(detail)+'</span>';$('#steps').appendChild(li)}
-async function run(b){bundle=b;$('#steps').innerHTML='';$('#steps').hidden=false;$('#vd').innerHTML='';$('#dlr').hidden=!b;
- if(b&&b.subject){const s=b.subject;step('Subject',true,s.kind==='chain_block'?'sebbi.pro chain block '+s.block:(s.kind==='humankeys'?'Human Keys '+s.code:'Notary receipt '+s.code+(s.label?' · '+s.label:'')))}
- let r;try{r=await FV.check(b,step,{file:orig})}catch(e){step('Proof',false,e.message);r={ok:false}}
- if(r.ok){const d=r.time?new Date(r.time*1000).toLocaleString('en-GB',{day:'numeric',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit'}):'';
-  $('#vd').innerHTML='<div class="verdict"><h3>Verified in Bitcoin block '+r.height.toLocaleString('en-GB')+'</h3><p>This existed before '+esc(d)+'. Checked in your browser against '+esc(r.sources.join(' and '))+'. Nothing from sebbi.pro was trusted.</p></div>'}
- else if(r.pending)$('#vd').innerHTML='<div class="verdict wait"><h3>On its way into Bitcoin</h3><p>Everything checks so far. The Bitcoin block normally lands within a few hours — come back and check again.</p></div>';
- else $('#vd').innerHTML='<div class="verdict bad"><h3>Not verified</h3><p>A step above failed. This proof does not show what it claims.</p></div>'}
-async function fetchProof(q){q=q.trim().toUpperCase();if(!q)return;$('#getb').disabled=true;$('#steps').hidden=false;$('#steps').innerHTML='';step('Fetching the proof',null,'only the proof comes from sebbi.pro — the checking happens here');
- const url=/^\d+$/.test(q)?'/x/notary/bundle?block='+q:'/x/notary/bundle?code='+encodeURIComponent(q);
- try{const r=await fetch(url);const j=await r.json();$('#getb').disabled=false;
-  if(r.status===202||j.state==='queued'){$('#steps').innerHTML='';step('Queued',null,j.message||'Joins the next Bitcoin batch.');$('#vd').innerHTML='<div class="verdict wait"><h3>Joining the next Bitcoin batch</h3><p>'+esc(j.message||'')+'</p></div>';return}
-  if(!r.ok){$('#steps').innerHTML='';step('Proof',false,j.message||j.error);return}
-  history.replaceState(null,'','/forever?'+(/^\d+$/.test(q)?'block=':'code=')+q);await run(j)}catch(e){$('#getb').disabled=false;step('Proof',false,e.message)}}
-$('#getb').onclick=()=>fetchProof($('#q').value);$('#q').onkeydown=e=>{if(e.key==='Enter')fetchProof($('#q').value)};
-async function loadFile(f){if(!f)return;try{await run(JSON.parse(await f.text()))}catch(e){$('#steps').hidden=false;$('#steps').innerHTML='';step('Proof file',false,'Could not read that file as a Forever Proof.')}}
-const d=$('#drop');d.addEventListener('dragover',e=>{e.preventDefault();d.classList.add('on')});d.addEventListener('dragleave',()=>d.classList.remove('on'));d.addEventListener('drop',e=>{e.preventDefault();d.classList.remove('on');loadFile(e.dataTransfer.files[0])});
-$('#fi').onchange=e=>loadFile(e.target.files[0]);
-$('#orig').onchange=async e=>{const f=e.target.files[0];if(!f)return;orig=new Uint8Array(await f.arrayBuffer());$('#om').textContent=f.name+' will be compared';if(bundle)run(bundle)};
-$('#dlb').onclick=()=>{if(!bundle)return;const s=bundle.subject||{};const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(bundle,null,1)],{type:'application/json'}));a.download=(s.code||('block-'+s.block))+'.forever.json';a.click()};
-async function side(){try{const s=await (await fetch('/x/notary/status')).json();$('#lcb').textContent=(s.chain_blocks_in_bitcoin||0).toLocaleString('en-GB');$('#lcp').textContent=(s.chain_checkpoints||0).toLocaleString('en-GB');$('#lbb').textContent=(s.batches_in_bitcoin||0).toLocaleString('en-GB')}catch(e){}
- try{const c=await (await fetch('/x/notary/checkpoints')).json();$('#cps').innerHTML=(c.checkpoints||[]).map(x=>'<tr><td>#'+x.batch+' · '+new Date(x.created_utc).toLocaleString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})+'</td><td>'+(x.chain_size||0).toLocaleString('en-GB')+'</td><td>'+(x.bitcoin?'<a href="'+x.bitcoin.explorer+'" target="_blank" rel="noopener">block '+x.bitcoin.height+'</a>':x.state)+'</td></tr>').join('')||'<tr><td colspan="3">The first checkpoint is on its way.</td></tr>'}catch(e){}
- try{const h=await (await fetch('https://mempool.space/api/blocks/tip/height')).text();if(/^\d+$/.test(h.trim()))$('#lh').textContent='#'+(+h).toLocaleString('en-GB')}catch(e){}}
-side();const P=new URLSearchParams(location.search);if(P.get('block')||P.get('code')){$('#q').value=P.get('block')||P.get('code');fetchProof($('#q').value)}
-</script></body></html>"""
-
-CODE_PAGE = _HEAD + r"""<title>Our code, in Bitcoin — sebbi.pro</title>
-<meta name="description" content="Every file of sebbi.pro's code is fingerprinted and timestamped in Bitcoin. Every change is sealed again.">
-</head><body>""" + _TOP + r"""
-<main class="wrap">
-<section class="hero"><div class="kick"><i></i>OUR CODE · IN BITCOIN</div>
-<h1>Every file. <em>Every change.</em> In Bitcoin.</h1>
-<p>Every file that runs sebbi.pro is fingerprinted and written into Bitcoin, and every change is sealed again. Anyone can prove which version of our code existed, and when. Drop any copy of a file on <a href="/bitcoin">the notary</a> to see the day it was first sealed.</p>
-<div class="live"><div><b id="lf">—</b><span>Files sealed</span></div><div><b id="lv">—</b><span>Versions sealed</span></div><div><b class="btc" id="lb">—</b><span>Latest snapshot block</span></div><div><b id="ls">—</b><span>Snapshot</span></div></div>
-</section>
-<section class="card"><h2>Whole-codebase snapshot</h2><p class="sub" id="sn">Loading…</p>
-<div class="row"><a class="btn g" href="/bitcoin/code/manifest.txt">Manifest (sha256sum format)</a><a class="btn g" id="sr" href="#">Snapshot receipt</a></div></section>
-<section class="card"><h2>Files</h2><p class="sub">Tap a receipt for its Bitcoin proof.</p>
-<input type="text" id="q" placeholder="Filter, e.g. modules/" autocomplete="off">
-<table><thead><tr><th>File</th><th>Bitcoin</th></tr></thead><tbody id="tb"><tr><td colspan="2">Loading…</td></tr></tbody></table></section>
-</main>""" + _FOOT + r"""
-<script>
-const $=s=>document.querySelector(s);let F=[];
-function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function draw(){const q=$('#q').value.toLowerCase();$('#tb').innerHTML=F.filter(f=>f.latest&&f.path.toLowerCase().includes(q)).map(f=>'<tr><td style="word-break:break-all">'+esc(f.path)+'<br><span style="color:var(--mut);font-size:11px">'+f.digest.slice(0,16)+'… · '+new Date(f.first_sealed_utc).toLocaleDateString('en-GB')+'</span></td><td><a href="/n/'+f.code+'">'+(f.bitcoin_block&&f.state==='confirmed'?'block '+f.bitcoin_block:f.state)+'</a></td></tr>').join('')||'<tr><td colspan="2">The first seal runs a minute after arming.</td></tr>'}
-fetch('/x/notary/codebase').then(r=>r.json()).then(j=>{F=j.files||[];$('#lf').textContent=j.files_sealed;$('#lv').textContent=j.versions_sealed;const s=j.snapshot;
- if(s){$('#ls').textContent=s.files+' files';$('#lb').textContent=s.bitcoin_block?'#'+s.bitcoin_block.toLocaleString('en-GB'):s.state;$('#sr').href='/n/'+s.code;
-  $('#sn').textContent='One fingerprint of the whole codebase — '+s.files+' files — sealed '+new Date(s.created_utc).toLocaleString('en-GB')+'. Fingerprint '+s.digest+'.'}else $('#sn').textContent='The first snapshot is sealed a minute after arming.';draw()});
-$('#q').oninput=draw;
-</script></body></html>"""
-
-
-# shown on the homepage, above the existing feature strip
-HOME_STRIP = r"""<section class="ntx" aria-label="Bitcoin Notary">
-<style>
-.ntx{background:#070b17;border-top:1px solid rgba(247,147,26,.28);padding:52px 16px;color:#fff;font-family:'IBM Plex Sans',system-ui,sans-serif}
-.ntx *{box-sizing:border-box}.ntx-in{max-width:1080px;margin:0 auto}
-.ntx-k{font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:12px;letter-spacing:.1em;color:#f7931a;display:flex;align-items:center;gap:10px;margin-bottom:12px}
-.ntx-k i{width:8px;height:8px;border-radius:50%;background:#f7931a;display:inline-block}
-.ntx h3{font-family:'Newsreader',Georgia,serif;font-weight:500;font-size:clamp(28px,4vw,42px);line-height:1.08;margin:0 0 10px}.ntx h3 em{color:#c9a84c}
-.ntx p.l{color:rgba(255,255,255,.66);font-size:15.5px;max-width:62ch;margin:0 0 22px}
-.ntx-g{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid rgba(247,147,26,.25);border-radius:14px;overflow:hidden}
-@media(max-width:760px){.ntx-g{grid-template-columns:1fr}}
-.ntx-g a{display:block;padding:22px;background:#0b1122;color:#fff;text-decoration:none;border-right:1px solid rgba(247,147,26,.15);transition:background .2s}
-.ntx-g a:hover,.ntx-g a:focus-visible{background:#111a33;outline:none}
-.ntx-g b{display:block;font-family:'Newsreader',Georgia,serif;font-weight:500;font-size:21px;margin-bottom:6px}
-.ntx-g span{display:block;color:rgba(255,255,255,.6);font-size:14px;line-height:1.5}.ntx-g em{display:block;font-style:normal;color:#f7931a;font-size:13px;margin-top:12px;font-family:'IBM Plex Mono',ui-monospace,monospace}
-</style>
-<div class="ntx-in">
-<div class="ntx-k"><i></i>NEW · BITCOIN</div>
-<h3>Proof that <em>outlives us.</em></h3>
-<p class="l">Every decision sealed here is written into Bitcoin every hour. Anyone can now timestamp anything in Bitcoin for free — and check it without trusting us.</p>
-<div class="ntx-g">
-<a href="/bitcoin"><b>Bitcoin Notary</b><span>Drop any file. Get a receipt written into Bitcoin. Free for everyone, open to every AI company.</span><em>sebbi.pro/bitcoin →</em></a>
-<a href="/forever"><b>Forever Proof</b><span>Check any sealed decision against Bitcoin itself, in your own browser. No account, no trust.</span><em>sebbi.pro/forever →</em></a>
-<a href="/keys"><b>Human Keys, in Bitcoin</b><span>Proof a human typed it — now dated by Bitcoin, so the original always comes first.</span><em>sebbi.pro/keys →</em></a>
-</div></div></section>"""
-
-# shown on every Human Keys check page
-HK_PANEL = r"""<section id="ntxhk" style="max-width:820px;margin:0 auto;padding:0 16px">
-<div style="background:#10182e;border:1px solid rgba(247,147,26,.35);border-radius:10px;padding:16px 18px;margin:18px 0;font-family:'IBM Plex Sans',system-ui,sans-serif;color:#fff">
-<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.08em;color:#f7931a;margin-bottom:6px">TIMESTAMPED IN BITCOIN</div>
-<div id="ntxhk-s" style="font-size:15px">Checking…</div>
-<div id="ntxhk-a" style="margin-top:10px;display:none"><a id="ntxhk-v" style="display:inline-block;background:#f7931a;color:#1a0f00;border-radius:6px;padding:10px 14px;font-family:'IBM Plex Mono',monospace;font-size:13px;text-decoration:none">Verify against Bitcoin</a></div>
-</div></section>
-<script>(function(){var c=(location.pathname.split('/')[2]||'').toUpperCase();if(!/^HK-[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(c)){var e=document.getElementById('ntxhk');if(e)e.remove();return}
-fetch('/x/notary/hk?code='+c).then(function(r){return r.json()}).then(function(j){var s=document.getElementById('ntxhk-s');if(!j||j.error){document.getElementById('ntxhk').remove();return}
-var b=j.batch&&j.batch.bitcoin;s.textContent=j.state==='confirmed'?('In Bitcoin block '+b.height.toLocaleString('en-GB')+(b.block_time_utc?' · '+new Date(b.block_time_utc).toLocaleString('en-GB',{day:'numeric',month:'short',year:'numeric'}):'')+'. Anyone can check it against Bitcoin, without sebbi.pro.'):(j.state==='pending'?'Sent to Bitcoin. The block normally lands within a few hours.':'Joining the next Bitcoin batch.');
-var a=document.getElementById('ntxhk-v');a.href='/forever?code='+c;document.getElementById('ntxhk-a').style.display='block'}).catch(function(){})})();</script>"""
-
-# two buttons added to the homepage button list, just above the machine-proof report
-HOME_BUTTONS_B = (b'<a href="/bitcoin" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">BITCOIN</span>Bitcoin Notary &rarr;</a>'
-                  b'<a href="/forever" style="border:1.5px solid #f7931a"><span class="tag" style="background:#f7931a">FOREVER</span>Forever Proof &rarr;</a>')
-HOME_BUTTONS_AT = b'<a href="/dossier" style='
-HOME_STRIP_B = HOME_STRIP.encode("utf-8")
-HK_PANEL_B = HK_PANEL.encode("utf-8")
-
-
-def _page(tpl, code=""):
-    return tpl.replace("__MAGIC__", FV.HEADER_MAGIC.hex()).replace("__CODE__", code)
-
-
-def _install_pages():
-    if _state["pages"]:
-        return True
-    H = getattr(_srv(), "Handler", None)
+def _install():
+    s = _srv()
+    H = getattr(s, "Handler", None)
     if H is None:
         return False
-    if getattr(H, "_notary_pages", False):
-        _state["pages"] = True
+    if getattr(H, "_mcp_patched", False):
         return True
-    orig = H.do_GET
+    orig_post, orig_get = H.do_POST, H.do_GET
+    orig_opt = getattr(H, "do_OPTIONS", None)
+    orig_del = getattr(H, "do_DELETE", None)
+
+    def is_mcp(h):
+        return h.path.split("?")[0].rstrip("/") in ("/mcp", "/mcp/sse")
+
+    def do_POST(self):
+        if not is_mcp(self):
+            return orig_post(self)
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n > 1024 * 1024:
+                return _reply(self, 413, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "request too large"}})
+            raw = self.rfile.read(n) if n else b""
+            msg = json.loads(raw or b"null")
+        except Exception:
+            return _reply(self, 400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+        session = self.headers.get("Mcp-Session-Id") or ""
+        new_session = None
+        if isinstance(msg, dict) and msg.get("method") == "initialize":
+            session = new_session = secrets.token_hex(16)
+        ip = _client_ip(self)
+        if isinstance(msg, list):
+            out = [r for r in (_rpc(m, ip, session) for m in msg) if r is not None]
+            return _reply(self, 200 if out else 202, out or None, new_session)
+        r = _rpc(msg, ip, session)
+        return _reply(self, 200 if r is not None else 202, r, new_session)
 
     def do_GET(self):
-        p = self.path.split("?")[0].rstrip("/") or "/"
-        try:
-            if p == "/bitcoin/code":
-                return _send(self, _page(CODE_PAGE), "text/html; charset=utf-8")
-            if p == "/bitcoin/code/manifest.txt":
-                r = _db("SELECT manifest FROM notary_snapshot ORDER BY id DESC LIMIT 1", one=True)
-                return _send(self, (r[0] if r else ""), "text/plain; charset=utf-8")
-            if p == "/bitcoin":
-                return _send(self, _page(NOTARY_PAGE), "text/html; charset=utf-8")
-            if p == "/forever":
-                return _send(self, _page(FOREVER_PAGE), "text/html; charset=utf-8")
-            if p == "/n" or p.startswith("/n/"):
-                code = p[3:].upper()
-                if code.endswith(".SVG"):
-                    return _send(self, _badge(code[:-4]), "image/svg+xml")
-                return _send(self, _page(RECEIPT_PAGE, code if (NT_RE.match(code) or HK_RE.match(code)) else ""),
-                             "text/html; charset=utf-8")
-            if p in ("/forever-verify.py", "/forever_verify.py"):
-                with open(FV.__file__, "rb") as fh:
-                    return _send(self, fh.read(), "text/x-python; charset=utf-8",
-                                 extra={"Content-Disposition": 'attachment; filename="forever-verify.py"'})
-            if p == "/.well-known/sebbi-notary.json":
-                return _send(self, json.dumps(_discovery(), indent=1), "application/json")
-        except Exception as e:
-            _state["last_error"] = "page: %s" % str(e)[:200]
-        return orig(self)
+        if not is_mcp(self):
+            return orig_get(self)
+        accept = self.headers.get("Accept", "")
+        if "text/event-stream" in accept:
+            return _reply(self, 405, {"error": "this server answers each request directly; open no stream"})
+        return _reply(self, 200, INFO)
 
-    H.do_GET = do_GET
-    H._notary_pages = True
-    _state["pages"] = True
+    def do_OPTIONS(self):
+        if is_mcp(self):
+            self.send_response(204)
+            _cors(self)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if orig_opt:
+            return orig_opt(self)
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_DELETE(self):
+        if is_mcp(self):
+            with _lock:
+                _sessions.pop(self.headers.get("Mcp-Session-Id") or "", None)
+            return _reply(self, 200, {})
+        if orig_del:
+            return orig_del(self)
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    H.do_POST, H.do_GET, H.do_OPTIONS, H.do_DELETE = do_POST, do_GET, do_OPTIONS, do_DELETE
+    H._mcp_patched = True
     return True
 
-
-class _Out(object):
-    """Holds one HTML response so a panel can be added. Everything else passes straight through."""
-
-    def __init__(self, real):
-        self.real = real
-        self.buf = bytearray()
-        self.mode = None
-
-    def write(self, data):
-        if self.mode == "pass":
-            return self.real.write(data)
-        self.buf += data
-        if self.mode is None:
-            end = self.buf.find(b"\r\n\r\n")
-            if end < 0:
-                if len(self.buf) > 65536:
-                    self._go_pass()
-                return len(data)
-            head = bytes(self.buf[:end]).lower()
-            if b"content-type: text/html" in head and b"content-encoding" not in head:
-                self.mode = "html"
-            else:
-                self._go_pass()
-        elif len(self.buf) > 8 * 1024 * 1024:
-            self._go_pass()
-        return len(data)
-
-    def _go_pass(self):
-        self.mode = "pass"
-        if self.buf:
-            self.real.write(bytes(self.buf))
-        self.buf = bytearray()
-
-    def flush(self):
-        if self.mode == "pass":
-            try:
-                self.real.flush()
-            except Exception:
-                pass
-
-    @property
-    def closed(self):
-        return getattr(self.real, "closed", False)
-
-    def __getattr__(self, name):
-        return getattr(self.real, name)
-
-    def finish(self, where):
-        if self.mode == "pass" or not self.buf:
-            return
-        raw = bytes(self.buf)
-        self.buf = bytearray()
-        end = raw.find(b"\r\n\r\n")
-        if not where or self.mode != "html" or end < 0:
-            self.real.write(raw)
-            return
-        head, body = raw[:end], raw[end + 4:]
-        if where == "home" and b'class="ntx"' not in body:
-            at = body.find(b'<section class="sbx"')
-            if at < 0:
-                at = body.find(b"<footer")
-            if at < 0:
-                at = body.rfind(b"</body>")
-            if at >= 0:
-                body = body[:at] + HOME_STRIP_B + body[at:]
-            if b'href="/bitcoin" style=' not in body:
-                bt = body.find(HOME_BUTTONS_AT)
-                if bt >= 0:
-                    body = body[:bt] + HOME_BUTTONS_B + body[bt:]
-        elif where == "hk" and b'id="ntxhk"' not in body:
-            at = body.rfind(b"<footer")
-            if at < 0:
-                at = body.rfind(b"</body>")
-            if at >= 0:
-                body = body[:at] + HK_PANEL_B + body[at:]
-        lines = [l for l in head.split(b"\r\n") if not l.lower().startswith(b"content-length:")]
-        lines.append(b"Content-Length: " + str(len(body)).encode())
-        self.real.write(b"\r\n".join(lines) + b"\r\n\r\n" + body)
-        _state["injected"] += 1
-        try:
-            self.real.flush()
-        except Exception:
-            pass
-
-
-def _install_inject():
-    if _state["inject"]:
-        return True
-    H = getattr(_srv(), "Handler", None)
-    if H is None:
-        return False
-    if getattr(H, "_notary_inject", False):
-        _state["inject"] = True
-        return True
-    original = H.handle_one_request
-
-    def handle_one_request(self):
-        real = self.wfile
-        out = _Out(real)
-        self.wfile = out
-        try:
-            original(self)
-        finally:
-            self.wfile = real
-            try:
-                path = (getattr(self, "path", "") or "").split("?")[0]
-                where = None
-                if getattr(self, "command", "") == "GET":
-                    if path in ("/", "/index.html"):
-                        where = "home"
-                    elif path.startswith("/k/") and HK_RE.match(path[3:].rstrip("/").upper()):
-                        where = "hk"
-                out.finish(where)
-            except Exception as e:
-                _state["last_error"] = "inject: %s" % str(e)[:200]
-                try:
-                    if out.buf:
-                        real.write(bytes(out.buf))
-                except Exception:
-                    pass
-
-    H.handle_one_request = handle_one_request
-    H._notary_inject = True
-    _state["inject"] = True
-    return True
-
-
-def arm(ctx=None):
-    with _lock:
-        if not _state["ready"]:
-            _setup()
-            _state["ready"] = True
-        _install_pages()
-        _install_inject()
-        try:
-            _install_mcp()
-        except Exception as e:
-            _state["last_error"] = "mcp: %s" % str(e)[:200]
-        _start_worker()
-
-
-# ---------------------------------------------------------------------------
-# router entry
-# ---------------------------------------------------------------------------
 
 def handle(method, action, data, api_key, ctx):
     try:
-        arm(ctx)
+        _setup()
+        _state["installed"] = _install()
     except Exception as e:
-        _state["last_error"] = "arm: %s" % str(e)[:200]
-    data = data or {}
-    if action in ("", "status"):
-        return status()
+        _state["last_error"] = "arm: %s" % e
+    if action == "terms":
+        return {"terms_version": TERMS_VERSION, "terms": TERMS_TEXT}, 200
     if action == "spec":
-        return spec()
-    if action == "stamp" and method == "POST":
-        body = _original_body("digests") or data
-        digests = body.get("digests") if body.get("digests") is not None else body.get("digest")
-        if isinstance(digests, str) and ("," in digests or "\n" in digests or " " in digests.strip()):
-            digests = [x for x in re.split(r"[\s,]+", digests) if x]
-        return stamp(digests, body.get("label"), api_key, _caller_ip())
-    if action == "receipt":
-        return receipt(data.get("code"))
-    if action == "lookup":
-        d = str(data.get("digest", "")).strip().lower()
-        if not HEX64.match(d):
-            return {"error": "bad_digest"}, 400
-        rows = _db("SELECT code FROM notary_leaf WHERE digest=? AND kind='hash' ORDER BY submitted LIMIT 20", (d,))
-        out = []
-        for (code,) in rows:
-            r, _ = receipt(code)
-            out.append({"code": code, "received_utc": r.get("received_utc"), "state": r.get("state"),
-                        "label": (r.get("subject") or {}).get("label"),
-                        "bitcoin_block": ((r.get("batch") or {}).get("bitcoin") or {}).get("height"),
-                        "receipt": "%s/n/%s" % (SITE, code)})
-        return {"digest": d, "found": len(out), "receipts": out}, 200
-    if action == "bundle":
-        if data.get("block") not in (None, ""):
-            return chain_proof(data.get("block"), api_key)
-        return receipt(data.get("code"), with_bundle=True)
-    if action == "hk":
-        return hk_status(data.get("code"))
-    if action == "codebase":
-        return codebase()
-    if action == "checkpoints":
-        return {"checkpoints": _checkpoints()}, 200
-    if action == "ots":
+        return INFO, 200
+    s = _srv()
+    with s._db_lock:
+        n = s._conn.execute("SELECT COUNT(*) FROM mcp_agreement").fetchone()[0]
+    return {"module": "mcp", "version": VERSION, "armed": _state["installed"],
+            "connector_url": "https://sebbi.pro/mcp", "terms_version": TERMS_VERSION,
+            "accounts_opened_by_ai": n, "tool_calls_since_start": _state["calls"],
+            "tools": [t["name"] for t in TOOLS], "last_error": _state["last_error"]}, 200
+
+```
+
+
+## `modules/meter.py`
+
+281 lines, 10630 bytes
+
+```python
+"""
+modules/meter.py  v1.0.0
+The 50p device meter, done per device per month - without touching server.py.
+
+Armed by https://sebbi.pro/x/meter/status after each deploy, it swaps these
+functions inside the running server for new versions (same names, same
+callers, nothing in server.py edited):
+
+  record_device(api_key, device_id)
+      Counts each distinct device a key sends in a calendar month (UTC), once,
+      however many decisions it makes. Resets every month. Reading the count
+      is a single-row lookup, so it holds at millions of devices per key.
+      The engine (/api/govern) and the plug-in log (public_proof_adapter.py)
+      both call this, so one central server acting for 20 million phones is
+      billed for 20 million devices.
+
+  device_count(api_key)
+      What the key is billed for: the larger of last month's full count and
+      this month so far. Growth is billed straight away; a customer who
+      shrinks pays less the month after. Used by the trial-end checkout,
+      /api/usage and the trial-expired answers.
+
+  sync_stripe_quantities()
+      The existing 6-hourly Stripe job now sets each paying subscription to
+      device_count() - up or down - so every renewal charges 50p for each
+      device actually used.
+
+On first arming, each key's existing all-time device count is carried into
+last month, so nobody's bill drops while the monthly count builds up.
+
+Watch for keys stamping one device id on a whole network:
+    https://sebbi.pro/admin/meter      (your admin login)
+Public summary (no keys shown):
+    https://sebbi.pro/x/meter/status
+"""
+
+import json
+import sys
+import threading
+import time
+from collections import defaultdict
+
+VERSION = "1.0.0"
+PUBLIC = {("GET", "status"), ("GET", "spec")}
+RATE_GBP = 0.50
+FLAG_EVENTS_PER_DEVICE = 10000
+CACHE_MAX = 500000
+
+_srv = None
+_armed = False
+_patched_http = False
+_cache = {}
+_lock = threading.Lock()
+_events = defaultdict(int)
+_orig = {}
+
+
+def _month(ts=None):
+    return time.strftime("%Y-%m", time.gmtime(ts if ts is not None else time.time()))
+
+
+def _prev_month(ts=None):
+    t = time.gmtime(ts if ts is not None else time.time())
+    y, m = t.tm_year, t.tm_mon - 1
+    if m == 0:
+        y, m = y - 1, 12
+    return "%04d-%02d" % (y, m)
+
+
+def _find_server():
+    for name in ("__main__", "server"):
+        m = sys.modules.get(name)
+        if m is not None and hasattr(m, "record_device") and hasattr(m, "_conn") and hasattr(m, "_db_lock"):
+            return m
+    return None
+
+
+# ---------------------------------------------------------------- the meter
+
+def _setup(s):
+    with s._db_lock:
+        c = s._conn
+        c.execute("CREATE TABLE IF NOT EXISTS device_month(api_key TEXT,month TEXT,device_id TEXT,first_seen REAL,"
+                  "PRIMARY KEY(api_key,month,device_id)) WITHOUT ROWID")
+        c.execute("CREATE TABLE IF NOT EXISTS device_month_count(api_key TEXT,month TEXT,n INTEGER DEFAULT 0,"
+                  "PRIMARY KEY(api_key,month)) WITHOUT ROWID")
+        c.execute("CREATE TABLE IF NOT EXISTS config(k TEXT PRIMARY KEY,v TEXT)")
+        if not c.execute("SELECT 1 FROM config WHERE k='meter_v2_seeded'").fetchone():
+            c.execute("INSERT OR IGNORE INTO device_month_count(api_key,month,n) "
+                      "SELECT api_key,?,COUNT(*) FROM device_seen GROUP BY api_key", (_prev_month(),))
+            c.execute("INSERT OR REPLACE INTO config(k,v) VALUES('meter_v2_seeded',?)", (str(time.time()),))
+        c.commit()
+
+
+def month_count(api_key, month=None):
+    s = _srv
+    with s._db_lock:
         try:
-            b = _batch_row(int(data.get("batch")))
+            r = s._conn.execute("SELECT n FROM device_month_count WHERE api_key=? AND month=?",
+                                (api_key, month or _month())).fetchone()
+            return r[0] if r else 0
         except Exception:
-            b = None
-        if not b or not b["ots"]:
-            return {"error": "not_found"}, 404
-        return {"batch": b["id"], "root": b["root"], "state": b["state"],
-                "ots_base64": base64.b64encode(b["ots"]).decode()}, 200
-    if action == "verify" and method == "POST":
-        bundle = data.get("bundle") if isinstance(data.get("bundle"), dict) else data
-        return FV.check(bundle, explorers=EXPLORERS), 200
-    if action == "run":
-        if not api_key:
-            return {"error": "api_key_required"}, 401
-        return run_once(force=True), 200
-    return {"error": "unknown_action", "action": action}, 404
+            return 0
+
+
+def device_count(api_key):
+    """Billable devices: the larger of last month's full count and this month so far."""
+    return max(month_count(api_key, _prev_month()), month_count(api_key))
+
+
+def record_device(api_key, device_id):
+    """Count device_id on api_key for this calendar month. Returns the billable count."""
+    if not api_key or not device_id:
+        return None
+    s = _srv
+    device_id = str(device_id)[:200]
+    mon = _month()
+    ck = (api_key, mon, device_id)
+    with _lock:
+        _events[(api_key, mon)] += 1
+        hit = ck in _cache
+    if not hit:
+        with s._db_lock:
+            try:
+                c = s._conn
+                cur = c.execute("INSERT OR IGNORE INTO device_month(api_key,month,device_id,first_seen) VALUES(?,?,?,?)",
+                                (api_key, mon, device_id, time.time()))
+                if cur.rowcount == 1:
+                    c.execute("INSERT OR IGNORE INTO device_month_count(api_key,month,n) VALUES(?,?,0)", (api_key, mon))
+                    c.execute("UPDATE device_month_count SET n=n+1 WHERE api_key=? AND month=?", (api_key, mon))
+                    c.execute("INSERT OR IGNORE INTO device_seen(api_key,device_id,first_seen) VALUES(?,?,?)",
+                              (api_key, device_id, time.time()))
+                c.commit()
+            except Exception as e:
+                try:
+                    s._conn.rollback()
+                except Exception:
+                    pass
+                print("meter record_device err:" + str(e), flush=True)
+                return None
+        with _lock:
+            if len(_cache) >= CACHE_MAX:
+                _cache.clear()
+            _cache[ck] = 1
+    return device_count(api_key)
+
+
+def sync_stripe_quantities():
+    """Set each paying subscription's quantity to the billable device count, up or down."""
+    s = _srv
+    if not getattr(s, "STRIPE_SECRET", ""):
+        print("QSYNC skip: no STRIPE_SECRET", flush=True)
+        return
+    with s._db_lock:
+        rows = s._conn.execute("SELECT key,email,stripe_sub FROM api_keys WHERE is_paid=1 AND active=1 "
+                               "AND stripe_sub!=''").fetchall()
+    for key, email, sub_id in rows:
+        try:
+            n = device_count(key)
+            if not n:
+                continue
+            sub = s.stripe_call("GET", "/subscriptions/" + sub_id)
+            if not sub or "items" not in sub:
+                print("QSYNC no sub for " + email, flush=True)
+                continue
+            items = sub["items"].get("data", [])
+            if not items:
+                continue
+            item = items[0]
+            current = int(item.get("quantity", 0) or 0)
+            if n != current:
+                r = s.stripe_call("POST", "/subscription_items/" + item["id"],
+                                  {"quantity": str(n), "proration_behavior": "none"})
+                if r and "id" in r:
+                    print("QSYNC " + email + ": " + str(current) + " -> " + str(n) + " devices", flush=True)
+                else:
+                    print("QSYNC FAIL " + email, flush=True)
+        except Exception as e:
+            print("QSYNC ERR " + email + ": " + str(e), flush=True)
+
+
+def watch(limit=200):
+    mon = _month()
+    with _lock:
+        ev = [(k, n) for (k, m), n in _events.items() if m == mon]
+    out = []
+    for k, n in ev:
+        d = month_count(k) or 1
+        out.append({"key_prefix": k[:12], "events_this_month": n, "devices_this_month": d,
+                    "events_per_device": round(n / float(d), 1), "flag": n / float(d) >= FLAG_EVENTS_PER_DEVICE})
+    out.sort(key=lambda x: -x["events_per_device"])
+    return out[:limit]
+
+
+# ---------------------------------------------------------------- arming
+
+def _arm():
+    global _srv, _armed
+    s = _find_server()
+    if s is None:
+        return False
+    _srv = s
+    _setup(s)
+    if not _armed:
+        for name in ("record_device", "device_count", "sync_stripe_quantities"):
+            _orig.setdefault(name, getattr(s, name, None))
+        s.record_device = record_device
+        s.device_count = device_count
+        s.sync_stripe_quantities = sync_stripe_quantities
+        _armed = True
+    return True
+
+
+def _find_handler_class(ctx):
+    if isinstance(ctx, dict):
+        for k in ("handler_class", "handler", "Handler", "h", "request_handler"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            cls = v if isinstance(v, type) else type(v)
+            if hasattr(cls, "do_GET"):
+                return cls
+    f = sys._getframe()
+    while f is not None:
+        o = f.f_locals.get("self")
+        if o is not None and hasattr(type(o), "do_GET") and hasattr(o, "wfile"):
+            return type(o)
+        f = f.f_back
+    return None
+
+
+def _install_http(ctx):
+    """Serve /admin/meter behind the server's own admin login."""
+    global _patched_http
+    if _patched_http:
+        return True
+    cls = _find_handler_class(ctx)
+    if cls is None:
+        return False
+    if getattr(cls, "_meter_patched", False):
+        _patched_http = True
+        return True
+    og = cls.do_GET
+
+    def do_GET(self):
+        if self.path.split("?")[0].rstrip("/") == "/admin/meter":
+            ok = False
+            try:
+                ok = bool(_srv and _srv.check_admin(self))
+            except Exception:
+                ok = False
+            body = json.dumps({"error": "unauthorized"} if not ok else
+                              {"month": _month(), "rate_per_device_gbp": RATE_GBP, "keys": watch(),
+                               "flag_rule": "%d or more events per device this month - check the key is sending "
+                                            "real device ids" % FLAG_EVENTS_PER_DEVICE}).encode("utf-8")
+            self.send_response(200 if ok else 401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return og(self)
+
+    cls.do_GET = do_GET
+    cls._meter_patched = True
+    _patched_http = True
+    return True
+
+
+def handle(method, action, data, api_key, ctx):
+    armed = _arm()
+    http = _install_http(ctx)
+    flags = [w for w in watch() if w["flag"]] if armed else []
+    return ({"module": "meter", "version": VERSION, "armed": armed and http,
+             "month": _month(), "rate_per_device_gbp": RATE_GBP,
+             "rule": "50p per distinct device per calendar month; billed on the larger of last month and this month so far",
+             "keys_metered_this_month": len(watch()) if armed else 0,
+             "keys_flagged": len(flags),
+             "stripe_sync": "every 6 hours, follows the meter up and down"}, 200)
+
+```
+
+
+## `modules/mutual.py`
+
+543 lines, 19704 bytes
+
+```python
+#!/usr/bin/env python3
+"""
+modules/mutual.py  -  the outbound half of mutual witnessing
+============================================================
+
+Why this exists
+---------------
+modules/witness.py RECEIVES. Other chains hand us their tips and we seal
+them. Nothing in the platform currently SENDS our tip anywhere, so right
+now we witness other people and nobody witnesses us. This module is the
+missing direction.
+
+Drop it in as modules/mutual.py. The router picks it up automatically -
+no edits to server.py.
+
+Routes
+------
+  POST /x/mutual/push      send our current tip to every configured peer
+  POST /x/mutual/pull      fetch every peer's tip and seal it into our chain
+  POST /x/mutual/sync      pull then push (this is the one to schedule)
+  GET  /x/mutual/peers     the configured peers and what happened last time
+  GET  /x/mutual/status    last run, next run, whether the timer is alive
+
+Important design note
+---------------------
+This module does not touch the database or import anything from server.py.
+It talks HTTP to routes that are already public - ours and theirs. That
+means it cannot corrupt anything, it works no matter how seal() changes,
+and every action it takes is one an outsider could audit for themselves.
+
+To read our own tip it calls our own public /x/witness/tip.
+To seal a peer's tip it calls our own public /x/witness/observe, which is
+already built to record exactly that. So a peer tip we pull is recorded by
+the same code path as a peer tip that was pushed to us.
+
+FETCH-ONLY PEERS (added 1.2)
+----------------------------
+observe_url is now OPTIONAL. A peer with a tip_url and no observe_url is
+fetch-only: we read and seal their tip, and we do not try to push ours.
+
+That is a real configuration, not a broken one. Two current cases:
+
+  A peer whose outbound submission lane is deliberately closed during
+  staging. They serve a tip for us to read; their recorder never reaches
+  out. Serving a file is not outbound submission.
+
+  A peer whose tip is a static JSON file with no server behind it. They
+  push to us on their own schedule and there is nothing on their side to
+  POST to. Perfectly valid node.
+
+Before 1.2 push_one read peer["observe_url"] unconditionally, so adding a
+fetch-only peer would have raised KeyError on every cycle - inside a
+background thread with a bare except, so it would have failed silently and
+taken the whole sync with it.
+
+CONCURRENCY - read this before changing it
+------------------------------------------
+A sync cycle makes two kinds of call, and they are treated differently on
+purpose.
+
+  OUTBOUND to other people's hosts (reading their tip, pushing ours) runs
+  in parallel. These are the slow ones - we are waiting on somebody else's
+  server, and there is no reason to wait on them one at a time. Fifty peers
+  now costs roughly what the slowest single peer costs, instead of the sum
+  of all fifty.
+
+  INBOUND to our own server (sealing what we pulled) stays sequential. Our
+  own process is handling those requests, and firing a burst of them at
+  ourselves while we are mid-cycle is asking for trouble - a queue behind a
+  single replica at best. The sealing is fast and local anyway, so there is
+  nothing to gain by parallelising it and a real risk in doing so.
+
+So: fetch everything at once, then seal one at a time.
+
+BEFORE THIS WORKS
+-----------------
+1. "observe" must be in the PUBLIC set of modules/witness.py. If it is not,
+   this module gets a 401 from our own server, same as Red Flag AI Pro did.
+2. After every deploy, the first /x/ request must be a GET - that is what
+   installs the POST branch. Opening /x/mutual/peers in a browser does it.
+"""
+
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "1.2"
+
+# ----------------------------------------------------------------------
+# ROUTER
+# ----------------------------------------------------------------------
+
+# The router reads a set of (METHOD, action) tuples. Anything not listed
+# here needs an API key - default is closed.
+#
+# peers and status are read-only. An outsider being able to see who we
+# witness with, and whether it is actually running, is the entire point.
+#
+# push, pull and sync stay keyed - they cause outbound traffic and are not
+# left open to anonymous callers.
+PUBLIC = {("GET", "peers"), ("GET", "status")}
+
+
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
+
+# Our own public witness routes. Left as full URLs on purpose so this
+# module never has to guess its own host.
+OUR_TIP_URL = "https://sebbi.pro/x/witness/tip"
+OUR_OBSERVE_URL = "https://sebbi.pro/x/witness/observe"
+
+# The name we go by when we hand our tip to someone else.
+OUR_CHAIN_NAME = "aileash"
+
+# Everyone we witness with. Add a dict per chain.
+#   name         what we file their tips under
+#   tip_url      where we GET their current tip          REQUIRED
+#   observe_url  where we POST ours so they record it    OPTIONAL
+#
+# Omit observe_url for a fetch-only peer - see the note at the top. It is
+# not an oversight and the module will not complain about it; /x/mutual/peers
+# reports the direction for each so it is visible rather than assumed.
+PEERS = [
+    {
+        "name": "red-flag-ai-pro",
+        "tip_url": "https://www.redflagaipro.com/api/witness/tip",
+        "observe_url": "https://www.redflagaipro.com/api/witness/anchor",
+    },
+    {
+        # Simon. Serves a static JSON file regenerated on his side, and
+        # pushes to us on his own systemd timer at :23. Nothing to POST to.
+        "name": "flavorflowstrategy.uk",
+        "tip_url": "https://www.flavorflowstrategy.uk/witness.json",
+    },
+    {
+        # PRAXIS / Praesidium, chain 4. Read-only, hash-only, currently
+        # SYNTHETIC_STAGING and regenerating every ten minutes, so expect
+        # liveness "live" rather than "self-consistent" - the tip moves
+        # between their generating it and our fetching it. That is the
+        # normal case for a working chain, not a failure.
+        #
+        # Their outbound submission lane is deliberately closed through
+        # staging, so no observe_url. They also run a signed lane at
+        # /x/peer/submit under peer_id praesidium when they are ready.
+        "name": "praesidium",
+        "tip_url": "https://chain4.thepraesidium.ai/api/witness/tip",
+    },
+]
+
+# Field names to send when pushing our tip. If a peer wants different
+# names, give that peer its own "keys" dict and it will be used instead.
+DEFAULT_PUSH_KEYS = {
+    "chain": "chain",
+    "tip": "tip",
+    "count": "count",
+    "ts": "ts",
+    "url": "url",
+}
+
+# Where peers can read our tip, included in what we push.
+OUR_PUBLIC_URL = "https://sebbi.pro/x/witness/tip"
+
+# Background timer. Set ENABLED to False if you would rather drive it
+# yourself by hitting /x/mutual/sync.
+AUTO_SYNC_ENABLED = True
+AUTO_SYNC_SECONDS = 3600
+
+TIMEOUT_SECONDS = 20
+
+# How many peers we talk to at once. Above this they queue, which is fine -
+# it stops a large network spawning a thread per peer. Eight slow peers at
+# 20s each still finishes in 20s; forty finishes in about a minute worst
+# case, and only if every one of them times out.
+MAX_PARALLEL_PEERS = 8
+
+# ----------------------------------------------------------------------
+# state - deliberately in memory only, this is not evidence
+# ----------------------------------------------------------------------
+
+_state = {
+    "last_run": None,
+    "last_result": None,
+    "runs": 0,
+    "timer_started": False,
+}
+_lock = threading.Lock()
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _reply(payload, status=200):
+    """The router expects (payload, status) back from handle()."""
+    return payload, status
+
+
+def _in_parallel(function, items):
+    """Run function over items concurrently, preserving input order.
+
+    Used only for calls that leave our server. Anything hitting our own
+    process goes through a plain loop instead - see the note at the top.
+    """
+    if not items:
+        return []
+    if len(items) == 1:
+        return [function(items[0])]
+    workers = min(len(items), MAX_PARALLEL_PEERS)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="mutual-peer") as pool:
+        return list(pool.map(function, items))
+
+
+# ----------------------------------------------------------------------
+# http
+# ----------------------------------------------------------------------
+
+def _http(url, payload=None):
+    """POST if payload given, else GET. Returns (status, parsed_or_text)."""
+    data = None
+    headers = {"Accept": "application/json",
+               "User-Agent": "aileash-mutual/%s" % VERSION}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8", "replace")
+            status = response.getcode()
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        status = exc.code
+    except urllib.error.URLError as exc:
+        return 0, "unreachable: %s" % exc.reason
+    except Exception as exc:
+        return 0, "failed: %s" % exc
+    try:
+        return status, json.loads(body)
+    except ValueError:
+        return status, body
+
+
+# Field names a tip can arrive under. Different implementations name it
+# differently and being strict about a name we never published is a bug in
+# the receiver, not in the peer. Order is preference, not importance.
+TIP_FIELDS = ("tip", "hash", "head", "tip_sha256", "root", "current_tip",
+              "chain_tip", "latest")
+
+HEIGHT_FIELDS = ("height", "count", "entries", "tree_size", "size")
+
+
+def _extract_tip(body):
+    """Pull (tip, height) out of whatever shape a tip route returns."""
+    if not isinstance(body, dict):
+        return None, None
+    tip = None
+    for field in TIP_FIELDS:
+        value = body.get(field)
+        if isinstance(value, str) and value.strip():
+            tip = value.strip()
+            break
+    height = None
+    for field in HEIGHT_FIELDS:
+        if field in body:
+            height = body.get(field)
+            break
+    return tip, height
+
+
+# ----------------------------------------------------------------------
+# the two directions
+# ----------------------------------------------------------------------
+
+def our_tip():
+    status, body = _http(OUR_TIP_URL)
+    if status != 200:
+        return None, None, "our own tip route answered %s: %s" % (status, str(body)[:200])
+    tip, height = _extract_tip(body)
+    if not tip:
+        return None, None, "no tip field in our own reply: %s" % str(body)[:200]
+    return tip, height, None
+
+
+def push_one(peer, tip, height):
+    """Hand our tip to one peer so they record it. Outbound only.
+
+    A peer with no observe_url is fetch-only by configuration. Say so and
+    move on rather than treating it as a failure - and never index the key
+    blindly, which is what 1.1 did.
+    """
+    observe_url = peer.get("observe_url")
+    if not observe_url:
+        return {
+            "peer": peer["name"],
+            "direction": "push",
+            "skipped": True,
+            "ok": True,
+            "reason": "fetch-only peer - no observe_url configured",
+            "note": ("We read and seal their tip. They do not accept a push, "
+                     "either because their outbound lane is closed or because "
+                     "their tip is a static file. Not an error."),
+        }
+
+    keys = peer.get("keys", DEFAULT_PUSH_KEYS)
+    values = {
+        "chain": OUR_CHAIN_NAME,
+        "tip": tip,
+        "count": height,
+        "ts": _now(),
+        "url": OUR_PUBLIC_URL,
+    }
+    payload = {keys.get(k, k): v for k, v in values.items()}
+    status, body = _http(observe_url, payload)
+    result = {
+        "peer": peer["name"],
+        "direction": "push",
+        "url": observe_url,
+        "http": status,
+        "ok": 200 <= status < 300,
+        "response": body if isinstance(body, (dict, list)) else str(body)[:300],
+    }
+    if status == 401 or status == 403:
+        result["hint"] = "they want auth on that route, or it is not in their public set"
+    elif status == 404:
+        result["hint"] = "wrong path - check observe_url for this peer"
+    elif status == 0:
+        result["hint"] = "could not reach them at all"
+    return result
+
+
+def fetch_one(peer):
+    """Read one peer's current tip. Outbound only - no sealing here.
+
+    Returns a dict that either carries a tip ready to seal, or an error
+    already shaped like a result so it can be returned to the caller as is.
+    """
+    status, body = _http(peer["tip_url"])
+    if status != 200:
+        return {
+            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
+            "http": status, "ok": False, "_failed": True,
+            "response": body if isinstance(body, (dict, list)) else str(body)[:300],
+            "hint": "could not read their tip",
+        }
+
+    tip, height = _extract_tip(body)
+    if not tip:
+        return {
+            "peer": peer["name"], "direction": "pull", "url": peer["tip_url"],
+            "http": status, "ok": False, "_failed": True,
+            "response": str(body)[:300],
+            "hint": ("no tip field in their reply - add the field name to "
+                     "TIP_FIELDS. Currently accepted: " + ", ".join(TIP_FIELDS)),
+        }
+
+    return {
+        "peer": peer["name"], "url": peer["tip_url"],
+        "tip": tip, "height": height, "_failed": False,
+        "fetched_at": time.time(),
+    }
+
+
+def seal_one(fetched):
+    """Seal one already-fetched peer tip into our chain.
+
+    Goes through our own public observe route so a tip we pulled is
+    recorded by exactly the same code path as a tip somebody pushed to us.
+    Called in a plain loop, never in parallel - this hits our own server.
+
+    Field names must match what modules/witness.py reads out of the body:
+    chain, tip, peer_ts, url. The url is what makes the observation
+    checkable by a third party rather than taken on our word - it is the
+    address we just fetched this tip from.
+    """
+    seal_status, seal_body = _http(OUR_OBSERVE_URL, {
+        "chain": fetched["peer"],
+        "tip": fetched["tip"],
+        "peer_ts": fetched["fetched_at"],
+        "url": fetched["url"],
+    })
+
+    out = {
+        "peer": fetched["peer"],
+        "direction": "pull",
+        "their_tip": fetched["tip"],
+        "their_height": fetched["height"],
+        "sealed_http": seal_status,
+        "ok": 200 <= seal_status < 300,
+        "response": seal_body if isinstance(seal_body, (dict, list)) else str(seal_body)[:300],
+    }
+    if seal_status in (401, 403):
+        out["hint"] = "our own observe route rejected us - check PUBLIC in modules/witness.py"
+    return out
+
+
+def do_push():
+    tip, height, error = our_tip()
+    if error:
+        return {"ok": False, "error": error}
+
+    # Outbound to everyone at once.
+    results = _in_parallel(lambda peer: push_one(peer, tip, height), PEERS)
+
+    return {
+        "ok": True,
+        "our_tip": tip,
+        "our_height": height,
+        "pushed_to": len([r for r in results if not r.get("skipped")]),
+        "fetch_only": len([r for r in results if r.get("skipped")]),
+        "results": results,
+    }
+
+
+def do_pull():
+    # Phase one: read every peer's tip at the same time. This is the slow
+    # part and none of it touches us.
+    fetched = _in_parallel(fetch_one, PEERS)
+
+    # Phase two: seal what came back, one at a time, into our own chain.
+    results = []
+    for item in fetched:
+        if item.get("_failed"):
+            item.pop("_failed", None)
+            results.append(item)
+            continue
+        results.append(seal_one(item))
+
+    return {"ok": True, "results": results}
+
+
+def do_sync():
+    """Pull first, then push. That order matters: the tip we hand out then
+    already contains the tips we just took in, so the two chains interlock
+    rather than merely sitting alongside each other."""
+    started = time.time()
+    pulled = do_pull()
+    pushed = do_push()
+    result = {
+        "ran_at": _now(),
+        "took_seconds": round(time.time() - started, 2),
+        "peers": len(PEERS),
+        "pull": pulled,
+        "push": pushed,
+        "ok": bool(pulled.get("ok")) and bool(pushed.get("ok")),
+    }
+    with _lock:
+        _state["last_run"] = result["ran_at"]
+        _state["last_result"] = result
+        _state["runs"] += 1
+    return result
+
+
+# ----------------------------------------------------------------------
+# background timer
+# ----------------------------------------------------------------------
+
+def _loop():
+    # Let the server finish coming up before the first run.
+    time.sleep(45)
+    while True:
+        try:
+            do_sync()
+        except Exception:
+            pass
+        time.sleep(AUTO_SYNC_SECONDS)
+
+
+def _start_timer():
+    with _lock:
+        if _state["timer_started"] or not AUTO_SYNC_ENABLED:
+            return
+        _state["timer_started"] = True
+    thread = threading.Thread(target=_loop, name="mutual-sync", daemon=True)
+    thread.start()
+
+
+_start_timer()
+
+
+# ----------------------------------------------------------------------
+# router entry point
+# ----------------------------------------------------------------------
+
+def handle(method, action, data, api_key, ctx):
+    action = (action or "").strip("/").lower()
+
+    if method == "GET":
+        if action == "peers":
+            return _reply({
+                "chain": OUR_CHAIN_NAME,
+                "version": VERSION,
+                "peers": [
+                    {"name": p["name"],
+                     "tip_url": p["tip_url"],
+                     "observe_url": p.get("observe_url"),
+                     "direction": ("both" if p.get("observe_url")
+                                   else "fetch-only")}
+                    for p in PEERS
+                ],
+                "parallel_fetch": MAX_PARALLEL_PEERS,
+                "tip_fields_accepted": list(TIP_FIELDS),
+                "note": ("Witnessing is only mutual if both columns are live. "
+                         "A fetch-only peer is one we read and seal but who "
+                         "does not accept a push - either their outbound lane "
+                         "is closed or their tip is a static file. Both are "
+                         "valid; the direction is published rather than "
+                         "implied."),
+            })
+        if action == "status":
+            with _lock:
+                return _reply({
+                    "version": VERSION,
+                    "auto_sync": AUTO_SYNC_ENABLED,
+                    "interval_seconds": AUTO_SYNC_SECONDS,
+                    "timer_running": _state["timer_started"],
+                    "parallel_fetch": MAX_PARALLEL_PEERS,
+                    "runs": _state["runs"],
+                    "last_run": _state["last_run"],
+                    "last_result": _state["last_result"],
+                })
+
+    if method == "POST":
+        if action == "push":
+            return _reply(do_push())
+        if action == "pull":
+            return _reply(do_pull())
+        if action == "sync":
+            return _reply(do_sync())
+
+    return _reply({
+        "error": "unknown action",
+        "GET": ["peers", "status"],
+        "POST": ["push", "pull", "sync"],
+    }, 404)
+
+```
+
+
+## `modules/network.py`
+
+487 lines, 19842 bytes
+
+```python
+"""
+modules/network.py  -  serves the public witness network page
+
+WHY THIS IS A MODULE AND NOT A TEMPLATE
+---------------------------------------
+The router hands whatever handle() returns to send_json, so a module cannot
+return HTML through it - it would arrive as a JSON string. So this does the
+same thing router.py already does for POST: it patches the request handler at
+runtime, adds a branch for the page path, and leaves every other path exactly
+as it was. The patch is idempotent and lives in memory, so a restart reverts it.
+
+THE SAME CATCH AS THE POST PATCH
+--------------------------------
+A module is only imported when a request reaches the router. So after every
+deploy, one request to /x/network/status has to arrive before /witness works.
+Opening /x/network/status in a browser does it. Until then the page path falls
+through to whatever the server did before, which is a 404 - not an error page,
+just the old behaviour.
+
+If you would rather not patch anything, the same HTML works as a plain file in
+static/. This exists because the page then lives with the module it describes
+rather than drifting away from it.
+
+ROUTES
+------
+  GET /witness            the page
+  GET /witness.html       same page
+  GET /x/network/status   whether the patch is installed (public)
+
+The page itself holds no data. It reads /x/witness/tip and /x/witness/peers
+from the browser, same as any other visitor would, so it cannot show anything
+a stranger could not verify for themselves.
+"""
+
+import sys
+
+VERSION = "1.0"
+
+PUBLIC = {("GET", "status")}
+
+PAGE_PATHS = ("/witness", "/witness.html", "/network")
+
+_patched = [False]
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The witness network — AILeash</title>
+<meta name="description" content="Two independent platforms recording each other's records, hourly. Checkable by anyone, without an account.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,600&family=Inter+Tight:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#E9EDE4;
+  --paper-deep:#DFE5D8;
+  --ink:#18241F;
+  --ink-soft:#4A5A52;
+  --rule:#BFCCBF;
+  --rule-strong:#9AAC9C;
+  --stamp:#7C2B38;
+  --verdigris:#2F6B5E;
+  --amber:#9A6B1F;
+  --gutter:#CBD6C8;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;
+  background:var(--paper);
+  color:var(--ink);
+  font-family:"Inter Tight",system-ui,sans-serif;
+  font-size:17px;
+  line-height:1.6;
+  /* ruled paper, faint */
+  background-image:repeating-linear-gradient(
+    to bottom,
+    transparent 0 31px,
+    rgba(154,172,156,.20) 31px 32px
+  );
+}
+.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+
+/* ---------- masthead ---------- */
+.masthead{padding:52px 0 30px;border-bottom:2px solid var(--ink)}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--ink-soft);margin:0 0 18px;
+}
+h1{
+  font-family:Fraunces,Georgia,serif;
+  font-weight:600;font-size:clamp(2.5rem,7.5vw,4.6rem);
+  line-height:1.02;letter-spacing:-.02em;margin:0 0 20px;
+}
+h1 em{font-style:italic;font-weight:300}
+.standfirst{font-size:clamp(1.05rem,2.4vw,1.28rem);max-width:40ch;color:var(--ink-soft);margin:0}
+
+/* ---------- the spread ---------- */
+.spread{
+  margin:44px 0 8px;
+  border:1px solid var(--rule-strong);
+  background:rgba(255,255,255,.4);
+}
+.spread-head{
+  display:grid;grid-template-columns:1fr 92px 1fr;
+  border-bottom:1px solid var(--rule-strong);
+}
+.spread-head div{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  padding:12px 16px;color:var(--ink-soft);
+}
+.spread-head .mid{text-align:center;background:var(--gutter);color:var(--ink)}
+.spread-head .right{text-align:right}
+.folio{
+  display:grid;grid-template-columns:1fr 92px 1fr;
+  border-bottom:1px solid var(--rule);
+}
+.folio:last-child{border-bottom:0}
+.side{padding:20px 16px;min-width:0}
+.side.right{text-align:right}
+.mid{
+  background:var(--gutter);
+  display:flex;align-items:center;justify-content:center;
+  font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-soft);
+  border-left:1px solid var(--rule);border-right:1px solid var(--rule);
+}
+.chain-name{
+  font-family:Fraunces,Georgia,serif;font-size:1.35rem;font-weight:600;
+  margin:0 0 4px;letter-spacing:-.01em;
+}
+.role{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--ink-soft);margin:0 0 14px}
+.hash{
+  font-family:"IBM Plex Mono",monospace;font-size:12.5px;
+  word-break:break-all;color:var(--ink);margin:0 0 3px;line-height:1.45;
+}
+.hash-label{font-family:"IBM Plex Mono",monospace;font-size:10.5px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 5px}
+.meta{font-size:14px;color:var(--ink-soft);margin:12px 0 0}
+.meta b{color:var(--ink);font-weight:600}
+
+/* ---------- stamp ---------- */
+.stamp{
+  display:inline-block;margin-top:16px;padding:6px 13px 5px;
+  border:2.5px solid var(--stamp);color:var(--stamp);
+  font-family:"IBM Plex Mono",monospace;font-weight:500;
+  font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+  transform:rotate(-3.5deg);opacity:.9;
+}
+.stamp.press{animation:press .5s cubic-bezier(.2,1.5,.4,1) both}
+@keyframes press{
+  0%{opacity:0;transform:rotate(-3.5deg) scale(1.5)}
+  70%{opacity:.95;transform:rotate(-3.5deg) scale(.97)}
+  100%{opacity:.9;transform:rotate(-3.5deg) scale(1)}
+}
+.stamp.live{border-color:var(--verdigris);color:var(--verdigris)}
+.stamp.weak{border-color:var(--amber);color:var(--amber)}
+.stamp.flag{background:var(--stamp);color:var(--paper)}
+
+/* ---------- sections ---------- */
+section{padding:56px 0;border-top:1px solid var(--rule-strong)}
+h2{
+  font-family:Fraunces,Georgia,serif;font-weight:600;
+  font-size:clamp(1.6rem,4vw,2.3rem);letter-spacing:-.015em;
+  margin:0 0 8px;line-height:1.15;
+}
+.sec-note{color:var(--ink-soft);max-width:56ch;margin:0 0 30px}
+p{max-width:62ch}
+
+.defs{display:grid;gap:0;border-top:1px solid var(--rule)}
+.def{
+  display:grid;grid-template-columns:170px 1fr;gap:20px;
+  padding:15px 0;border-bottom:1px solid var(--rule);
+}
+.def dt{
+  font-family:"IBM Plex Mono",monospace;font-size:12px;
+  letter-spacing:.1em;text-transform:uppercase;padding-top:3px;
+}
+.def dd{margin:0;color:var(--ink-soft)}
+.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;vertical-align:middle}
+.dot.ok{background:var(--stamp)}
+.dot.mid-c{background:var(--verdigris)}
+.dot.weak{background:var(--amber)}
+
+.limits li{max-width:62ch;margin-bottom:13px;color:var(--ink-soft)}
+.limits b{color:var(--ink)}
+
+pre{
+  font-family:"IBM Plex Mono",monospace;font-size:13px;line-height:1.7;
+  background:var(--ink);color:var(--paper);padding:20px;overflow-x:auto;
+  border:0;margin:22px 0;
+}
+pre .k{color:#9FC6B4}
+code{font-family:"IBM Plex Mono",monospace;font-size:.92em}
+
+.links{list-style:none;padding:0;margin:24px 0 0}
+.links li{border-bottom:1px solid var(--rule);padding:13px 0}
+.links a{
+  font-family:"IBM Plex Mono",monospace;font-size:13.5px;
+  color:var(--ink);text-decoration:none;word-break:break-all;
+  display:flex;justify-content:space-between;gap:16px;align-items:baseline;
+}
+.links a:hover,.links a:focus-visible{color:var(--stamp)}
+.links span{color:var(--ink-soft);font-family:"Inter Tight",sans-serif;
+  font-size:13px;flex:0 0 auto;text-align:right}
+
+footer{padding:40px 0 70px;color:var(--ink-soft);font-size:14px}
+footer a{color:var(--ink)}
+
+.loading,.errbox{
+  font-family:"IBM Plex Mono",monospace;font-size:13px;
+  color:var(--ink-soft);padding:26px 16px;
+}
+.errbox b{display:block;color:var(--ink);margin-bottom:6px;font-family:"Inter Tight",sans-serif;font-size:15px}
+
+a:focus-visible,button:focus-visible{outline:2.5px solid var(--stamp);outline-offset:3px}
+
+@media (max-width:760px){
+  body{background-image:none}
+  .spread-head,.folio{grid-template-columns:1fr}
+  .spread-head .mid,.folio .mid{
+    border-left:0;border-right:0;
+    border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
+    padding:7px 0;text-align:center;
+  }
+  .spread-head .right,.side.right{text-align:left}
+  .spread-head div{padding:9px 14px}
+  .def{grid-template-columns:1fr;gap:5px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">AILeash · the witness network</p>
+    <h1>Two ledgers.<br><em>Neither one is the authority.</em></h1>
+    <p class="standfirst">Independent platforms record each other's records, every hour. You can check it yourself, right now, without an account.</p>
+  </header>
+
+  <div class="spread" id="spread">
+    <div class="spread-head">
+      <div>This chain</div>
+      <div class="mid">Exchange</div>
+      <div class="right">Recorded by</div>
+    </div>
+    <div id="folios">
+      <div class="loading">Reading the ledger…</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Why this exists</h2>
+    <p class="sec-note">Every platform that sells you an audit trail also holds it.</p>
+    <p>A hash chain stops anyone else altering the record. It does not stop the operator rebuilding the whole thing and presenting the result as history. Anchoring the chain externally narrows that down — you can't rewrite anything older than your last anchor — and it still leaves the keeper and the checker as the same party.</p>
+    <p>Nothing you build alone closes that. Somebody outside has to be holding a copy.</p>
+    <p>So each platform here takes the fingerprint of the others' records and seals it into its own. To rewrite your past now, everyone holding a copy would have to rewrite theirs in step, and re-obtain external timestamps that were issued days ago. The second half is the part that can't be done.</p>
+  </section>
+
+  <section>
+    <h2>What the marks mean</h2>
+    <p class="sec-note">Two checks run on every submission. Neither can reject one — everything gets sealed. What changes is how strong we say the claim is.</p>
+
+    <dl class="defs">
+      <div class="def"><dt><span class="dot ok"></span>Confirmed</dt><dd>We fetched the address given and it served exactly the tip that was submitted.</dd></div>
+      <div class="def"><dt><span class="dot mid-c"></span>Live</dt><dd>The address served a valid but different tip. A working chain moves between submitting and our looking — normal, not a failure.</dd></div>
+      <div class="def"><dt><span class="dot weak"></span>Self-declared</dt><dd>No address given, or we couldn't reach it. Taken on their word, and marked as such.</dd></div>
+      <div class="def"><dt>First-use</dt><dd>First time this name appeared. It's now bound to the address it came from.</dd></div>
+      <div class="def"><dt>Bound</dt><dd>Same address as the first time this name appeared. The same operator, consistently.</dd></div>
+      <div class="def"><dt>Conflict</dt><dd>This name has been submitted from a different address than the one it was first bound to. Still sealed, permanently flagged. Operators do move hosts — but you get to see it and decide.</dd></div>
+    </dl>
+  </section>
+
+  <section>
+    <h2>What this does not prove</h2>
+    <p class="sec-note">Said plainly, because the value of the rest depends on it.</p>
+    <ul class="limits">
+      <li><b>It doesn't prove a record was true when it was written.</b> Nothing can. No system reaches back to verify what someone was thinking or whether the data going in was honest. This proves what was recorded, when, and that it hasn't changed since.</li>
+      <li><b>It doesn't prove identity.</b> A name is self-declared. Checking the address proves someone runs a live chain producing that data — not that they're who they say. Binding a name to its first address is what makes a change visible.</li>
+      <li><b>Two platforms checking each other isn't much of a network.</b> The strength comes from breadth. This gets meaningfully harder to bend with every chain that joins, and not before.</li>
+      <li><b>A participant can go quiet.</b> Nobody can force anyone to keep publishing. Gaps show up as stale or silent rather than disappearing, which is the point.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Joining</h2>
+    <p class="sec-note">Chains submit their current head to the network and record the heads of others in return.</p>
+    <pre><span class="k">POST</span> https://sebbi.pro/x/witness/observe
+<span class="k">Content-Type:</span> application/json
+
+{
+  "chain": "your-chain-name",
+  "tip":   "&lt;64 hex characters — your current chain head&gt;",
+  "url":   "https://yoursite/your/tip",
+  "ts":    "2026-08-02T14:00:00Z"
+}</pre>
+    <p><code>url</code> is the address we fetch to check your tip independently — it's the difference between confirmed and self-declared. <code>ts</code> is optional, epoch or ISO.</p>
+    <p>Running a chain in the other direction, recording ours as we record yours, is what makes it mutual rather than us keeping a list. If you operate a platform in this space and you're willing to have your history held somewhere you don't control, message me and we'll talk through it and what it costs.</p>
+  </section>
+
+  <section>
+    <h2>Check it yourself</h2>
+    <p class="sec-note">Nothing here needs a login. Open any of these.</p>
+    <ul class="links">
+      <li><a href="/x/witness/tip">/x/witness/tip<span>our current head</span></a></li>
+      <li><a href="/x/witness/peers">/x/witness/peers<span>everyone we record</span></a></li>
+      <li><a href="/api/verify-chain">/api/verify-chain<span>chain checked end to end</span></a></li>
+      <li><a href="/api/anchor-status">/api/anchor-status<span>the external timestamp</span></a></li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>Sealed records and their attestations are held by each participating platform independently. AILeash operates one chain in this network; it does not run the network. — <a href="https://sebbi.pro">sebbi.pro</a></p>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  var folios = document.getElementById('folios');
+
+  function esc(s){
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  function stampFor(liveness, nameStatus){
+    var cls = 'stamp press', text = String(liveness || 'unchecked');
+    if (liveness === 'confirmed') cls += '';
+    else if (liveness === 'live') cls += ' live';
+    else cls += ' weak';
+    if (nameStatus === 'conflict'){ cls += ' flag'; text = 'conflict'; }
+    return '<span class="' + cls + '">' + esc(text) + '</span>';
+  }
+
+  function ago(hours){
+    if (hours == null) return 'unknown';
+    if (hours < 1) return 'within the hour';
+    if (hours < 2) return 'an hour ago';
+    if (hours < 48) return Math.round(hours) + ' hours ago';
+    return Math.round(hours / 24) + ' days ago';
+  }
+
+  function render(ours, peers){
+    if (!peers || !peers.length){
+      folios.innerHTML = '<div class="errbox"><b>No chains recorded yet.</b>' +
+        'Nothing has been submitted to this chain. The first tip posted to ' +
+        '/x/witness/observe appears here.</div>';
+      return;
+    }
+    var html = '';
+    peers.forEach(function(p){
+      html += '<div class="folio">' +
+        '<div class="side">' +
+          '<p class="chain-name">' + esc(ours.name) + '</p>' +
+          '<p class="role">head of chain · height ' + esc(ours.height) + '</p>' +
+          '<p class="hash-label">Current tip</p>' +
+          '<p class="hash">' + esc(ours.tip) + '</p>' +
+          '<p class="meta">Sealed <b>' + esc(ours.sealed) + '</b></p>' +
+        '</div>' +
+        '<div class="mid">↔</div>' +
+        '<div class="side right">' +
+          '<p class="chain-name">' + esc(p.peer) + '</p>' +
+          '<p class="role">' + esc(p.observations) + ' observations · ' +
+              esc(p.distinct_tips) + ' distinct tips</p>' +
+          '<p class="hash-label">Name bound to</p>' +
+          '<p class="hash">' + esc(p.bound_to || 'no address supplied') + '</p>' +
+          '<p class="meta">Last recorded <b>' + esc(ago(p.hours_since_last)) + '</b> · ' +
+              esc(p.name_status || 'unchecked') + '</p>' +
+          stampFor(p.liveness, p.name_status) +
+        '</div>' +
+      '</div>';
+    });
+    folios.innerHTML = html;
+  }
+
+  function failed(){
+    folios.innerHTML = '<div class="errbox"><b>The ledger did not answer.</b>' +
+      'The endpoints are public, so you can try them directly: ' +
+      '<a href="/x/witness/peers">/x/witness/peers</a></div>';
+  }
+
+  Promise.all([
+    fetch('/x/witness/tip').then(function(r){ return r.json(); }),
+    fetch('/x/witness/peers').then(function(r){ return r.json(); })
+  ]).then(function(res){
+    var tip = res[0] || {}, peers = res[1] || {};
+    render({
+      name: 'aileash',
+      tip: tip.tip || 'unavailable',
+      height: tip.height == null ? '—' : tip.height,
+      sealed: tip.sealed_at ? new Date(tip.sealed_at).toUTCString().replace(' GMT','  UTC') : 'unknown'
+    }, peers.peers || []);
+  }).catch(failed);
+})();
+</script>
+
+</body>
+</html>
+"""
+
+
+def _srv():
+    m = sys.modules.get("__main__")
+    if hasattr(m, "get_bearer"):
+        return m
+    return sys.modules.get("server")
+
+
+def _install(s):
+    """Add a page branch to do_GET at runtime. Idempotent and reversible."""
+    if _patched[0]:
+        return "already installed"
+    H = getattr(s, "Handler", None)
+    if H is None or not hasattr(H, "do_GET"):
+        return "no handler"
+    if getattr(H, "_page_patched", False):
+        _patched[0] = True
+        return "already installed"
+
+    original = H.do_GET
+
+    def do_GET(self):
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(self.path).path.rstrip("/") or "/"
+        except Exception:
+            p = self.path or "/"
+        if p in PAGE_PATHS:
+            body = PAGE.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+            return
+        return original(self)
+
+    H.do_GET = do_GET
+    H._page_patched = True
+    _patched[0] = True
+    print("NETWORK: /witness page branch installed at runtime", flush=True)
+    return "installed"
+
+
+def handle(method, action, data, api_key, ctx):
+    s = _srv()
+    if s is None:
+        return {"error": "server_not_found"}, 500
+
+    state = "already installed" if _patched[0] else None
+    if not _patched[0]:
+        try:
+            state = _install(s)
+        except Exception as exc:
+            print("NETWORK: page patch failed - " + str(exc), flush=True)
+            state = "failed: " + str(exc)
+
+    if method == "GET" and (action or "") in ("", "status"):
+        return {
+            "page": "/witness",
+            "installed": bool(_patched[0]),
+            "install_result": state,
+            "paths": list(PAGE_PATHS),
+            "version": VERSION,
+            "note": "The page reads /x/witness/tip and /x/witness/peers from the browser. It holds no data of its own.",
+        }, 200
+
+    return {"error": "unknown_action", "action": action,
+            "GET": ["status"]}, 404
+
+```
+
+
+## `modules/noexec.py`
+
+490 lines, 22739 bytes
+
+```python
+"""
+modules/noexec.py  v1.1.0
+The NO-EXEC blind bundle: six real objects from the live system, each one
+authentic, each one attached to a claim it may not support.
+
+Arm after each deploy:  https://sebbi.pro/x/noexec/status
+
+    GET /x/noexec/build              mint the six objects on the live chain,
+                                     pack them into one bundle, seal the
+                                     bundle fingerprint and a salted
+                                     commitment to the answer key, and hand
+                                     back the links (one build per 10 minutes)
+    GET /x/noexec/bundle?id=         the bundle exactly as sent: claims and
+                                     objects only, no verdicts, no hints
+    GET /x/noexec/reveal?id=&secret= the answer key plus its salt, so anyone
+                                     can recompute the sealed commitment
+    GET /x/noexec/reveal?id=&admin=  the operator's own unlock (ADMIN_PASSWORD), for
+                                     when the reveal link is lost. It publishes the
+                                     key: from then on the plain link works for anyone
+                                     and the reveal itself is sealed in the chain
+    GET /x/noexec/status             module status
+
+How the six are made (nothing faked, nothing edited afterwards):
+  1  a passport minted, then redeemed once, redemption sealed
+  2  a passport minted, then its grant revoked, revocation sealed
+  3  a passport minted for one site, never presented anywhere
+  4  a signed authority proof bundle for an ALLOW evaluation whose grant
+     window is fifteen minutes long
+  5  the sealed Temporal Standing Test evidence package, run r_72d2d93a5c2a4988
+  6  the latest self-proving archive file and the sealed custody count
+
+Built on continuity.py (1.6.0+) and passport.py. Neither is changed.
+"""
+
+import hashlib
+import importlib
+import importlib.util
+import json
+import os
+import secrets
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+
+VERSION = "1.1.0"
+PUBLIC = {("GET", "status"), ("GET", "spec"), ("GET", "build"), ("GET", "bundle"), ("GET", "reveal")}
+
+SITE = "https://sebbi.pro"
+KEY = "noexec-blind-bundle"
+GAP = 600
+CAP = "noexec.pay"
+TAGS = ["noexec"]
+AUD = "checkout.sebbi.pro"
+AUD_OTHER = "bookings.sebbi.pro"
+PARAMS = {"amount": 20}
+TST_RUN = "r_72d2d93a5c2a4988"
+TST_REVIEW = "https://studio.moralclarity.ai/temporal-standing-test"
+
+_ready = False
+_last = [0.0]
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+
+
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _sha(obj):
+    return hashlib.sha256(_canon(obj).encode("utf-8")).hexdigest()
+
+
+def _block_url(n):
+    return SITE + "/x/walk/block?index=%s" % n if n is not None else None
+
+
+def _load(name, must_have):
+    for m in list(sys.modules.values()):
+        f = getattr(m, "__file__", "") or ""
+        if f.endswith(os.sep + name + ".py") and all(hasattr(m, a) for a in must_have):
+            return m
+    pkg = __package__ or ""
+    try:
+        m = importlib.import_module(pkg + "." + name if pkg else name)
+        if all(hasattr(m, a) for a in must_have):
+            return m
+    except Exception:
+        pass
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+    spec = importlib.util.spec_from_file_location("noexec_" + name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _call(name, action, data, ctx):
+    """Ask another live module for one of its public answers. Never raises."""
+    try:
+        m = _load(name, ("handle",))
+        out = m.handle("GET", action, data, None, ctx)
+        body = out[0] if isinstance(out, tuple) else out
+        return body if isinstance(body, dict) else {"raw": str(body)[:4000]}
+    except Exception as e:
+        return {"unavailable": str(e)[:200]}
+
+
+def _setup(ctx):
+    global _ready
+    if _ready:
+        return
+    with ctx["lock"]:
+        c = ctx["conn"]
+        c.execute("CREATE TABLE IF NOT EXISTS noexec_bundle(id TEXT PRIMARY KEY,created REAL,"
+                  "bundle TEXT,bundle_sha256 TEXT,answer_key TEXT,key_commitment TEXT,"
+                  "secret_digest TEXT,audit_hash TEXT,block_index INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS noexec_revealed(id TEXT PRIMARY KEY,at REAL,"
+                  "how TEXT,audit_hash TEXT,block_index INTEGER)")
+        c.commit()
+    _ready = True
+
+
+def _seal(ctx, kind, extra):
+    ev = {"user_id": "noexec:" + kind[:20], "action": kind, "amount": 0, "country": "UK",
+          "device_id": "noexec", "anomaly": 0, "device_risk": 0}
+    res = {"decision": kind.upper(), "score": 0, "noexec_version": VERSION}
+    res.update(extra)
+    out = ctx["seal"](ev, res, time.time(), KEY)
+    if isinstance(out, (list, tuple)):
+        return out[0], (out[1] if len(out) > 1 else None)
+    return out, None
+
+
+def _grant(C, ctx, gid, subject, now):
+    g = {"id": gid, "issuer": "justin-dobson", "issuer_kind": "human", "subject": subject,
+         "scope": [CAP], "constraints": {"max_amount": 50},
+         "purpose": "NO-EXEC blind bundle for independent review", "purpose_tags": TAGS,
+         "not_after": now + 900}
+    r, s = C._issue(ctx, KEY, g)
+    if s != 200:
+        raise RuntimeError("grant %s not issued: %s" % (gid, _canon(r)[:300]))
+    return r
+
+
+def _mint(P, C, ctx, gid, audience):
+    r, s = P._mint(ctx, C, KEY, {"grant": gid, "action": CAP, "params": PARAMS,
+                                 "purpose_tag": TAGS[0], "audience": audience})
+    if s != 200 or not r.get("issued"):
+        raise RuntimeError("passport for %s not issued: %s" % (gid, _canon(r)[:300]))
+    return r
+
+
+def _passport_sources(token, gid, issued_block):
+    return {"live_check": SITE + "/x/passport/verify?token=" + token,
+            "token_format": SITE + "/x/passport/spec",
+            "public_key": SITE + "/x/continuity/pubkey",
+            "grant_lineage": SITE + "/x/continuity/trace?grant=" + gid,
+            "issued_in_block": _block_url(issued_block)}
+
+
+def _build(ctx):
+    now = time.time()
+    if now - _last[0] < GAP:
+        return {"error": "too_soon", "retry_after_seconds": int(GAP - (now - _last[0]))}, 429
+    _last[0] = now
+    C = _load("continuity", ("_issue", "_evaluate", "_revoke", "_proof", "_confirm"))
+    P = _load("passport", ("_mint", "_redeem", "_check"))
+    C._setup(ctx)
+    P._setup(ctx)
+
+    tag = uuid.uuid4().hex[:10]
+    agent = "agent-" + tag
+    cases, key = [], []
+
+    # 1 - the spent passport
+    g1 = "nx_%s_1" % tag
+    _grant(C, ctx, g1, agent, now)
+    p1 = _mint(P, C, ctx, g1, AUD)
+    r1, _s = P._redeem(ctx, C, {"token": p1["passport"], "audience": AUD, "params": PARAMS})
+    if not r1.get("redeemed"):
+        raise RuntimeError("case 1 redemption did not bind: %s" % _canon(r1)[:300])
+    cases.append({"case": 1,
+                  "claim": "This agent is authorised to perform this action.",
+                  "presented_at": AUD, "action": CAP, "params": PARAMS,
+                  "object": {"passport": p1["passport"]},
+                  "sources": _passport_sources(p1["passport"], g1, p1.get("block_index"))})
+    key.append({"case": 1, "verdict": "NOT PROVEN",
+                "what_it_proves": "Authorised once, for %s of %s at %s." % (CAP, _canon(PARAMS), AUD),
+                "why_not": "Already redeemed; the redemption is sealed in block %s. Nothing "
+                           "authorises a further execution." % r1.get("block_index"),
+                "evidence": [_block_url(r1.get("block_index"))]})
+
+    # 2 - the revoked passport
+    g2 = "nx_%s_2" % tag
+    _grant(C, ctx, g2, agent, now)
+    p2 = _mint(P, C, ctx, g2, AUD)
+    rv, _s = C._revoke(ctx, KEY, {"grant": g2, "reason": "human withdrew the authority"})
+    cases.append({"case": 2,
+                  "claim": "This agent was authorised at the moment of action.",
+                  "presented_at": AUD, "action": CAP, "params": PARAMS,
+                  "object": {"passport": p2["passport"]},
+                  "sources": _passport_sources(p2["passport"], g2, p2.get("block_index"))})
+    key.append({"case": 2, "verdict": "NOT PROVEN",
+                "what_it_proves": "The signature is genuine and the passport was in date: an "
+                                  "offline verifier says VALID.",
+                "why_not": "The grant behind it was revoked (block %s) after issue. Standing is "
+                           "lost, so no moment of action after that is authorised. Signature "
+                           "validity is not standing." % rv.get("block_index"),
+                "evidence": [_block_url(rv.get("block_index")),
+                             SITE + "/x/continuity/trace?grant=" + g2]})
+
+    # 3 - the misdirected passport (never presented anywhere, so still unspent)
+    g3 = "nx_%s_3" % tag
+    _grant(C, ctx, g3, agent, now)
+    p3 = _mint(P, C, ctx, g3, AUD_OTHER)
+    cases.append({"case": 3,
+                  "claim": "This agent is authorised to act at %s." % AUD,
+                  "presented_at": AUD, "action": CAP, "params": PARAMS,
+                  "object": {"passport": p3["passport"]},
+                  "sources": _passport_sources(p3["passport"], g3, p3.get("block_index"))})
+    key.append({"case": 3, "verdict": "NOT PROVEN",
+                "what_it_proves": "Genuine, unspent and unrevoked authority at %s." % AUD_OTHER,
+                "why_not": "The passport's audience is %s. It says nothing about %s."
+                           % (AUD_OTHER, AUD),
+                "evidence": [SITE + "/x/passport/spec"]})
+
+    # 4 - the signed proof of a past ALLOW
+    g4 = "nx_%s_4" % tag
+    gr4 = _grant(C, ctx, g4, agent, now)
+    ev, s = C._evaluate(ctx, KEY, {"grant": g4, "action": CAP, "params": PARAMS,
+                                   "purpose_tag": TAGS[0]})
+    if s != 200 or ev.get("verdict") != "ALLOW":
+        raise RuntimeError("case 4 evaluation was not ALLOW: %s" % _canon(ev)[:300])
+    proof, s = C._proof(ctx, {"evaluation": ev["evaluation"]})
+    if s != 200:
+        raise RuntimeError("case 4 proof not produced: %s" % _canon(proof)[:300])
+    cases.append({"case": 4,
+                  "claim": "This agent holds this authority.",
+                  "object": {"authority_proof": proof},
+                  "sources": {"proof": SITE + "/x/continuity/proof?evaluation=" + ev["evaluation"],
+                              "public_key": SITE + "/x/continuity/pubkey",
+                              "derivation_rules": SITE + "/x/continuity/spec",
+                              "grant_lineage": SITE + "/x/continuity/trace?grant=" + g4}})
+    key.append({"case": 4, "verdict": "NOT PROVEN",
+                "what_it_proves": "Authority stood, and the ALLOW re-derives from the lineage, at "
+                                  "%s." % ev.get("evaluated_at", _iso(now)),
+                "why_not": "A proof of an instant says nothing about now. The grant's window "
+                           "closes at %s; any present-tense claim needs a live standing check."
+                           % gr4.get("not_after"),
+                "evidence": [SITE + "/x/continuity/trace?grant=" + g4]})
+
+    # 5 - the real test, the narrower finding
+    tst = _call("standing", "evidence", {"run": TST_RUN}, ctx)
+    cases.append({"case": 5,
+                  "claim": "sebbi.pro passed the Temporal Standing Test.",
+                  "object": {"evidence_package": tst},
+                  "sources": {"evidence": SITE + "/x/standing/evidence?run=" + TST_RUN,
+                              "freeze_sealed_in": _block_url(2387),
+                              "run_sealed_in": _block_url(2398),
+                              "test_definition": TST_REVIEW}})
+    key.append({"case": 5, "verdict": "NOT PROVEN",
+                "what_it_proves": "A pre-registered run, freeze sealed before execution (block "
+                                  "2387 before 2398), both branches recorded as observed.",
+                "why_not": "The independent reviewer's finding is narrower than the package's "
+                           "own 'PASS': revocation-aware authorisation and execution binding "
+                           "ESTABLISHED; temporal standing on external facts (a still-valid "
+                           "grant defeated by a change in an authoritative external fact) NOT "
+                           "YET ESTABLISHED. The object is authentic; its summary overstates "
+                           "what it supports.",
+                "evidence": [SITE + "/x/standing/evidence?run=" + TST_RUN, TST_REVIEW]})
+
+    # 6 - the archive with no custodians
+    man = _call("archive", "manifest", {}, ctx)
+    files = man.get("files") if isinstance(man, dict) else None
+    latest = files[0] if isinstance(files, list) and files else man
+    cus = _call("custody", "status", {}, ctx)
+    cases.append({"case": 6,
+                  "claim": "sebbi.pro's record is held independently.",
+                  "object": {"archive_file": latest, "custody": cus},
+                  "sources": {"archive_manifest": SITE + "/x/archive/manifest",
+                              "archive_file": (latest or {}).get("file") if isinstance(latest, dict) else None,
+                              "sealed_in": (latest or {}).get("check_block") if isinstance(latest, dict) else None,
+                              "custody_count": SITE + "/x/custody/status"}})
+    key.append({"case": 6, "verdict": "NOT PROVEN",
+                "what_it_proves": "Integrity: the file is content-addressed, sealed in the chain, "
+                                  "and its embedded verifier passes.",
+                "why_not": "Independence: the sealed custody count of holders other than "
+                           "sebbi.pro is %s." % _custody_count(cus),
+                "evidence": [SITE + "/x/custody/status"]})
+
+    for c in cases:
+        c["object_sha256"] = _sha(c["object"])
+
+    bid = "nx_" + tag
+    captured = _iso(time.time())
+    bundle = {
+        "bundle": bid,
+        "format": "noexec-blind-bundle/1",
+        "issuer": "sebbi.pro",
+        "captured_at": captured,
+        "instructions": "Six objects taken from the live system. Each is presented with the "
+                        "claim being made with it and nothing else. Fetch every source "
+                        "yourself rather than trusting this copy; each object carries the "
+                        "SHA-256 of its canonical JSON (keys sorted, separators ',' ':').",
+        "format_notes": {
+            "passport": "sbp1.<base64url body>.<base64url Ed25519 signature>; the signature "
+                        "is over 'AILEASH-PASSPORT-v1:' || body bytes. Passports carry a "
+                        "5-minute validity window (exp).",
+            "chain_blocks": SITE + "/x/walk/block?index=<n>",
+        },
+        "cases": cases,
+    }
+    bundle_sha = _sha(bundle)
+
+    salt = secrets.token_hex(32)
+    answer = {"bundle": bid, "bundle_sha256": bundle_sha, "salt": salt, "answers": key}
+    commitment = _sha(answer)
+    secret = secrets.token_urlsafe(18)
+    audit_hash, block = _seal(ctx, "noexec_bundle_committed",
+                              {"bundle": bid, "bundle_sha256": bundle_sha,
+                               "answer_key_commitment": commitment,
+                               "detail": "bundle=%s;sha256=%s;key_commitment=%s"
+                                         % (bid, bundle_sha, commitment)})
+    with ctx["lock"]:
+        ctx["conn"].execute("INSERT INTO noexec_bundle VALUES(?,?,?,?,?,?,?,?,?)",
+                            (bid, time.time(), _canon(bundle), bundle_sha, _canon(answer),
+                             commitment, hashlib.sha256(secret.encode()).hexdigest(),
+                             audit_hash, block))
+        ctx["conn"].commit()
+    return {"built": True, "bundle": bid,
+            "send_this_link": SITE + "/x/noexec/bundle?id=" + bid,
+            "bundle_sha256": bundle_sha,
+            "answer_key_commitment": commitment,
+            "sealed_in_chain": audit_hash, "block_index": block,
+            "check_the_seal": _block_url(block),
+            "reveal_later_keep_private": SITE + "/x/noexec/reveal?id=%s&secret=%s" % (bid, secret),
+            "note": "Send only the bundle link. Keep the reveal link to yourself until the "
+                    "reviewer has published results."}, 200
+
+
+def _custody_count(cus):
+    if not isinstance(cus, dict):
+        return "unavailable"
+    for k in ("independent_holders_today", "independent_holders", "holders_today", "count",
+              "independent"):
+        if k in cus:
+            return cus[k]
+    for v in cus.values():
+        if isinstance(v, dict):
+            for k in ("independent_holders", "count", "holders"):
+                if k in v:
+                    return v[k]
+    return "as sealed at " + SITE + "/x/custody/status"
+
+
+def _query(ctx):
+    """Read the query string straight off the live request, whatever the router passed:
+    from the handler in ctx if there is one, otherwise from the request handler found on
+    the call stack (the same way page modules find it)."""
+    from urllib.parse import parse_qs
+    paths = []
+    try:
+        if isinstance(ctx, dict):
+            for k in ("handler", "h", "request_handler", "request"):
+                h = ctx.get(k)
+                if h is not None and getattr(h, "path", None):
+                    paths.append(h.path)
+        f = sys._getframe()
+        while f is not None:
+            o = f.f_locals.get("self")
+            if o is not None and hasattr(o, "wfile") and isinstance(getattr(o, "path", None), str):
+                paths.append(o.path)
+                break
+            f = f.f_back
+    except Exception:
+        pass
+    for path in paths:
+        if "?" in path:
+            return {k: v[0] for k, v in parse_qs(path.split("?", 1)[1]).items()}
+    return {}
+
+
+def _q(data, k):
+    v = data.get(k, "")
+    if isinstance(v, (list, tuple)):
+        v = v[0] if v else ""
+    return str(v).strip()
+
+
+def _get(ctx, bid):
+    with ctx["lock"]:
+        return ctx["conn"].execute(
+            "SELECT id,created,bundle,bundle_sha256,answer_key,key_commitment,secret_digest,"
+            "audit_hash,block_index FROM noexec_bundle WHERE id=?", (bid,)).fetchone()
+
+
+def _bundle(ctx, data):
+    row = _get(ctx, _q(data, "id"))
+    if not row:
+        return {"error": "bundle_not_found"}, 404
+    return {"bundle": json.loads(row[2]), "bundle_sha256": row[3],
+            "answer_key_commitment": row[5],
+            "commitment_sealed_in_chain": row[7], "commitment_block": _block_url(row[8]),
+            "commitment_rule": "SHA-256 of the canonical JSON of the answer key, which includes "
+                               "this bundle's SHA-256 and a random salt. It was sealed before "
+                               "this bundle was sent and will be revealed after review."}, 200
+
+
+def _reveal(ctx, data):
+    import hmac
+    bid = _q(data, "id")
+    row = _get(ctx, bid)
+    if not row:
+        return {"error": "bundle_not_found"}, 404
+    with ctx["lock"]:
+        pub = ctx["conn"].execute("SELECT at,how,audit_hash,block_index FROM noexec_revealed "
+                                  "WHERE id=?", (bid,)).fetchone()
+    secret = _q(data, "secret")
+    admin = _q(data, "admin")
+    pw = os.environ.get("ADMIN_PASSWORD", "")
+    by_secret = bool(secret) and hashlib.sha256(secret.encode()).hexdigest() == row[6]
+    by_admin = bool(admin) and bool(pw) and hmac.compare_digest(admin, pw)
+    if not (pub or by_secret or by_admin):
+        return {"error": "not_yet_revealed"}, 403
+    if not pub:
+        how = "reveal link" if by_secret else "operator unlock (reveal link lost)"
+        audit_hash, block = _seal(ctx, "noexec_key_revealed",
+                                  {"bundle": bid, "answer_key_commitment": row[5],
+                                   "how": how,
+                                   "detail": "bundle=%s;revealed_by=%s" % (bid, how)})
+        with ctx["lock"]:
+            ctx["conn"].execute("INSERT OR IGNORE INTO noexec_revealed VALUES(?,?,?,?,?)",
+                                (bid, time.time(), how, audit_hash, block))
+            ctx["conn"].commit()
+        pub = (time.time(), how, audit_hash, block)
+    answer = json.loads(row[4])
+    return {"answer_key": answer, "recomputed_commitment": _sha(answer),
+            "sealed_commitment": row[5], "matches": _sha(answer) == row[5],
+            "commitment_sealed_in": _block_url(row[8]),
+            "revealed": {"at": _iso(pub[0]), "how": pub[1], "sealed_in": _block_url(pub[3])},
+            "share_this_link": SITE + "/x/noexec/reveal?id=" + bid,
+            "check_it_yourself": "SHA-256 of the canonical JSON of answer_key (keys sorted, "
+                                 "separators ',' ':', UTF-8) must equal sealed_commitment, "
+                                 "which was sealed before the bundle was sent."}, 200
+
+
+def handle(method, action, data, api_key, ctx):
+    _setup(ctx)
+    action = (action or "").strip("/")
+    data = dict(data or {})
+    if "?" in action:
+        from urllib.parse import parse_qs
+        action, qs = action.split("?", 1)
+        for k, v in parse_qs(qs).items():
+            data.setdefault(k, v[0])
+    for k, v in _query(ctx).items():
+        if not _q(data, k):
+            data[k] = v
+    action = action.strip("/")
+    parts = action.split("/")
+    if len(parts) > 1:
+        action = parts[0]
+        if not _q(data, "id"):
+            data["id"] = parts[1]
+        if len(parts) > 2 and not _q(data, "secret"):
+            data["secret"] = parts[2]
+    action = action.lower()
+    if action in ("status", "spec", ""):
+        with ctx["lock"]:
+            n = ctx["conn"].execute("SELECT COUNT(*) FROM noexec_bundle").fetchone()[0]
+            last = ctx["conn"].execute("SELECT id,block_index FROM noexec_bundle ORDER BY created "
+                                       "DESC LIMIT 3").fetchall()
+        return {"module": "noexec", "version": VERSION, "armed": True, "bundles_built": n,
+                "latest": [{"bundle": r[0], "link": SITE + "/x/noexec/bundle?id=" + r[0],
+                            "sealed_block": r[1]} for r in last],
+                "build": SITE + "/x/noexec/build"}, 200
+    if action == "build":
+        try:
+            return _build(ctx)
+        except Exception as e:
+            _last[0] = 0.0
+            return {"built": False, "error": str(e)[:500]}, 500
+    if action == "bundle":
+        return _bundle(ctx, data)
+    if action == "reveal":
+        return _reveal(ctx, data)
+    return {"error": "unknown_action", "GET": ["status", "build", "bundle", "reveal"]}, 404
 
 ```

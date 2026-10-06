@@ -1,4 +1,4 @@
-# Codebase — part 2 of 49
+# Codebase — part 2 of 50
 
 Contains:
 - `modules/__init__.py`
@@ -680,7 +680,7 @@ def handle(method, action, data, api_key, ctx):
 
 ## `modules/answers.py`
 
-376 lines, 29442 bytes
+386 lines, 30726 bytes
 
 ```python
 """
@@ -819,6 +819,16 @@ ANSWERS = [
              "High-risk actions can require an Agent Passport: a signed permission for that one action.",
              "Every action then has a receipt that outlives the agent, the model and the vendor, provable against Bitcoin."],
      "do": [("Connect your AI", "/connect"), ("Agent Passport", "/passport"), ("Build your own rules", "/build")]},
+
+    {"slug": "govern-every-openai-call",
+     "q": "How do I govern every OpenAI or Anthropic call without changing my code?",
+     "a": "Change one line: point your app's OpenAI or Anthropic base URL at the sebbi.pro gateway. Every call is then scored before it leaves, stopped if it should be, sealed into a tamper-evident chain, and answered with an AI-Decision-Receipt header anyone can check against Bitcoin.",
+     "how": ["Get your private gateway URL at sebbi.pro/gateway (or ask your AI assistant connected at sebbi.pro/mcp to set it up).",
+             "Set it as base_url in the OpenAI or Anthropic SDK. Your provider key stays in your app and passes straight through.",
+             "Each request is fingerprinted, scored ALLOW, CHALLENGE or BLOCK, and sealed. BLOCK never reaches the provider.",
+             "Answers stream back token by token with an AI-Decision-Receipt header; request and response fingerprints are timestamped in Bitcoin."],
+     "more": ["Prompts, answers and provider keys are never stored, only their fingerprints. The receipt header is an open standard any system can emit."],
+     "do": [("Set up the gateway", "/gateway"), ("The receipt standard", "/standard/ai-decision-receipt")]},
 
     {"slug": "prove-code-existed-on-a-date",
      "q": "How do I prove my code existed on a date?",
@@ -981,7 +991,7 @@ def standard_page():
 
 def sitemap():
     urls = [SITE + "/answers", SITE + "/standard/forever-proof", SITE + "/forever", SITE + "/bitcoin",
-            SITE + "/bitcoin/code"] + [SITE + "/answers/" + a["slug"] for a in ANSWERS]
+            SITE + "/bitcoin/code", SITE + "/gateway", SITE + "/standard/ai-decision-receipt"] + [SITE + "/answers/" + a["slug"] for a in ANSWERS]
     return ('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
             "".join("  <url><loc>%s</loc><changefreq>weekly</changefreq></url>\n" % u for u in urls) + "</urlset>\n")
 
