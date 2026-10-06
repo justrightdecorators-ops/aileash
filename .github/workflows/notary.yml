@@ -38,6 +38,8 @@ jobs:
         run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/gateway_check.py
       - name: Per-key rate limits (no outside network)
         run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/ratelimit_check.py
+      - name: Paid pilot and gateway allowance, with stand-in Stripe (no outside network)
+        run: sudo -E env "PATH=$PATH" unshare -n "$(which python3)" .github/scripts/pilot_check.py
 
   live:
     if: github.event_name != 'push'
@@ -51,7 +53,7 @@ jobs:
                    https://sebbi.pro/x/notary/status https://sebbi.pro/x/notary/spec https://sebbi.pro/x/notary/checkpoints \
                    https://sebbi.pro/.well-known/sebbi-notary.json \
                    https://sebbi.pro/answers https://sebbi.pro/standard/forever-proof https://sebbi.pro/llms.txt https://sebbi.pro/sitemap-answers.xml \
-                   https://sebbi.pro/gateway https://sebbi.pro/standard/ai-decision-receipt https://sebbi.pro/x/gateway/status; do
+                   https://sebbi.pro/gateway https://sebbi.pro/standard/ai-decision-receipt https://sebbi.pro/x/gateway/status https://sebbi.pro/pilot https://sebbi.pro/x/pilot/status https://sebbi.pro/x/ratelimit/status; do
             code=$(curl -s -m 30 -o /dev/null -w "%{http_code}" "$u")
             if [ "$code" = "200" ]; then echo "ok   $u"; else echo "FAIL $code $u"; echo "::error title=$code $u::arm the site at https://sebbi.pro/x/arm/status"; fail=1; fi
           done

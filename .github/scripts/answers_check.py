@@ -73,7 +73,7 @@ try:
         locs = [e.text for e in ET.fromstring(xml).iter("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")]
     except Exception as e:
         locs = []
-    chk("sitemap lists every answer", st == 200 and len(locs) == len(A.ANSWERS) + 7, (st, len(locs)))
+    chk("sitemap lists every answer", st == 200 and len(locs) == len(A.ANSWERS) + 8, (st, len(locs)))
     st, txt, ct = get("/llms.txt")
     chk("llms.txt served as text", st == 200 and "text/plain" in ct and b"/answers/prove-an-ai-decision-to-a-regulator" in txt and b"Monop Content" in txt, (st, ct))
     for u in re.findall(rb"\((https://sebbi\.pro/answers[^)]*)\)", txt):
