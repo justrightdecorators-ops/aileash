@@ -1,0 +1,52 @@
+name: Publish to MCP Registry
+
+# Manual only. Run it from the Actions tab after the site is deployed and armed,
+# so https://sebbi.pro/.well-known/mcp-registry-auth is live for the check.
+# Needs one repo secret: MCP_REGISTRY_PRIVATE_KEY (the Ed25519 private key hex).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Install mcp-publisher
+        run: go install github.com/modelcontextprotocol/registry/cmd/mcp-publisher@latest
+
+      - name: Build server.json
+        run: |
+          set -e
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          # init to harvest the current $schema default, then write our own fields
+          mcp-publisher init || true
+          SCHEMA=$(jq -r '."$schema" // "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json"' server.json 2>/dev/null || echo "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json")
+          jq -n --arg s "$SCHEMA" '{
+            "$schema": $s,
+            name: "pro.sebbi/governance",
+            description: "Score, seal and prove any AI decision, and timestamp it into Bitcoin - checkable by anyone, without trusting us.",
+            version: "1.0.0",
+            remotes: [ { type: "streamable-http", url: "https://sebbi.pro/mcp" } ]
+          }' > server.json
+          echo "----- server.json -----"; cat server.json
+
+      - name: Log in (domain HTTP auth)
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          mcp-publisher login http --domain=sebbi.pro --private-key="${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}"
+
+      - name: Validate (dry run)
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          mcp-publisher publish --dry-run || echo "dry-run not supported on this version; continuing"
+
+      - name: Publish
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          mcp-publisher publish
