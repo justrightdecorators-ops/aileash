@@ -41,11 +41,10 @@ jobs:
       - name: Build server.json
         run: |
           set -e
-          mcp-publisher init || true
-          SCHEMA=$(jq -r '."$schema" // "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json"' server.json 2>/dev/null || echo "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json")
-          jq -n --arg s "$SCHEMA" '{
-            "$schema": $s,
+          jq -n '{
+            "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
             name: "pro.sebbi/governance",
+            title: "sebbi.pro - seal every AI decision",
             description: "Score, seal and prove any AI decision, and timestamp it into Bitcoin - checkable by anyone, without trusting us.",
             version: "1.0.0",
             remotes: [ { type: "streamable-http", url: "https://sebbi.pro/mcp" } ]
@@ -56,4 +55,12 @@ jobs:
         run: mcp-publisher login http --domain=sebbi.pro --private-key="${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}"
 
       - name: Publish
-        run: mcp-publisher publish
+        run: |
+          set +e
+          mcp-publisher publish 2>&1 | tee pub.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            echo "::error::publish failed (exit $code)"
+            tail -n 25 pub.log | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$code"
+          fi
