@@ -36,7 +36,7 @@ homelink still arms and the status says which one.
 import io
 import sys
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 PATHS = ("/", "/index.html")
 MARK = b"<!--sebbi-homelink-->"
 
@@ -174,6 +174,7 @@ BUTTON = (
     b'var b=document.getElementById(\'sebbi-bubble\');b.style.display=\'flex\'">&times;</a>'
     b'<a href="/auditors" style="background:#c9a84c;color:#0a0f1e;border:0;font-weight:700;'
     b'box-shadow:0 0 24px rgba(201,168,76,.5),0 5px 18px rgba(0,0,0,.4)">&#9878; AUDITORS &rarr;</a>'
+    b'<a href="/proveit" style="border:1.5px solid #ff8a80"><span class="tag" style="background:#ff8a80">FREE</span>Make them prove it &rarr;</a>'
     b'<a href="/cinema" style="border:1.5px solid #8fd0ff"><span class="tag" style="background:#8fd0ff">WATCH</span>Cinema &#127916;</a>'
     b'<a href="/game" style="border:1.5px solid #d59bff"><span class="tag" style="background:#d59bff">PLAY</span>Deep Run &#9654;</a>'
     b'<a class="portal" href="/room"><span class="ring"></span>Enter the Agent Room &rarr;</a>'
