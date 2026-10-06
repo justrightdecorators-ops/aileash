@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-176 files across 52 parts.
+177 files across 52 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -103,13 +103,14 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-17.md](CODEBASE-17.md)
 
 - `modules/mcp.py`
+- `modules/mcpdirectory.py`
 - `modules/meter.py`
 - `modules/monitor.py`
 - `modules/mutual.py`
-- `modules/network.py`
 
 ## [CODEBASE-18.md](CODEBASE-18.md)
 
+- `modules/network.py`
 - `modules/noexec.py`
 
 ## [CODEBASE-19.md](CODEBASE-19.md)
