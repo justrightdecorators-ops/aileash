@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-177 files across 52 parts.
+178 files across 52 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -207,6 +207,7 @@ Generated automatically on every push. Do not edit by hand.
 
 - `modules/wallet.py`
 - `modules/warmup.py`
+- `modules/wellknown_mcp.py`
 - `modules/witness.py`
 
 ## [CODEBASE-36.md](CODEBASE-36.md)
