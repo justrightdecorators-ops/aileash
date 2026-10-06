@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-171 files across 50 parts.
+172 files across 50 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -143,6 +143,7 @@ Generated automatically on every push. Do not edit by hand.
 - `modules/publish.py`
 - `modules/pwa.py`
 - `modules/ratchet.py`
+- `modules/ratelimit.py`
 
 ## [CODEBASE-25.md](CODEBASE-25.md)
 
