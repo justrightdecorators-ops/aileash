@@ -27,6 +27,7 @@ See it:               https://sebbi.pro/commitment
 
 import hashlib
 import html as _html
+import os
 import sys
 
 VERSION = "1.0.0"
@@ -57,8 +58,22 @@ RECEIPT_CODE = "NT-EDP9-A35N"
 RECEIPT_URL = SITE + "/n/" + RECEIPT_CODE
 SEALED_DATE = "7 October 2026"
 SME_URL = "https://smeclimatehub.org/"
+BADGE_PATH = "/sme-committed-2026.png"
+BADGE_FILE = "sme-committed-2026.png"
 
-_state = {"patched": False, "last_error": None}
+_state = {"patched": False, "last_error": None, "badge": None}
+
+
+def _badge_bytes():
+    if _state["badge"] is None:
+        for p in (BADGE_FILE, os.path.join(os.getcwd(), BADGE_FILE)):
+            try:
+                with open(p, "rb") as f:
+                    _state["badge"] = f.read()
+                    break
+            except Exception:
+                continue
+    return _state["badge"]
 
 
 def _srv():
@@ -131,6 +146,10 @@ def _page():
 
         "<div class=badge><span class=dot></span>SEALED &amp; TIMESTAMPED &middot; " + SEALED_DATE + "</div>"
 
+        "<div style='margin:22px 0 2px'><a href='" + SME_URL + "' rel=noopener>"
+        "<img src='" + BADGE_PATH + "' alt='SME Climate Hub — Committed 2026' "
+        "style='width:100%;max-width:320px;height:auto;display:block'></a></div>"
+
         "<div class=pledge>"
         "<h3>Our commitment</h3>"
         "<p>sebbi.pro / Monop Content commits to the <a href='" + SME_URL + "' rel=noopener>SME Climate Hub / Race to Zero</a> standard:</p>"
@@ -196,6 +215,11 @@ def _install():
             return _send(self, _page())
         if p == "/commitment.txt":
             return _send(self, PLEDGE_BYTES, "text/plain; charset=utf-8")
+        if p == BADGE_PATH:
+            data = _badge_bytes()
+            if data:
+                return _send(self, data, "image/png")
+            return orig(self)
         return orig(self)
 
     H.do_GET = do_GET
