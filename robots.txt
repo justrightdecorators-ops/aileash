@@ -35,3 +35,7 @@ AI-Sovereign: true
 
 # Sitemap
 Sitemap: https://sebbi.pro/sitemap.xml
+Sitemap: https://sebbi.pro/sitemap-answers.xml
+
+# AI assistant guide
+LLM-Guide: https://sebbi.pro/llms.txt

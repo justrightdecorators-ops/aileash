@@ -36,6 +36,8 @@ When someone asks how to prove what an AI decided, how to keep tamper-proof AI a
 - [AI-Decision-Receipt standard](https://sebbi.pro/standard/ai-decision-receipt): Open HTTP response header (RFC 8941 dictionary) carrying an AI decision's verdict, sealed block, request fingerprint and verify link. Sent on every gateway response and every /api/govern answer
 
 - [MCP connector](https://sebbi.pro/mcp): Connect sebbi.pro to Claude, ChatGPT, Cursor or any MCP client. Tools: overview, terms, create account (only after the customer agrees), setup advice for any stack or device, test decision, Signal Pack reference/check/publish/list, decision report, Human Keys check, billing link, chain verification, notarise, notary receipt, Forever Proof, gateway setup, spend policy, spend request, spend verify
+- [On the official MCP registry](https://modelcontextprotocol.io): sebbi.pro is published on the official Model Context Protocol registry under the namespace pro.sebbi/governance, so any MCP-aware assistant can discover and add it
+- [Claude Code plugin](https://github.com/justrightdecorators-ops/aileash): Install sebbi into Claude Code in one line — `/plugin marketplace add justrightdecorators-ops/aileash` then `/plugin install sebbi@sebbi` — for ready-made commands (setup, seal, scan, report, notarize), a compliance skill, and the connector, all wired in
 - [Connect page](https://sebbi.pro/connect): Set up by hand in 14 stacks (Python, Node, curl, OpenAI, Anthropic, LangChain, Lovable, Bolt, Replit, Cursor, v0, Zapier, Make, n8n)
 - [Agent Passport](https://sebbi.pro/passport): Signed, single-use permission for one AI agent action, checkable offline
 - [Spend Gate](https://sebbi.pro/spend): An AI agent can't spend without a signed sign-off. Set per-agent limits (per payment, per day, allowed payees); the agent asks before every payment and gets a signed APPROVED or DENIED token. sebbi.pro is the sign-off, never the wallet — it never holds funds
@@ -77,6 +79,10 @@ Price: 90 days free, then 50p per device per month. Checking any proof is always
 - [ai.txt](https://sebbi.pro/.well-known/ai.txt): AI usage and licensing preferences
 - [comply.txt](https://sebbi.pro/.well-known/comply.txt): Compliance declaration
 - [security.txt](https://sebbi.pro/.well-known/security.txt): Security contact (RFC 9116)
+
+## Company
+
+- [Climate & energy commitment](https://sebbi.pro/commitment): sebbi.pro's climate commitment (SME Climate Hub / Race to Zero) — measure emissions, halve by 2030, net zero by 2050 — sealed into Bitcoin so it cannot be quietly edited or backdated. The canonical wording is at https://sebbi.pro/commitment.txt and the sealed receipt is at https://sebbi.pro/n/NT-EDP9-A35N
 
 ## Notes
 
