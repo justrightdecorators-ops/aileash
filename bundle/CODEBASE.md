@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-189 files across 52 parts.
+189 files across 53 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -301,24 +301,27 @@ Generated automatically on every push. Do not edit by hand.
 - `legal.txt`
 - `liability.txt`
 - `llms.txt`
-- `map.html`
 
 ## [CODEBASE-47.md](CODEBASE-47.md)
 
+- `map.html`
 - `notary.html`
 - `pack.html`
+
+## [CODEBASE-48.md](CODEBASE-48.md)
+
 - `pay-check.html`
 - `registry.html`
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-48.md](CODEBASE-48.md)
+## [CODEBASE-49.md](CODEBASE-49.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-49.md](CODEBASE-49.md)
+## [CODEBASE-50.md](CODEBASE-50.md)
 
 - `scan.html`
 - `seal.html`
@@ -332,18 +335,18 @@ Generated automatically on every push. Do not edit by hand.
 - `sentinel.html`
 - `signal-packs.html`
 
-## [CODEBASE-50.md](CODEBASE-50.md)
+## [CODEBASE-51.md](CODEBASE-51.md)
 
 - `sitemap.xml`
 - `sonicboom.html`
 - `terms.html`
 
-## [CODEBASE-51.md](CODEBASE-51.md)
+## [CODEBASE-52.md](CODEBASE-52.md)
 
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-52.md](CODEBASE-52.md)
+## [CODEBASE-53.md](CODEBASE-53.md)
 
 - `whitepaper.html`
 
