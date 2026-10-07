@@ -3,9 +3,15 @@
 Contains:
 - `scan.html`
 - `seal.html`
+- `sebbi-plugin/README.md`
+- `sebbi-plugin/commands/notarize.md`
+- `sebbi-plugin/commands/report.md`
+- `sebbi-plugin/commands/scan.md`
+- `sebbi-plugin/commands/seal.md`
+- `sebbi-plugin/commands/setup.md`
+- `sebbi-plugin/skills/sebbi-compliance/SKILL.md`
 - `sentinel.html`
 - `signal-packs.html`
-- `sitemap.xml`
 
 
 ## `scan.html`
@@ -805,6 +811,199 @@ async function sealPost(){
 ```
 
 
+## `sebbi-plugin/README.md`
+
+36 lines, 1492 bytes
+
+```markdown
+# sebbi for Claude Code
+
+Score, seal and prove every AI decision — right inside your coding agent.
+
+[sebbi.pro](https://sebbi.pro) scores an AI or automated decision in under 30ms (ALLOW / CHALLENGE / BLOCK) and seals it into an append-only chain timestamped into Bitcoin, so anyone can prove later exactly what was decided and when — without trusting sebbi.pro or the company that made the call. Built for the EU AI Act and GDPR Article 22.
+
+## Install
+
+```
+/plugin marketplace add justrightdecorators-ops/aileash
+/plugin install sebbi@sebbi
+```
+
+That's it — the sebbi tools are wired in automatically (connector: `https://sebbi.pro/mcp`).
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/setup` | Open a sebbi.pro account and seal your first decision, end to end |
+| `/seal` | Score and seal an AI decision into the chain (timestamped into Bitcoin) |
+| `/scan` | Free EU AI Act readiness check, explained plainly |
+| `/report` | Pull a machine-proof report for a sealed decision, ready for an auditor |
+| `/notarize` | Notarize a file or text into Bitcoin (free) and get a Forever Proof |
+
+It also ships a **sebbi-compliance** skill, so Claude knows when and how to seal decisions while you build.
+
+## Pricing
+
+Free for 90 days, then 50p per device per month. No tiers, no sales calls.
+
+- Connect: https://sebbi.pro/connect
+- Build your own rules: https://sebbi.pro/build
+- Machine-proof report: https://sebbi.pro/dossier
+- Verify against Bitcoin: https://sebbi.pro/forever
+
+```
+
+
+## `sebbi-plugin/commands/notarize.md`
+
+11 lines, 574 bytes
+
+```markdown
+---
+description: Notarize a file or text into Bitcoin (free) and return a Forever Proof
+argument-hint: [path or text to prove existed now]
+---
+
+Notarize the file or text in $ARGUMENTS so it can be proven to have existed at this moment.
+
+Compute its SHA-256 locally, then call `sebbi_notarize` with the digest and `sebbi_forever_proof` for a proof anyone can check. Give the user the receipt and the verification link (https://sebbi.pro/forever).
+
+Only the hash ever leaves the machine — never the content itself. If no file or text was given, ask what they want to prove.
+
+```
+
+
+## `sebbi-plugin/commands/report.md`
+
+9 lines, 525 bytes
+
+```markdown
+---
+description: Pull a machine-proof report for a sealed decision, ready for an auditor
+argument-hint: [block index or decision reference]
+---
+
+Produce a machine-proof report for the decision in $ARGUMENTS using `sebbi_decision_report`. If no block index or reference was given, ask for one.
+
+Summarise who the decision was about, what was decided, why, and where the inputs came from. Then give the user the verifiable link so an auditor can check the whole thing against Bitcoin without trusting sebbi.pro or anyone else.
+
+```
+
+
+## `sebbi-plugin/commands/scan.md`
+
+14 lines, 665 bytes
+
+```markdown
+---
+description: Run a free EU AI Act readiness check and explain plainly what to fix
+---
+
+Help the user check their AI system against the EU AI Act, free. Point them to https://sebbi.pro/scan, and if they describe their system here, walk through the duties that matter and say plainly where sebbi.pro covers each:
+
+- Article 9 — risk management
+- Article 12 — automatic logging of events
+- Article 13 — transparency to users
+- Article 14 — human oversight
+- Article 22 (GDPR) — the right not to be subject to a purely automated decision, and to an explanation
+
+Be concrete and calm. No scare tactics. End with the one or two things they should do first.
+
+```
+
+
+## `sebbi-plugin/commands/seal.md`
+
+9 lines, 665 bytes
+
+```markdown
+---
+description: Score and seal an AI decision into the sebbi.pro chain, timestamped into Bitcoin
+argument-hint: [the decision, e.g. "refund £120 for customer-42"]
+---
+
+Seal the decision described in $ARGUMENTS using the connected `sebbi` tools. If no details were given, ask what the decision is (who it is about, what action, any amount).
+
+Score it with the sebbi decision flow (`sebbi_test_decision` or the govern tool) to get a verdict — ALLOW, CHALLENGE or BLOCK — then confirm it is sealed. Give the user the block index and the link to verify it, and explain the verdict in one line. The record is now permanent and checkable by anyone against Bitcoin.
+
+```
+
+
+## `sebbi-plugin/commands/setup.md`
+
+14 lines, 786 bytes
+
+```markdown
+---
+description: Open a sebbi.pro account and seal your first AI decision, end to end
+---
+
+Set the user up on sebbi.pro using the connected `sebbi` tools. Keep it quick and plain.
+
+1. Call `sebbi_overview` and explain in a sentence or two what sebbi does for the user's stack.
+2. Ask how they build and what they want to govern, then call `sebbi_setup_advice`.
+3. Show the full text from `sebbi_terms` and get a clear yes before opening anything.
+4. On agreement, call `sebbi_create_account` with that terms_version. Give them their API key and tell them to keep it secret.
+5. Offer `sebbi_test_decision` so they see their first sealed decision, and `sebbi_billing_link` when they want to add a card.
+
+Pricing: free for 90 days, then 50p per device per month. No tiers, no sales calls.
+
+```
+
+
+## `sebbi-plugin/skills/sebbi-compliance/SKILL.md`
+
+44 lines, 2965 bytes
+
+```markdown
+---
+name: sebbi-compliance
+description: Use when building, reviewing or shipping any app that makes automated or AI-driven decisions about people — payments, refunds, bans, approvals, claims, pricing, content moderation — and those decisions need to be logged, explained or proven later (EU AI Act, GDPR Article 22, audits, disputes, chargebacks). Scores and seals each decision into sebbi.pro so it can be proven, unchanged, against Bitcoin.
+---
+
+# Governing AI decisions with sebbi.pro
+
+sebbi.pro scores an AI or automated decision in under 30ms — ALLOW, CHALLENGE or BLOCK — and seals it into an append-only chain that is timestamped into Bitcoin. Anyone can later verify exactly what was decided, and when, without trusting sebbi.pro or the company that made the decision. The connected `sebbi` tools do all of this.
+
+## When to reach for this
+
+Pull sebbi in whenever the code is about to act on a decision that affects a person and might have to be defended later:
+
+- payments, refunds, payouts, spend by an agent
+- account actions: bans, suspensions, approvals, eligibility
+- insurance or benefit claims, credit or lending calls
+- content moderation, takedowns, demonetisation
+- any model/tool call whose outcome needs a logged, explainable record
+
+If the answer to "could someone demand the record of this decision?" is yes, seal it.
+
+## The workflow
+
+1. **Set up once.** `sebbi_overview` to see the products, `sebbi_setup_advice` for the right fit, `sebbi_terms` then `sebbi_create_account` to get an API key. Keep the key secret — server-side only, never in the browser.
+2. **Govern each decision.** Before the app acts, send the decision to sebbi and read the verdict:
+   - `ALLOW` — carry on.
+   - `CHALLENGE` — ask the user to confirm, or route to a human.
+   - `BLOCK` — stop and show "this action needs review".
+3. **Keep the proof.** Save the returned `audit_hash` and `block_index` next to your own record, so the decision can be proven later.
+4. **Prove on demand.** `sebbi_decision_report` gives an auditor-ready, machine-proof report for any sealed decision. `sebbi_verify_chain` checks the chain. `sebbi_notarize` + `sebbi_forever_proof` timestamp any file or text into Bitcoin (only the hash leaves the machine).
+
+## How it maps to the law
+
+- **EU AI Act** — Article 9 (risk), Article 12 (automatic logging), Article 13 (transparency), Article 14 (human oversight).
+- **GDPR Article 22** — the right not to be subject to a purely automated decision, and to a meaningful explanation. A sealed record is that explanation, dated and unchangeable.
+
+## Guardrails
+
+- Seal the decision, don't let sebbi make the business call for you — the verdict is advice your code acts on.
+- Never expose the API key client-side.
+- Pricing is free for 90 days, then 50p per device per month — no need to over-provision.
+
+Pages: https://sebbi.pro/connect · https://sebbi.pro/build · https://sebbi.pro/dossier · https://sebbi.pro/forever
+
+```
+
+
 ## `sentinel.html`
 
 485 lines, 52354 bytes
@@ -1518,84 +1717,5 @@ function useLibPack(name,sigStr){
 </script>
 </body>
 </html>
-
-```
-
-
-## `sitemap.xml`
-
-71 lines, 1760 bytes
-
-```
-<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9
-        http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd">
-
-  <url>
-    <loc>https://sebbi.pro/</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>1.0</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/compliance-assistant</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.95</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/guardian-app</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.95</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/sonicboom</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.95</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/sentinel</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.95</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/reseller</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.90</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/scan</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.85</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/report-threat</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.70</priority>
-  </url>
-
-  <url>
-    <loc>https://sebbi.pro/contact</loc>
-    <lastmod>2026-06-23</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.65</priority>
-  </url>
-
-</urlset>
 
 ```

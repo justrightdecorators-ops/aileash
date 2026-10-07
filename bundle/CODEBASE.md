@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-182 files across 52 parts.
+189 files across 52 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -322,12 +322,19 @@ Generated automatically on every push. Do not edit by hand.
 
 - `scan.html`
 - `seal.html`
+- `sebbi-plugin/README.md`
+- `sebbi-plugin/commands/notarize.md`
+- `sebbi-plugin/commands/report.md`
+- `sebbi-plugin/commands/scan.md`
+- `sebbi-plugin/commands/seal.md`
+- `sebbi-plugin/commands/setup.md`
+- `sebbi-plugin/skills/sebbi-compliance/SKILL.md`
 - `sentinel.html`
 - `signal-packs.html`
-- `sitemap.xml`
 
 ## [CODEBASE-50.md](CODEBASE-50.md)
 
+- `sitemap.xml`
 - `sonicboom.html`
 - `terms.html`
 
