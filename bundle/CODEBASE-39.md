@@ -10,6 +10,7 @@ Contains:
 - `tests/attack_witnessed.py`
 - `verify_authority.py`
 - `AILeash-API-Reference-v6.4.2.md`
+- `Dockerfile`
 - `LICENCE`
 
 
@@ -2211,6 +2212,31 @@ No machine learning. No drift. No retraining. Weights are written in code and ca
 - **Scanner (free):** https://sebbi.pro/scan
 - **Guardian:** https://sebbi.pro/guardian-parent
 - **Contact:** justrightdecorators@gmail.com
+
+```
+
+
+## `Dockerfile`
+
+17 lines, 276 bytes
+
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy only requirements and server
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the entire application
+COPY . .
+
+# Expose the configured port
+EXPOSE 8080
+
+# Run the server
+CMD ["python", "server.py"]
 
 ```
 
