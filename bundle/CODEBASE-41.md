@@ -3,6 +3,7 @@
 Contains:
 - `aileash-game.html`
 - `aitxt-popup-live.html`
+- `app.yaml`
 - `brain.html`
 - `certificate.html`
 
@@ -849,6 +850,34 @@ resize();cfg=SECTORS[0];fieldInit();hud();render(0);
 
 </body>
 </html>
+
+```
+
+
+## `app.yaml`
+
+20 lines, 489 bytes
+
+```yaml
+title: Sebbi Pro Verification Node
+sdk: docker
+app_port: 8080
+tags:
+  - verification
+  - cryptographic-anchoring
+  - merkle-tree
+  - zero-dependency
+  - execution-witnessing
+license: mit
+short_description: Open-source state verification framework anchored via SHA-256 Merkle trees.
+
+environment_variables:
+  HF_TOKEN:
+    description: Hugging Face API access token for authenticated node sync.
+    required: false
+  PORT:
+    description: Local service execution port.
+    default: "8080"
 
 ```
 
