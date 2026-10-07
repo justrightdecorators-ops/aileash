@@ -8,7 +8,7 @@ Contains:
 
 ## `reseller.html`
 
-834 lines, 68508 bytes
+834 lines, 68767 bytes
 
 ```html
 <!DOCTYPE html>
@@ -243,7 +243,7 @@ footer{background:rgba(0,0,0,0.4);padding:48px;border-top:1px solid rgba(255,255
   <div class="hero-inner">
     <span class="eyebrow">sebbi.pro &mdash; Here's your future</span>
     <h1>Build your own product.<br><em>Keep the margin. Scale to millions.</em></h1>
-    <p class="hero-sub">You don't resell a tool &mdash; you build your own product on the engine that scores and seals every AI decision into Bitcoin. <strong>Set your own price. We take a flat 50p per device per month; everything above that is yours, every month, for as long as those devices stay live.</strong> Sell it under our name, sell it under yours, or just share a code. Land real client volume and this stops being a side-line and starts being a company &mdash; whether you're an IT consultancy, a call centre supplier, a web developer, or someone starting from zero.</p>
+    <p class="hero-sub">You don't resell a tool &mdash; you build your own product on the engine that scores and seals every AI decision into Bitcoin. <strong>Set your own price. We take a flat 50p per device per month; everything above that is yours, every month, for as long as those devices stay live.</strong> Sell it under our name, sell it under yours, or just share a code. Land real client volume and this stops being a side-line and starts being a company &mdash; whether you're an IT consultancy, a call centre supplier, a web developer, or someone starting from zero. <strong>And it's easy to deploy:</strong> sebbi is now on the official Model Context Protocol registry and installs into Claude and other AI assistants in one line, so your clients' own AI can set it up and seal their first decision &mdash; no code from you.</p>
 
     <div class="three-options">
       <a href="#partner" class="option-card">
