@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-181 files across 52 parts.
+182 files across 52 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -203,6 +203,7 @@ Generated automatically on every push. Do not edit by hand.
 ## [CODEBASE-34.md](CODEBASE-34.md)
 
 - `modules/toolspage.py`
+- `modules/useinclaude.py`
 - `modules/verifier.py`
 - `modules/walk.py`
 
