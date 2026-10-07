@@ -1,0 +1,17 @@
+{
+  "name": "sebbi",
+  "owner": {
+    "name": "Justin Dobson",
+    "url": "https://sebbi.pro"
+  },
+  "description": "Govern, seal and prove every AI decision — sebbi.pro tools for Claude Code.",
+  "plugins": [
+    {
+      "name": "sebbi",
+      "source": "./sebbi-plugin",
+      "description": "Score, seal and prove any AI decision into Bitcoin, plus a free EU AI Act check — right inside Claude Code.",
+      "category": "Security & Compliance",
+      "tags": ["ai-governance", "compliance", "eu-ai-act", "audit", "bitcoin", "mcp", "provenance"]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "name": "sebbi",
+  "version": "1.0.0",
+  "description": "Score, seal and prove any AI decision into Bitcoin, plus a free EU AI Act check — right inside Claude Code.",
+  "author": {
+    "name": "Justin Dobson",
+    "url": "https://sebbi.pro"
+  },
+  "homepage": "https://sebbi.pro",
+  "repository": "https://github.com/justrightdecorators-ops/aileash",
+  "keywords": ["ai governance", "compliance", "eu ai act", "gdpr", "audit", "bitcoin", "provenance"],
+  "mcpServers": {
+    "sebbi": {
+      "type": "http",
+      "url": "https://sebbi.pro/mcp"
+    }
+  }
+}
