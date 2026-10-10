@@ -1,6 +1,6 @@
 # Codebase
 Generated automatically on every push. Do not edit by hand.
-193 files across 53 parts.
+195 files across 54 parts.
 
 ## [CODEBASE-01.md](CODEBASE-01.md)
 
@@ -174,49 +174,53 @@ Generated automatically on every push. Do not edit by hand.
 
 ## [CODEBASE-29.md](CODEBASE-29.md)
 
+- `modules/sebdog_safety.py`
 - `modules/sebdog_standard.py`
 - `modules/selfcheck.py`
-- `modules/signed.py`
 
 ## [CODEBASE-30.md](CODEBASE-30.md)
 
+- `modules/signed.py`
 - `modules/social_meta.py`
 - `modules/sortition.py`
-- `modules/sound.py`
-- `modules/spec.py`
 
 ## [CODEBASE-31.md](CODEBASE-31.md)
 
+- `modules/sound.py`
+- `modules/spec.py`
 - `modules/spendgate.py`
 - `modules/src/modules/sebbi/index.ts`
 - `modules/standard.py`
+
+## [CODEBASE-32.md](CODEBASE-32.md)
+
 - `modules/standing.py`
 - `modules/startpage.py`
 - `modules/stats.py`
 
-## [CODEBASE-32.md](CODEBASE-32.md)
+## [CODEBASE-33.md](CODEBASE-33.md)
 
 - `modules/studio.py`
 
-## [CODEBASE-33.md](CODEBASE-33.md)
+## [CODEBASE-34.md](CODEBASE-34.md)
 
 - `modules/tokensaver.py`
 
-## [CODEBASE-34.md](CODEBASE-34.md)
+## [CODEBASE-35.md](CODEBASE-35.md)
 
 - `modules/toolspage.py`
 - `modules/useinclaude.py`
 - `modules/verifier.py`
 - `modules/walk.py`
 
-## [CODEBASE-35.md](CODEBASE-35.md)
+## [CODEBASE-36.md](CODEBASE-36.md)
 
 - `modules/wallet.py`
 - `modules/warmup.py`
 - `modules/wellknown_mcp.py`
 - `modules/witness.py`
 
-## [CODEBASE-36.md](CODEBASE-36.md)
+## [CODEBASE-37.md](CODEBASE-37.md)
 
 - `modules/witnessed.py`
 - `ai_act_ranker.py`
@@ -226,7 +230,7 @@ Generated automatically on every push. Do not edit by hand.
 - `anchor.py`
 - `brain.py`
 
-## [CODEBASE-37.md](CODEBASE-37.md)
+## [CODEBASE-38.md](CODEBASE-38.md)
 
 - `forever_verify.py`
 - `gateway_proxy.py`
@@ -235,15 +239,16 @@ Generated automatically on every push. Do not edit by hand.
 - `sebbi_benchmark.py`
 - `sebbi_sdk.py`
 
-## [CODEBASE-38.md](CODEBASE-38.md)
+## [CODEBASE-39.md](CODEBASE-39.md)
 
 - `sebbi_site.py`
 - `sebbi_tokensaver.py`
+- `sebdog_core.py`
 - `sebdog_engine.py`
 - `sebdog_licence.py`
 - `sebdog_reporter.py`
 
-## [CODEBASE-39.md](CODEBASE-39.md)
+## [CODEBASE-40.md](CODEBASE-40.md)
 
 - `tests/attack_continuity_1.py`
 - `tests/attack_continuity_2.py`
@@ -257,14 +262,14 @@ Generated automatically on every push. Do not edit by hand.
 - `Dockerfile`
 - `LICENCE`
 
-## [CODEBASE-40.md](CODEBASE-40.md)
+## [CODEBASE-41.md](CODEBASE-41.md)
 
 - `README.md`
 - `admin.html`
 - `ai-standard.html`
 - `ai-txt-kit.html`
 
-## [CODEBASE-41.md](CODEBASE-41.md)
+## [CODEBASE-42.md](CODEBASE-42.md)
 
 - `aileash-game.html`
 - `aitxt-popup-live.html`
@@ -272,7 +277,7 @@ Generated automatically on every push. Do not edit by hand.
 - `brain.html`
 - `certificate.html`
 
-## [CODEBASE-42.md](CODEBASE-42.md)
+## [CODEBASE-43.md](CODEBASE-43.md)
 
 - `compliance-assistant.html`
 - `console.html`
@@ -280,12 +285,12 @@ Generated automatically on every push. Do not edit by hand.
 - `copyright.txt`
 - `data-protection.html`
 
-## [CODEBASE-43.md](CODEBASE-43.md)
+## [CODEBASE-44.md](CODEBASE-44.md)
 
 - `developers.html`
 - `dis.txt`
 
-## [CODEBASE-44.md](CODEBASE-44.md)
+## [CODEBASE-45.md](CODEBASE-45.md)
 
 - `docs/evidential-undertaking.md`
 - `docs/spec/ai-txt.md`
@@ -294,11 +299,11 @@ Generated automatically on every push. Do not edit by hand.
 - `human-oversight.html`
 - `identity.html`
 
-## [CODEBASE-45.md](CODEBASE-45.md)
+## [CODEBASE-46.md](CODEBASE-46.md)
 
 - `index.html`
 
-## [CODEBASE-46.md](CODEBASE-46.md)
+## [CODEBASE-47.md](CODEBASE-47.md)
 
 - `integration-docs.html`
 - `investor-prospectus.html`
@@ -306,26 +311,26 @@ Generated automatically on every push. Do not edit by hand.
 - `liability.txt`
 - `llms.txt`
 
-## [CODEBASE-47.md](CODEBASE-47.md)
+## [CODEBASE-48.md](CODEBASE-48.md)
 
 - `map.html`
 - `notary.html`
 - `pack.html`
 
-## [CODEBASE-48.md](CODEBASE-48.md)
+## [CODEBASE-49.md](CODEBASE-49.md)
 
 - `pay-check.html`
 - `registry.html`
 - `report-threat.html`
 - `requirements.txt`
 
-## [CODEBASE-49.md](CODEBASE-49.md)
+## [CODEBASE-50.md](CODEBASE-50.md)
 
 - `reseller.html`
 - `risk-policy.html`
 - `robots.txt`
 
-## [CODEBASE-50.md](CODEBASE-50.md)
+## [CODEBASE-51.md](CODEBASE-51.md)
 
 - `scan.html`
 - `seal.html`
@@ -339,18 +344,18 @@ Generated automatically on every push. Do not edit by hand.
 - `sentinel.html`
 - `signal-packs.html`
 
-## [CODEBASE-51.md](CODEBASE-51.md)
+## [CODEBASE-52.md](CODEBASE-52.md)
 
 - `sitemap.xml`
 - `sonicboom.html`
 - `terms.html`
 
-## [CODEBASE-52.md](CODEBASE-52.md)
+## [CODEBASE-53.md](CODEBASE-53.md)
 
 - `tokensaver.html`
 - `verify.html`
 
-## [CODEBASE-53.md](CODEBASE-53.md)
+## [CODEBASE-54.md](CODEBASE-54.md)
 
 - `whitepaper.html`
 
