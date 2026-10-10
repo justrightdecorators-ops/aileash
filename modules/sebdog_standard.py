@@ -14,7 +14,7 @@ WHAT THIS STANDARD DOES
    - Not "passes our ML model"
    - Not "seems reasonable"
    - Not "close enough"
-
+   
    Safe means:
    - Input validation is deterministic (same input always produces same check result)
    - Proof is local (does not require trusting a remote service)
@@ -351,7 +351,7 @@ def handle(method, action, data, api_key, ctx):
             "what": "Public, open standard for deterministic AI tool safety",
             "adoption_url": "https://sebbi.pro/spec/sebdog-safety",
             "spec_url": "https://sebbi.pro/spec/sebdog-safety/full",
-            "reference_impl": "https://github.com/justrightdecorators-ops/aileash/blob/main/modules/sebdog_standard.py",
+            "reference_impl": "https://github.com/justrightdecorators-ops/aileash/blob/main/modules/sebdog_safety.py",
             "license": "CC0 (Public Domain)",
             "anyone_can_conform": True,
             "no_approval_needed": True,
