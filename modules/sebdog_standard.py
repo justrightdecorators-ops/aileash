@@ -35,7 +35,7 @@ WHAT THIS STANDARD DOES
    - Rust
    - Java
    - Any language that has JSON and SHA-256
-   
+
 4. ENABLES external verification
    - Audit log is public (operator cannot hide what ran)
    - Proof is publicly checkable (anyone can verify the hash)
